@@ -459,6 +459,77 @@ TEST(bridge_client_stops_claiming_health_after_the_server_goes)
     CHECK(!rb.isConnected());
 }
 
+// ---------------------------------------------------------------------------
+// A host that models run control and breakpoints itself (IDA does) must be the
+// one that performs them, or its view goes stale: IDA owns the Breakpoints
+// window and the run state, and there is no debug event meaning "resumed", so
+// a bridge client reaching straight into the backend leaves IDA convinced the
+// machine is still stopped at a breakpoint it has already cleared.
+// ---------------------------------------------------------------------------
+TEST(bridge_routes_mutations_through_the_host_when_one_is_installed)
+{
+    Wired w(17);
+    REQUIRE(w.ok);
+    Raw raw;
+    REQUIRE(raw.connect(portFor(17)));
+
+    struct Seen {
+        int resume = 0, pause = 0, add = 0, del = 0, clear = 0;
+    } seen;
+
+    EmuHost::HostMutations hm;
+    hm.resume = [&] { ++seen.resume; return true; };
+    hm.pause  = [&] { ++seen.pause;  return true; };
+    hm.addBreakpoint = [&](const Breakpoint&, int* id) {
+        ++seen.add; if (id) *id = 4242; return true;
+    };
+    hm.removeBreakpoint = [&](int) { ++seen.del;   return true; };
+    hm.clearBreakpoints = [&]      { ++seen.clear; return true; };
+    w.emu.host()->setHostMutations(hm);
+
+    CHECK_STR(raw.cmd("resume"), "ok");
+    CHECK_STR(raw.cmd("pause"),  "ok");
+    // The id the host reports is the one the client is told.
+    CHECK_STR(raw.cmd("bpadd x 200 200"), "ok 4242");
+    CHECK_STR(raw.cmd("bpdel 4242"), "ok");
+    CHECK_STR(raw.cmd("bpclear"), "ok");
+
+    CHECK_EQ(seen.resume, 1);
+    CHECK_EQ(seen.pause,  1);
+    CHECK_EQ(seen.add,    1);
+    CHECK_EQ(seen.del,    1);
+    CHECK_EQ(seen.clear,  1);
+
+    // ...and the backend was NOT touched behind the host's back: the host said
+    // it handled the add, so no breakpoint should have been created here.
+    CHECK(w.emu.backend()->getBreakpoints().empty());
+
+    w.emu.host()->setHostMutations({});
+}
+
+TEST(bridge_falls_through_to_the_backend_without_a_host)
+{
+    // The standalone app installs nothing, and a host may decline any single
+    // operation — a Z80 breakpoint means nothing in a 68000 database, so IDA's
+    // handler returns false for those and the backend must still get it.
+    Wired w(18);
+    REQUIRE(w.ok);
+    Raw raw;
+    REQUIRE(raw.connect(portFor(18)));
+
+    EmuHost::HostMutations hm;
+    hm.addBreakpoint = [](const Breakpoint&, int*) { return false; };  // declines
+    w.emu.host()->setHostMutations(hm);
+
+    const std::string r = raw.cmd("bpadd x 300 300 cpu=z80");
+    CHECK(r.rfind("ok ", 0) == 0);
+    REQUIRE(w.emu.backend()->getBreakpoints().size() == 1);
+    CHECK(w.emu.backend()->getBreakpoints()[0].cpu == Cpu::Z80);
+
+    w.emu.backend()->clearBreakpoints();
+    w.emu.host()->setHostMutations({});
+}
+
 TEST(bridge_rejects_absurd_sizes_instead_of_allocating)
 {
     Wired w(9);

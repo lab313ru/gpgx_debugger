@@ -84,6 +84,33 @@ public:
     // Run n more frames, then pause. Zero cancels a pending advance.
     void advanceFrames(int n) { framesLeft_.store(n < 0 ? 0 : n); }
 
+    // A host that keeps its OWN model of run control and breakpoints installs
+    // these. IDA does: its Breakpoints window and its run state are IDA's, not
+    // ours, and it has no way to learn that something else changed them —
+    // there is not even a "resumed" debug event to send it (idd.hpp).
+    //
+    // So an external client does not reach into the backend behind the host's
+    // back. It asks the host to perform the mutation, the host does it through
+    // its own API, and the host's normal path arrives at the backend as usual.
+    // One road instead of two, so nothing can go stale and nothing can loop.
+    //
+    // Each returns true if it handled the request. A host that installs
+    // nothing — the standalone app — falls through to the backend.
+    //
+    // Called on a bridge client thread. An implementation may block (IDA's
+    // does, marshalling onto its main thread) but must NOT call back into
+    // EmuHost::invoke: the emulation thread may itself be waiting on the host,
+    // and that pair of waits is a deadlock.
+    struct HostMutations {
+        std::function<bool()>                        resume;
+        std::function<bool()>                        pause;
+        std::function<bool(const Breakpoint&, int*)> addBreakpoint;   // out: id
+        std::function<bool(int)>                     removeBreakpoint;
+        std::function<bool()>                        clearBreakpoints;
+    };
+    void setHostMutations(HostMutations m) { hostMut_ = std::move(m); }
+    const HostMutations& hostMutations() const { return hostMut_; }
+
     // Copy the visible viewport as tightly packed RGB565 (w*h*2 bytes). Call
     // from the emulation thread — i.e. through invoke() — so the framebuffer
     // is not being redrawn underneath.
@@ -108,6 +135,7 @@ private:
     std::atomic<bool> stopFlag_ { false };
     std::atomic<bool> running_  { false };
     std::atomic<int>  framesLeft_ { 0 };   // frame-advance countdown
+    HostMutations     hostMut_;
 
     // Work handed to the emulation thread by invoke().
     struct Task { const std::function<void()>* fn; bool done; };

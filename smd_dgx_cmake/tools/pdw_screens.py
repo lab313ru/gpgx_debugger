@@ -118,6 +118,27 @@ def render_map(blob, tiles_off, map_off, pals):
     return w, h, buf
 
 
+def scene_palettes(path):
+    """block address -> (scene index, four palette offsets).
+
+    A block can be loaded by several scenes; prefer one whose four lines are
+    all known, so a partial scene never overrides a complete one.
+    """
+    best = {}
+    for scene in json.loads(Path(path).read_text()):
+        lines = scene.get("palette_lines") or []
+        if len(lines) != 4:
+            continue
+        known = sum(x is not None for x in lines)
+        if not known:
+            continue
+        for src in scene["unpack"]:
+            at = int(src, 16)
+            if at not in best or known > best[at][2]:
+                best[at] = (scene["index"], lines, known)
+    return best
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -125,12 +146,15 @@ def main():
     ap.add_argument("outdir")
     ap.add_argument("--palette", default=",".join(f"{p:X}" for p in DEFAULT_PALETTES),
                     help="four ROM offsets, one per palette line")
+    ap.add_argument("--scenes", help="scenes.json from pdw_scenes.py; colours each "
+                                     "block with the palettes of the scene that loads it")
     args = ap.parse_args()
 
     rom = Path(args.rom).read_bytes()
     out = Path(args.outdir)
     out.mkdir(parents=True, exist_ok=True)
     pals = [palette(rom, int(p, 16)) for p in args.palette.split(",")]
+    by_block = scene_palettes(args.scenes) if args.scenes else {}
 
     # Literal call sites plus the one real offset table.
     sources = {src for _, src, _ in find_sites(rom)}
@@ -145,21 +169,28 @@ def main():
             continue
 
         entry = {"at": f"0x{src:06X}", "unpacked": len(blob)}
+        use = pals
+        if src in by_block:
+            scene_i, lines, _ = by_block[src]
+            use = [palette(rom, int(l, 16)) if l else pals[n]
+                   for n, l in enumerate(lines)]
+            entry["scene"] = scene_i
+            entry["palettes"] = lines
         shape = parse_container(blob)
         if shape:
             containers += 1
             tiles_off, map_off = shape
             cols = PLANE_WIDTH
             rows = (tiles_off - map_off) // 2 // cols
-            write_png(out / f"{src:06X}_map.png", *render_map(blob, tiles_off, map_off, pals))
+            write_png(out / f"{src:06X}_map.png", *render_map(blob, tiles_off, map_off, use))
             write_png(out / f"{src:06X}_tiles.png",
-                      *tile_sheet(blob[tiles_off:], pals[0]))
+                      *tile_sheet(blob[tiles_off:], use[0]))
             entry.update(kind="container", map=[cols, rows],
                          tiles=(len(blob) - tiles_off) // 32)
             print(f"{src:06X}  container: {cols}x{rows} map, "
                   f"{(len(blob) - tiles_off) // 32} tiles")
         else:
-            write_png(out / f"{src:06X}_tiles.png", *tile_sheet(blob, pals[0]))
+            write_png(out / f"{src:06X}_tiles.png", *tile_sheet(blob, use[0]))
             entry.update(kind="tiles", tiles=len(blob) // 32)
             print(f"{src:06X}  tiles: {len(blob) // 32}")
         manifest.append(entry)

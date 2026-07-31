@@ -625,8 +625,21 @@ std::string BridgeServer::handle(const std::string& line, Client& client)
         return o.str();
     }
 
-    if (cmd == "pause")  { be->pause();    return "ok"; }
-    if (cmd == "resume") { be->resume();   return "ok"; }
+    // Run control goes through the host too. IDA has no debug event meaning
+    // "resumed" (idd.hpp event_id_t), so if something else resumes the machine
+    // behind its back its UI stays stuck on "suspended" forever. Asking IDA to
+    // continue instead means IDA reaches the backend by its own path and its
+    // state is right by construction.
+    if (cmd == "pause") {
+        const auto& hm = host_->hostMutations();
+        if (!(hm.pause && hm.pause())) be->pause();
+        return "ok";
+    }
+    if (cmd == "resume") {
+        const auto& hm = host_->hostMutations();
+        if (!(hm.resume && hm.resume())) be->resume();
+        return "ok";
+    }
     // optional trailing "z80" selects the sound CPU
     if (cmd == "stepi" || cmd == "stepo") {
         const Cpu cpu = (arg() == "z80") ? Cpu::Z80 : Cpu::M68K;
@@ -664,11 +677,29 @@ std::string BridgeServer::handle(const std::string& line, Client& client)
                 break;
             }
         }
-        return "ok " + std::to_string(be->addBreakpoint(bp));
+        // Through the host when it keeps its own list (IDA's Breakpoints
+        // window); straight to the backend otherwise. See EmuHost::HostMutations.
+        const auto& hm = host_->hostMutations();
+        int id = -1;
+        if (!(hm.addBreakpoint && hm.addBreakpoint(bp, &id)))
+            id = be->addBreakpoint(bp);
+        return "ok " + std::to_string(id);
     }
 
-    if (cmd == "bpdel")  { be->removeBreakpoint((int)parseU32(arg(), 10)); return "ok"; }
-    if (cmd == "bpclear"){ be->clearBreakpoints(); return "ok"; }
+    if (cmd == "bpdel") {
+        const int id = (int)parseU32(arg(), 10);
+        const auto& hm = host_->hostMutations();
+        if (!(hm.removeBreakpoint && hm.removeBreakpoint(id)))
+            be->removeBreakpoint(id);
+        return "ok";
+    }
+
+    if (cmd == "bpclear") {
+        const auto& hm = host_->hostMutations();
+        if (!(hm.clearBreakpoints && hm.clearBreakpoints()))
+            be->clearBreakpoints();
+        return "ok";
+    }
 
     if (cmd == "bplist") {
         std::ostringstream o;

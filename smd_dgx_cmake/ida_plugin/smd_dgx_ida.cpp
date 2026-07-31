@@ -209,6 +209,122 @@ bool evaluate_condition(uint32_t elang, const std::string& expr)
     return req.result;
 }
 
+
+// ---------------------------------------------------------------------------
+// Bridge mutations, performed the way IDA performs them
+//
+// An external client (the MCP server, the Z80 database) must not reach into the
+// backend behind IDA's back: IDA owns the Breakpoints window and the run state,
+// and there is no debug event that means "resumed" (idd.hpp event_id_t), so it
+// would have no way to notice. Instead the bridge asks us, we do it through
+// IDA's own API on IDA's own thread, and IDA arrives at the backend by its
+// normal path — ev_resume, ev_update_bpts. One road, so nothing goes stale and
+// nothing loops.
+//
+// These run on a bridge client thread and marshal with execute_sync. They must
+// never call EmuHost::invoke: the emulation thread can itself be waiting on
+// IDA (apply_codemap, eval_cond_req), and the two waits would deadlock. None of
+// the IDA calls below touch the emulation thread.
+// ---------------------------------------------------------------------------
+struct run_ctl_req : public exec_request_t {
+    bool wantRun;
+    bool ok = false;
+    explicit run_ctl_req(bool run) : wantRun(run) {}
+    ssize_t idaapi execute() override {
+        const int st = get_process_state();
+        if (st == DSTATE_NOTASK) return 0;          // nothing being debugged
+        // Only correct a real mismatch. Asking IDA to continue a process it
+        // already believes is running would be a second, spurious resume.
+        if (wantRun && st == DSTATE_SUSP)  ok = continue_process();
+        else if (!wantRun && st == DSTATE_RUN) ok = suspend_process();
+        else ok = true;                             // already where we want it
+        return 0;
+    }
+};
+
+bool host_resume() { run_ctl_req r(true);  execute_sync(r, MFF_WRITE); return r.ok; }
+bool host_pause()  { run_ctl_req r(false); execute_sync(r, MFF_WRITE); return r.ok; }
+
+struct add_bpt_req : public exec_request_t {
+    Breakpoint bp;
+    bool ok = false;
+    explicit add_bpt_req(const Breakpoint& b) : bp(b) {}
+    ssize_t idaapi execute() override {
+        ea_t ea = bp.start;
+        if (bp.is_vdp) ea += BREAKPOINTS_BASE;
+        const asize_t size = bp.end >= bp.start ? (bp.end - bp.start + 1) : 1;
+        const bpttype_t t = bp.type == BpType::Read  ? BPT_READ
+                          : bp.type == BpType::Write ? BPT_WRITE
+                                                     : BPT_EXEC;
+        // add_bpt makes IDA call our ev_update_bpts, which is what actually
+        // creates the backend breakpoint — so we deliberately do NOT create it
+        // here as well.
+        ok = add_bpt(ea, t == BPT_EXEC ? 0 : size, t);
+        return 0;
+    }
+};
+
+// A Z80 breakpoint has no place in a 68000 database — its addresses belong to
+// a different machine — so it goes straight to the backend and IDA is not
+// involved. The Z80 database keeps its own list for those.
+bool host_add_bpt(const Breakpoint& bp, int* idOut)
+{
+    if (!g_host || bp.cpu != Cpu::M68K) return false;
+
+    add_bpt_req req(bp);
+    execute_sync(req, MFF_WRITE);
+    if (!req.ok) return false;
+
+    // ev_update_bpts has run by now and recorded the id under this key.
+    uint8_t vdp = bp.is_vdp ? 1 : 0;
+    auto it = g_bpIds.find(BpKey{ (uint8_t)bp.type, vdp, bp.start, bp.end });
+    if (idOut) *idOut = (it != g_bpIds.end()) ? it->second : -1;
+    return true;
+}
+
+struct del_bpt_req : public exec_request_t {
+    ea_t ea;
+    explicit del_bpt_req(ea_t a) : ea(a) {}
+    ssize_t idaapi execute() override { del_bpt(ea); return 0; }
+};
+
+bool host_del_bpt(int id)
+{
+    if (!g_host) return false;
+    // Find the address IDA knows this backend id by.
+    for (const auto& kv : g_bpIds) {
+        if (kv.second != id) continue;
+        ea_t ea = kv.first.start;
+        if (kv.first.vdp) ea += BREAKPOINTS_BASE;
+        del_bpt_req req(ea);
+        execute_sync(req, MFF_WRITE);
+        return true;
+    }
+    return false;   // not one of ours (a Z80 breakpoint): let the backend do it
+}
+
+struct clear_bpts_req : public exec_request_t {
+    ssize_t idaapi execute() override {
+        // Walk backwards: deleting renumbers the ones after it.
+        for (int i = get_bpt_qty() - 1; i >= 0; --i) {
+            bpt_t b;
+            if (getn_bpt(i, &b)) del_bpt(b.ea);
+        }
+        return 0;
+    }
+};
+
+bool host_clear_bpts()
+{
+    if (!g_host) return false;
+    clear_bpts_req req;
+    execute_sync(req, MFF_WRITE);
+    // IDA only knows about the 68000 ones; anything else (Z80, added straight
+    // to the backend) still has to go.
+    g_host->backend()->clearBreakpoints();
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // memory routing: side-effect-free reads via typed regions
 // (never touches IO read handlers; unmapped bytes read as 0, like Gens)
@@ -491,6 +607,16 @@ drc_t start_process(const char* path, const char* input_path)
 
     g_host->addEventSink(on_emu_event);
     g_host->backend()->setConditionEvaluator(evaluate_condition);
+
+    // Bridge clients must not mutate run state or breakpoints behind IDA's
+    // back; route them through IDA instead. See the block above.
+    EmuHost::HostMutations hm;
+    hm.resume           = host_resume;
+    hm.pause            = host_pause;
+    hm.addBreakpoint    = host_add_bpt;
+    hm.removeBreakpoint = host_del_bpt;
+    hm.clearBreakpoints = host_clear_bpts;
+    g_host->setHostMutations(hm);
 #ifdef SMD_DGX_IDA_VIEWS
     g_host->setFrameSink(smd_dgx_push_frame);   // no-op unless the Screen dock is open
 #endif
