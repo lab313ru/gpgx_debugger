@@ -49,6 +49,7 @@
 /* Different ways to stop the CPU */
 #define STOP_LEVEL_STOP 1
 #define STOP_LEVEL_HALT 2
+#define STOP_LEVEL_WAIT 4
 
 /* Used for 68000 address error processing */
 #if M68K_EMULATE_ADDRESS_ERROR
@@ -139,6 +140,24 @@
 
 /* Simulate address lines of 68k family */
 #define ADDRESS_68K(A) ((A)&CPU_ADDRESS_MASK)
+
+/* Data breakpoints. Without these a debugger can only break on execution,
+ * which leaves "what wrote this address?" — the question most memory
+ * investigations start from — unanswerable. The hook sites below are where
+ * upstream left commented-out check_breakpoint() calls.
+ *
+ * Every hook fires AFTER the access has taken place, reads and writes alike,
+ * and the Z80's do the same. So when execution stops, memory already shows
+ * what happened: the hex view answers "what value?" as well as "who?", which
+ * is the pair of questions that actually get asked together. Firing a write
+ * hook before the store — as the commented-out site did — leaves the debugger
+ * showing the old value with no way to see the new one. */
+#ifdef HOOK_CPU
+#define M68K_HOOK_MEM(type, size, addr, val) \
+  do { if (cpu_hook) cpu_hook((type), (size), ADDRESS_68K(addr), (val)); } while (0)
+#else
+#define M68K_HOOK_MEM(type, size, addr, val) do {} while (0)
+#endif
 
 
 /* Shift & Rotate Macros. */
@@ -240,6 +259,9 @@
 #if M68K_EMULATE_FC == OPT_ON
 #define CALLBACK_SET_FC       m68ki_cpu.set_fc_callback
 #endif
+#if M68K_INSTRUCTION_HOOK == OPT_ON
+#define CALLBACK_INSTR_HOOK   m68ki_cpu.instr_hook_callback
+#endif
 
 
 /* ----------------------------- Configuration ---------------------------- */
@@ -277,6 +299,16 @@
 #else
   #define m68ki_tas_callback() 0
 #endif /* M68K_TAS_HAS_CALLBACK */
+
+#if M68K_INSTRUCTION_HOOK
+	#if M68K_INSTRUCTION_HOOK == OPT_SPECIFY_HANDLER
+		#define m68ki_instr_hook() M68K_INSTRUCTION_CALLBACK()
+	#else
+		#define m68ki_instr_hook() CALLBACK_INSTR_HOOK()
+	#endif
+#else
+	#define m68ki_instr_hook()
+#endif /* M68K_INSTRUCTION_HOOK */
 
 
 /* Enable or disable function code emulation */
@@ -854,15 +886,12 @@ INLINE uint m68ki_read_8(uint address)
   cpu_memory_map *temp = &m68ki_cpu.memory_map[((address)>>16)&0xff];
   uint val;
 
-  m68ki_set_fc(FLAG_S | m68ki_get_address_space()) /* auto-disable (see m68kcpu.h) */
+  m68ki_set_fc(FLAG_S | m68ki_get_address_space()); /* auto-disable (see m68kcpu.h) */
 
   if (temp->read8) val = (*temp->read8)(ADDRESS_68K(address));
   else val = READ_BYTE(temp->base, (address) & 0xffff);
 
-#ifdef HOOK_CPU
-  if (cpu_hook)
-    cpu_hook(HOOK_M68K_R, 1, address, val);
-#endif
+  M68K_HOOK_MEM(HOOK_M68K_R, 1, address, val);
 
   return val;
 }
@@ -879,10 +908,7 @@ INLINE uint m68ki_read_16(uint address)
   if (temp->read16) val = (*temp->read16)(ADDRESS_68K(address));
   else val = *(uint16 *)(temp->base + ((address) & 0xffff));
 
-#ifdef HOOK_CPU
-  if (cpu_hook)
-    cpu_hook(HOOK_M68K_R, 2, address, val);
-#endif
+  M68K_HOOK_MEM(HOOK_M68K_R, 2, address, val);
 
   return val;
 }
@@ -899,10 +925,7 @@ INLINE uint m68ki_read_32(uint address)
   if (temp->read16) val = ((*temp->read16)(ADDRESS_68K(address)) << 16) | ((*temp->read16)(ADDRESS_68K(address + 2)));
   else val = m68k_read_immediate_32(address);
 
-#ifdef HOOK_CPU
-  if (cpu_hook)
-    cpu_hook(HOOK_M68K_R, 4, address, val);
-#endif
+  M68K_HOOK_MEM(HOOK_M68K_R, 4, address, val);
 
   return val;
 }
@@ -911,46 +934,35 @@ INLINE void m68ki_write_8(uint address, uint value)
 {
   cpu_memory_map *temp;
 
-  m68ki_set_fc(FLAG_S | FUNCTION_CODE_USER_DATA) /* auto-disable (see m68kcpu.h) */
-
-#ifdef HOOK_CPU
-  if (cpu_hook)
-    cpu_hook(HOOK_M68K_W, 1, address, value);
-#endif
+  m68ki_set_fc(FLAG_S | FUNCTION_CODE_USER_DATA); /* auto-disable (see m68kcpu.h) */
 
   temp = &m68ki_cpu.memory_map[((address)>>16)&0xff];
   if (temp->write8) (*temp->write8)(ADDRESS_68K(address),value);
   else WRITE_BYTE(temp->base, (address) & 0xffff, value);
+
+  M68K_HOOK_MEM(HOOK_M68K_W, 1, address, value);
 }
 
 INLINE void m68ki_write_16(uint address, uint value)
 {
   cpu_memory_map *temp;
 
-  m68ki_set_fc(FLAG_S | FUNCTION_CODE_USER_DATA) /* auto-disable (see m68kcpu.h) */
+  m68ki_set_fc(FLAG_S | FUNCTION_CODE_USER_DATA); /* auto-disable (see m68kcpu.h) */
   m68ki_check_address_error(address, MODE_WRITE, FLAG_S | FUNCTION_CODE_USER_DATA); /* auto-disable (see m68kcpu.h) */
-
-#ifdef HOOK_CPU
-  if (cpu_hook)
-    cpu_hook(HOOK_M68K_W, 2, address, value);
-#endif
 
   temp = &m68ki_cpu.memory_map[((address)>>16)&0xff];
   if (temp->write16) (*temp->write16)(ADDRESS_68K(address),value);
   else *(uint16 *)(temp->base + ((address) & 0xffff)) = value;
+
+  M68K_HOOK_MEM(HOOK_M68K_W, 2, address, value);
 }
 
 INLINE void m68ki_write_32(uint address, uint value)
 {
   cpu_memory_map *temp;
 
-  m68ki_set_fc(FLAG_S | FUNCTION_CODE_USER_DATA) /* auto-disable (see m68kcpu.h) */
-  m68ki_check_address_error(address, MODE_WRITE, FLAG_S | FUNCTION_CODE_USER_DATA) /* auto-disable (see m68kcpu.h) */
-
-#ifdef HOOK_CPU
-  if (cpu_hook)
-    cpu_hook(HOOK_M68K_W, 4, address, value);
-#endif
+  m68ki_set_fc(FLAG_S | FUNCTION_CODE_USER_DATA); /* auto-disable (see m68kcpu.h) */
+  m68ki_check_address_error(address, MODE_WRITE, FLAG_S | FUNCTION_CODE_USER_DATA); /* auto-disable (see m68kcpu.h) */
 
   temp = &m68ki_cpu.memory_map[((address)>>16)&0xff];
   if (temp->write16) (*temp->write16)(ADDRESS_68K(address),value>>16);
@@ -959,6 +971,8 @@ INLINE void m68ki_write_32(uint address, uint value)
   temp = &m68ki_cpu.memory_map[((address + 2)>>16)&0xff];
   if (temp->write16) (*temp->write16)(ADDRESS_68K(address+2),value&0xffff);
   else *(uint16 *)(temp->base + ((address + 2) & 0xffff)) = value;
+
+  M68K_HOOK_MEM(HOOK_M68K_W, 4, address, value);
 }
 
 

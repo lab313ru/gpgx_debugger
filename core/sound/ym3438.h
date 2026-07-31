@@ -1,36 +1,21 @@
 /*
- *  Copyright (C) 2017 Alexey Khokholov (Nuke.YKT)
- * 
- *  Redistribution and use of this code or any derivative works are permitted
- *  provided that the following conditions are met:
+ * Copyright (C) 2017-2021 Alexey Khokholov (Nuke.YKT)
  *
- *   - Redistributions may not be sold, nor may they be used in a commercial
- *     product or activity.
+ * This file is part of Nuked OPN2.
  *
- *   - Redistributions that are modified from the original source must include the
- *     complete source code, including the source code for all components used by a
- *     binary built from the modified sources. However, as a special exception, the
- *     source code distributed need not include anything that is normally distributed
- *     (in either source or binary form) with the major components (compiler, kernel,
- *     and so on) of the operating system on which the executable runs, unless that
- *     component itself accompanies the executable.
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
- *   - Redistributions must reproduce the above copyright notice, this list of
- *     conditions and the following disclaimer in the documentation and/or other
- *     materials provided with the distribution.
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
  *
- *  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- *  AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- *  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- *  ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- *  LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- *  CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- *  SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- *  INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- *  CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- *  ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- *  POSSIBILITY OF SUCH DAMAGE.
- *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  *
  *  Nuked OPN2(Yamaha YM3438) emulator.
  *  Thanks:
@@ -39,7 +24,7 @@
  *      OPLx decapsulated(Matthew Gambrell, Olli Niemitalo):
  *          OPL2 ROMs.
  *
- * version: 1.0.8
+ * version: 1.0.9
  */
 
 #ifndef YM3438_H
@@ -51,7 +36,7 @@ extern "C" {
 
 enum {
     ym3438_mode_ym2612 = 0x01,      /* Enables YM2612 emulation (MD1, MD2 VA2) */
-    ym3438_mode_readmode = 0x02,    /* Enables status read on any port (TeraDrive, MD1 VA7, MD2, etc) */
+    ym3438_mode_readmode = 0x02     /* Enables status read on any port (TeraDrive, MD1 VA7, MD2, etc) */
 };
 
 #include <stdint.h>
@@ -70,7 +55,6 @@ typedef int8_t          Bit8s;
 typedef struct
 {
     Bit32u cycles;
-    Bit32u slot;
     Bit32u channel;
     Bit16s mol, mor;
     /* IO */
@@ -83,7 +67,7 @@ typedef struct
     Bit8u write_busy_cnt;
     Bit8u write_fm_address;
     Bit8u write_fm_data;
-    Bit8u write_fm_mode_a;
+    Bit16u write_fm_mode_a;
     Bit16u address;
     Bit8u data;
     Bit8u pin_test_in;
@@ -159,7 +143,7 @@ typedef struct
     Bit8u timer_a_load_latch;
     Bit8u timer_a_overflow_flag;
     Bit8u timer_a_overflow;
-    
+
     Bit16u timer_b_cnt;
     Bit8u timer_b_subcnt;
     Bit16u timer_b_reg;
@@ -170,7 +154,7 @@ typedef struct
     Bit8u timer_b_load_latch;
     Bit8u timer_b_overflow_flag;
     Bit8u timer_b_overflow;
-    
+
     /* Register set */
     Bit8u mode_test_21[8];
     Bit8u mode_test_2c[8];
@@ -182,7 +166,7 @@ typedef struct
     Bit8u mode_kon_csm;
     Bit8u dacen;
     Bit16s dacdata;
-    
+
     Bit8u ks[24];
     Bit8u ar[24];
     Bit8u sr[24];
@@ -194,7 +178,7 @@ typedef struct
     Bit8u am[24];
     Bit8u tl[24];
     Bit8u ssg_eg[24];
-    
+
     Bit16u fnum[6];
     Bit8u block[6];
     Bit8u kcode[6];

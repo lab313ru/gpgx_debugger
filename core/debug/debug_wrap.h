@@ -40,13 +40,13 @@ typedef enum {
     BPT_VSRAM_RW = BPT_VSRAM_R | BPT_VSRAM_W,
 
     // Z80
-    //BPT_Z80_E = (1 << 11),
-    //BPT_Z80_R = (1 << 12),
-    //BPT_Z80_W = (1 << 13),
-    //BPT_Z80_RW = BPT_Z80_R | BPT_Z80_W,
-    //BPT_Z80_RE = BPT_Z80_R | BPT_Z80_E,
-    //BPT_Z80_WE = BPT_Z80_W | BPT_Z80_E,
-    //BPT_Z80_RWE = BPT_Z80_R | BPT_Z80_W | BPT_Z80_E,
+    BPT_Z80_E = (1 << 11),
+    BPT_Z80_R = (1 << 12),
+    BPT_Z80_W = (1 << 13),
+    BPT_Z80_RW = BPT_Z80_R | BPT_Z80_W,
+    BPT_Z80_RE = BPT_Z80_R | BPT_Z80_E,
+    BPT_Z80_WE = BPT_Z80_W | BPT_Z80_E,
+    BPT_Z80_RWE = BPT_Z80_R | BPT_Z80_W | BPT_Z80_E,
 
     // REGS
     BPT_VDP_REG = (1 << 9),
@@ -248,18 +248,12 @@ typedef struct {
 } bpt_list_t;
 
 typedef struct {
-    int to_apply;
-    int applied;
-} pc_map_t;
-
-typedef struct {
     request_type_t req_type;
     register_data_t regs_data;
     memory_data_t mem_data;
     bpt_data_t bpt_data;
     unsigned int dbg_events_count;
     debugger_event_t dbg_events[MAX_DBG_EVENTS];
-    pc_map_t pc_map[MAXROMSIZE >> 1];
     bpt_list_t bpt_list;
     int dbg_active, dbg_paused;
 } dbg_request_t;

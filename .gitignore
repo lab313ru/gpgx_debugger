@@ -1,11 +1,8 @@
 .vs/
-.idea/
 /libretro/libretro_msvc/Debug_*/
 /libretro/libretro_msvc/Release_*/
 /libretro/libretro_msvc/x64/Debug_*/
 /libretro/libretro_msvc/x64/Release_*/
-/cmake-build-debug/
-cmake-build-release/
 psp2/*.o
 psp2/*.elf
 psp2/*.velf
@@ -15,6 +12,15 @@ sdl/gen_sdl
 sdl/gen_sdl2
 sdl/build_sdl
 sdl/build_sdl2
+sdl/gx_vstudio/gx_vstudio/x64
+smd_dgx_cmake/out
+/out/
+builds/
 
 *.o
+*.a
 *.aps
+# Emulator run artifacts: cartridge save RAM and save states are produced
+# next to whatever the working directory happened to be.
+*.srm
+*.gpz

@@ -3,7 +3,7 @@
  *  ROM Loading Support
  *
  *  Copyright (C) 1998-2003  Charles Mac Donald (original code)
- *  Copyright (C) 2007-2020  Eke-Eke (Genesis Plus GX)
+ *  Copyright (C) 2007-2025  Eke-Eke (Genesis Plus GX)
  *
  *  Redistribution and use of this code or any derivative works are permitted
  *  provided that the following conditions are met:
@@ -58,20 +58,21 @@
 #define ROMMEMO       456
 #define ROMCOUNTRY    496
 
-#define P3BUTTONS   1
-#define P6BUTTONS   2
-#define PKEYBOARD   4
-#define PPRINTER    8
-#define PBALL       16
-#define PFLOPPY     32
-#define PACTIVATOR  64
-#define PTEAMPLAYER 128
-#define PMSYSTEMPAD 256
-#define PSERIAL     512
-#define PTABLET     1024
-#define PPADDLE     2048
-#define PCDROM      4096
-#define PMOUSE      8192
+#define P3BUTTONS   0x0001
+#define P6BUTTONS   0x0002
+#define PKEYBOARD   0x0004
+#define PPRINTER    0x0008
+#define PBALL       0x0010
+#define PFLOPPY     0x0020
+#define PACTIVATOR  0x0040
+#define PTEAMPLAYER 0x0080
+#define PMSYSTEMPAD 0x0100
+#define PSERIAL     0x0200
+#define PTABLET     0x0400
+#define PPADDLE     0x0800
+#define PCDROM      0x1000
+#define PMOUSE      0x2000
+#define PMENACER    0x4000
 
 #define MAXCOMPANY 64
 #define MAXPERIPHERALS 15
@@ -91,6 +92,7 @@ typedef struct
 
 ROMINFO rominfo;
 uint8 romtype;
+char rompath[256];
 
 static uint8 rom_region;
 
@@ -288,7 +290,7 @@ void getrominfo(char *romheader)
     /* Supported peripherals */
     rominfo.peripherals = 0;
     for (i = 0; i < 14; i++)
-      for (j=0; j < 14; j++)
+      for (j=0; j < MAXPERIPHERALS; j++)
         if (romheader[ROMIOSUPPORT+i] == peripheralinfo[j].pID[0])
           rominfo.peripherals |= (1 << j);
   }
@@ -418,20 +420,25 @@ int load_bios(int system)
         if (size > 0)
         {
           /* auto-detect CD hardware model */
-          if (!memcmp (&scd.bootrom[0x120], "WONDER-MEGA BOOT", 16))
+          if (!memcmp(&scd.bootrom[0x120], "WONDER-MEGA BOOT", 16))
           {
             /* Wondermega CD hardware */
-            cdd.type = CD_TYPE_WONDERMEGA;
+            scd.type = CD_TYPE_WONDERMEGA;
           }
-          else if (!memcmp (&scd.bootrom[0x120], "WONDERMEGA2 BOOT", 16))
+          else if (!memcmp(&scd.bootrom[0x120], "WONDERMEGA2 BOOT", 16))
           {
             /* Wondermega M2 / X'Eye CD hardware */
-            cdd.type = CD_TYPE_WONDERMEGA_M2;
+            scd.type = CD_TYPE_WONDERMEGA_M2;
+          }
+          else if (!memcmp(&scd.bootrom[0x120], "CDX BOOT ROM    ", 16))
+          {
+            /* CDX / Multi-Mega CD hardware */
+            scd.type = CD_TYPE_CDX;
           }
           else
           {
             /* default CD hardware */
-            cdd.type = CD_TYPE_DEFAULT;
+            scd.type = CD_TYPE_DEFAULT;
           }
          
 #ifdef LSB_FIRST
@@ -581,9 +588,6 @@ int load_rom(char *filename)
   {
     /* enable CD hardware */
     system_hw = SYSTEM_MCD;
-
-    /* boot from CD hardware */
-    scd.cartridge.boot = 0x00;
   }
   else
   {
@@ -710,10 +714,10 @@ int load_rom(char *filename)
 
   /* Save auto-detected system hardware  */
   romtype = system_hw;
-  
+
   /* CD image file */
   if (system_hw == SYSTEM_MCD)
-  {   
+  {
     /* try to load CD BOOTROM for selected region */
     if (!load_bios(SYSTEM_MCD))
     {
@@ -723,65 +727,52 @@ int load_rom(char *filename)
       /* error booting from CD */
       return (0);
     }
-  }
-
-  /* CD BOOTROM */
-  else if (strstr(rominfo.ROMType, "BR") != NULL)
-  {
-    /* enable CD hardware */
-    system_hw = SYSTEM_MCD;
 
     /* boot from CD hardware */
     scd.cartridge.boot = 0x00;
-
-    /* copy ROM to BOOTROM area */
-    memcpy(scd.bootrom, cart.rom, sizeof(scd.bootrom));
-
-    /* mark CD BIOS as being loaded */
-    system_bios = system_bios | 0x10;
-
-    /* loaded CD BIOS region */
-    system_bios = (system_bios & 0xf0) | (region_code >> 4);
   }
 
-  /* ROM cartridge (max. 8MB) with CD loaded */
-  else if ((cart.romsize <= 0x800000) && cdd.loaded)
+  /* 16-bit ROM cartridge (max. 8MB) with optional CD hardware add-on support enabled */
+  else if ((system_hw == SYSTEM_MD) && (cart.romsize <= 0x800000) && (config.add_on != HW_ADDON_NONE))
   {
-    /* try to load CD BOOTROM */
-    if (load_bios(SYSTEM_MCD))
-    {
-      /* enable CD hardware */
-      system_hw = SYSTEM_MCD;
+    int len;
+    char fname[256];
 
-      /* boot from cartridge */
-      scd.cartridge.boot = 0x40;
+#if defined(USE_LIBCHDR)
+    /* automatically try to load associated .chd file if no .cue file CD image loaded yet */
+    if (!cdd.loaded)
+    {
+      len = strlen(filename);
+      while ((len && (filename[len] != '.')) || (len > 251)) len--;
+      strncpy(fname, filename, len);
+      strcpy(&fname[len], ".chd");
+      fname[len+4] = 0;
+      cdd_load(fname, (char *)cdc.ram);
     }
-    else
+#endif
+
+    /* automatically enable CD hardware emulation (Mode 1) in case :             */
+    /*  - loaded ROM has known CD hardware support                               */
+    /*      or                                                                   */
+    /*  - CD hardware emulation is forced on                                     */
+    /*      or                                                                   */
+    /*  - MegaSD add-on emulation is disabled and normal CD image file is loaded */
+    if ((rominfo.peripherals & PCDROM) || (strstr(rominfo.domestic,"FLUX") != NULL) ||
+        (config.add_on == HW_ADDON_MEGACD) || ((config.add_on | cdd.loaded) == HW_ADDON_MEGACD))
     {
-      /* unmount CD image */
-      cdd_unload();
-    }    
-  }
-  
-  /* ROM cartridge with CD support */
-  else if ((strstr(rominfo.domestic,"FLUX") != NULL) ||
-           (strstr(rominfo.domestic,"WONDER LIBRARY") != NULL) ||
-           (strstr(rominfo.product,"T-5740") != NULL))
-  {
-    /* check if console hardware is set to AUTO */
-    if (!config.system)
-    {
-      /* try to load CD BOOTROM */
+      /* try to load CD BOOTROM for selected region */
       if (load_bios(SYSTEM_MCD))
       {
-        char fname[256];
-        int len = strlen(filename);
-
-        /* automatically try to load associated .iso file */
-        while ((len && (filename[len] != '.')) || (len > 251)) len--;
-        strncpy(fname, filename, len);
-        strcpy(&fname[len], ".iso");
-        cdd_load(fname, (char *)cdc.ram);
+        /* automatically try to load associated .iso file if no CD image loaded yet */
+        if (!cdd.loaded)
+        {
+          len = strlen(filename);
+          while ((len && (filename[len] != '.')) || (len > 251)) len--;
+          strncpy(fname, filename, len);
+          strcpy(&fname[len], ".iso");
+          fname[len+4] = 0;
+          cdd_load(fname, (char *)cdc.ram);
+        }
 
         /* enable CD hardware */
         system_hw = SYSTEM_MCD;
@@ -789,6 +780,52 @@ int load_rom(char *filename)
         /* boot from cartridge */
         scd.cartridge.boot = 0x40;
       }
+      else
+      {
+        /* unmount any loaded CD image */
+        cdd_unload();
+      }
+    }
+
+    /* CD BOOTROM */
+    else if (strstr(rominfo.ROMType, "BR") != NULL)
+    {
+      /* enable CD hardware */
+      system_hw = SYSTEM_MCD;
+
+      /* auto-detect CD hardware model */
+      if (strstr(rominfo.domestic, "WONDER-MEGA BOOT"))
+      {
+        /* Wondermega CD hardware */
+        scd.type = CD_TYPE_WONDERMEGA;
+      }
+      else if (strstr(rominfo.domestic, "WONDERMEGA2 BOOT"))
+      {
+        /* Wondermega M2 / X'Eye CD hardware */
+        scd.type = CD_TYPE_WONDERMEGA_M2;
+      }
+      else if (strstr(rominfo.domestic, "CDX BOOT ROM"))
+      {
+        /* CDX / Multi-Mega CD hardware */
+        scd.type = CD_TYPE_CDX;
+      }
+      else
+      {
+        /* default CD hardware */
+        scd.type = CD_TYPE_DEFAULT;
+      }
+
+      /* boot from CD hardware */
+      scd.cartridge.boot = 0x00;
+
+      /* copy ROM to BOOTROM area */
+      memcpy(scd.bootrom, cart.rom, sizeof(scd.bootrom));
+
+      /* mark CD BIOS as being loaded */
+      system_bios = system_bios | 0x10;
+
+      /* loaded CD BIOS region */
+      system_bios = (system_bios & 0xf0) | (region_code >> 4);
     }
   }
 
@@ -993,6 +1030,13 @@ int load_rom(char *filename)
     input.y_offset = 0;
   }
 
+  /* extract loaded game filepath */
+  strncpy(rompath, filename, sizeof(rompath));
+  rompath[sizeof(rompath) - 1] = 0;
+  i = strlen(rompath);
+  while ((i>0) && (rompath[i-1]!='/') && (rompath[i-1]!='\\')) i--;
+  rompath[i] = 0;
+
   return(1);
 }
 
@@ -1078,6 +1122,7 @@ void get_region(char *romheader)
            (strstr(rominfo.product,"T-69046-50") != NULL) ||    /* Back to the Future III (Europe) */
            (strstr(rominfo.product,"T-120106-00") != NULL) ||   /* Brian Lara Cricket (Europe) */
            (strstr(rominfo.product,"T-97126 -50") != NULL) ||   /* Williams Arcade's Greatest Hits (Europe) */
+           (strstr(rominfo.product,"T-113026-50") != NULL) ||   /* Wiz'n'Liz - The Frantic Wabbit Wescue (Europe) */
            (strstr(rominfo.product,"T-70096 -00") != NULL) ||   /* Muhammad Ali Heavyweight Boxing (Europe) */
            ((rominfo.checksum == 0x0000) && (rominfo.realchecksum == 0x1f7f))) /* Radica - Sensible Soccer Plus edition */
       {

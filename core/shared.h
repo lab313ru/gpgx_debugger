@@ -1,9 +1,9 @@
 #ifndef _SHARED_H_
 #define _SHARED_H_
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+// #ifdef __cplusplus
+// extern "C" {
+// #endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,9 +41,9 @@ extern "C" {
 #include "svp.h"
 #include "state.h"
 
-#ifdef __cplusplus
-}
-#endif
+// #ifdef __cplusplus
+// }
+// #endif
 
 #endif /* _SHARED_H_ */
 

@@ -2,7 +2,7 @@
  *  Genesis Plus
  *  SPI Serial EEPROM (25XX512 only) support
  *
- *  Copyright (C) 2012  Eke-Eke (Genesis Plus GX)
+ *  Copyright (C) 2012-2026  Eke-Eke (Genesis Plus GX)
  *
  *  Redistribution and use of this code or any derivative works are permitted
  *  provided that the following conditions are met:
@@ -40,7 +40,7 @@
 #define _EEPROM_SPI_H_
 
 /* Function prototypes */
-extern void eeprom_spi_init();
+extern void eeprom_spi_init(void);
 extern void eeprom_spi_write(unsigned char data);
 extern unsigned int eeprom_spi_read(unsigned int address);
 

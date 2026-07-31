@@ -61,6 +61,12 @@ extern void psg_write(unsigned int clocks, unsigned int data);
 extern void psg_config(unsigned int clocks, unsigned int preamp, unsigned int panning);
 extern void psg_end_frame(unsigned int clocks);
 
+#ifdef HOOK_CPU
+/* Raw latched PSG registers for the debugger:
+   [0,2,4]=tone periods, [1,3,5]=attenuations, [6]=noise ctrl, [7]=noise att */
+extern const int *psg_debug_regs(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

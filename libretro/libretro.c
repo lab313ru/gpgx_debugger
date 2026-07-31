@@ -3,7 +3,7 @@
  *
  *  Genesis Plus GX libretro port
  *
- *  Copyright Eke-Eke (2007-2020)
+ *  Copyright Eke-Eke (2007-2026)
  *
  *  Copyright Daniel De Matteis (2012-2016)
  *
@@ -74,10 +74,13 @@ jmp_buf jmp_env;
 #define RETRO_DEVICE_PHASER               RETRO_DEVICE_SUBCLASS(RETRO_DEVICE_LIGHTGUN, 0)
 #define RETRO_DEVICE_MENACER              RETRO_DEVICE_SUBCLASS(RETRO_DEVICE_LIGHTGUN, 1)
 #define RETRO_DEVICE_JUSTIFIERS           RETRO_DEVICE_SUBCLASS(RETRO_DEVICE_LIGHTGUN, 2)
+#define RETRO_DEVICE_SMASH_CONTROLLER     RETRO_DEVICE_SUBCLASS(RETRO_DEVICE_LIGHTGUN, 3)
 #define RETRO_DEVICE_GRAPHIC_BOARD        RETRO_DEVICE_SUBCLASS(RETRO_DEVICE_POINTER, 0)
 
 #include <libretro.h>
 #include <streams/file_stream.h>
+
+#include "libretro_core_options.h"
 
 #include "shared.h"
 #include "md_ntsc.h"
@@ -89,7 +92,9 @@ jmp_buf jmp_env;
 #define OVERCLOCK_FRAME_DELAY 100
 
 #ifdef M68K_OVERCLOCK_SHIFT
+#ifndef HAVE_OVERCLOCK
 #define HAVE_OVERCLOCK
+#endif
 STATIC_ASSERT(m68k_overflow,
               M68K_MAX_CYCLES <= UINT_MAX >> (M68K_OVERCLOCK_SHIFT + 1));
 #endif
@@ -102,10 +107,10 @@ STATIC_ASSERT(z80_overflow,
               Z80_MAX_CYCLES <= UINT_MAX >> (Z80_OVERCLOCK_SHIFT + 1));
 #endif
 
+t_config config;
+
 sms_ntsc_t *sms_ntsc;
 md_ntsc_t  *md_ntsc;
-
-t_config config;
 
 char GG_ROM[256];
 char AR_ROM[256];
@@ -146,9 +151,9 @@ static bool restart_eq = false;
 
 static char g_rom_dir[256];
 static char g_rom_name[256];
-static void *g_rom_data;
-static size_t g_rom_size;
-static char *save_dir;
+static const void *g_rom_data = NULL;
+static size_t g_rom_size      = 0;
+static char *save_dir         = NULL;
 
 static retro_log_printf_t log_cb;
 static retro_video_refresh_t video_cb;
@@ -156,6 +161,9 @@ static retro_input_poll_t input_poll_cb;
 static retro_input_state_t input_state_cb;
 static retro_environment_t environ_cb;
 static retro_audio_sample_batch_t audio_cb;
+
+enum RetroLightgunInputModes{RetroLightgun, RetroPointer};
+static enum RetroLightgunInputModes retro_gun_mode = RetroLightgun;
 
 /* Cheat Support */
 #define MAX_CHEATS (150)
@@ -188,10 +196,94 @@ static char arvalidchars[] = "0123456789ABCDEF";
 static uint32_t overclock_delay;
 #endif
 
+static bool libretro_supports_option_categories = false;
+static bool libretro_supports_bitmasks          = false;
+
 #define SOUND_FREQUENCY 44100
 
 /* Hide the EQ settings for now */
 /*#define HAVE_EQ*/
+
+/* Frameskipping Support */
+
+static unsigned frameskip_type             = 0;
+static unsigned frameskip_threshold        = 0;
+static uint16_t frameskip_counter          = 0;
+
+static bool retro_audio_buff_active        = false;
+static unsigned retro_audio_buff_occupancy = 0;
+static bool retro_audio_buff_underrun      = false;
+/* Maximum number of consecutive frames that
+ * can be skipped */
+#define FRAMESKIP_MAX 60
+
+static unsigned audio_latency              = 0;
+static bool update_audio_latency           = false;
+
+#ifdef USE_PER_SOUND_CHANNELS_CONFIG
+static bool show_advanced_av_settings      = true;
+#endif
+
+static void retro_audio_buff_status_cb(
+      bool active, unsigned occupancy, bool underrun_likely)
+{
+   retro_audio_buff_active    = active;
+   retro_audio_buff_occupancy = occupancy;
+   retro_audio_buff_underrun  = underrun_likely;
+}
+
+static void init_frameskip(void)
+{
+   if (frameskip_type > 0)
+   {
+      struct retro_audio_buffer_status_callback buf_status_cb;
+
+      buf_status_cb.callback = retro_audio_buff_status_cb;
+      if (!environ_cb(RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK,
+            &buf_status_cb))
+      {
+         if (log_cb)
+            log_cb(RETRO_LOG_WARN, "Frameskip disabled - frontend does not support audio buffer status monitoring.\n");
+
+         retro_audio_buff_active    = false;
+         retro_audio_buff_occupancy = 0;
+         retro_audio_buff_underrun  = false;
+         audio_latency              = 0;
+      }
+      else
+      {
+         /* Frameskip is enabled - increase frontend
+          * audio latency to minimise potential
+          * buffer underruns */
+         float frames_per_sec;
+         float frame_time_msec;
+
+         /* While system_clock and lines_per_frame will
+          * always be valid when this function is called,
+          * it is not guaranteed. Just add a fallback to
+          * prevent any possible divide-by-zero errors */
+         if ((system_clock <= 0) || (lines_per_frame <= 0))
+            frames_per_sec = 60.0f;
+         else
+            frames_per_sec = (float)system_clock / (float)lines_per_frame / (float)MCYCLES_PER_LINE;
+
+         frame_time_msec = 1000.0f / frames_per_sec;
+
+         /* Set latency to 6x current frame time... */
+         audio_latency = (unsigned)((6.0f * frame_time_msec) + 0.5f);
+
+         /* ...then round up to nearest multiple of 32 */
+         audio_latency = (audio_latency + 0x1F) & ~0x1F;
+      }
+   }
+   else
+   {
+      environ_cb(RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK, NULL);
+      audio_latency = 0;
+   }
+
+   update_audio_latency = true;
+}
 
 /************************************
  * Genesis Plus GX implementation
@@ -301,243 +393,609 @@ int load_archive(char *filename, unsigned char *buffer, int maxsize, char *exten
 
 static void RAMCheatUpdate(void);
 
+static void osd_input_update_internal_bitmasks(void)
+{
+   int i, player = 0;
+   unsigned int temp;
+   int16_t ret = input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK);
+
+   for (i = 0; i < MAX_INPUTS; i++)
+   {
+      temp = 0;
+      switch (input.dev[i])
+      {
+         case DEVICE_PAD6B:
+            if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_L))
+               temp |= INPUT_X;
+            if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_X))
+               temp |= INPUT_Y;
+            if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_R))
+               temp |= INPUT_Z;
+            if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_SELECT))
+               temp |= INPUT_MODE;
+
+         case DEVICE_PAD3B:
+            if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_Y))
+               temp |= INPUT_A;
+
+         case DEVICE_PAD2B:
+            if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_B))
+               temp |= INPUT_B;
+            if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_A))
+               temp |= INPUT_C;
+            if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_START))
+               temp |= INPUT_START;
+            if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_UP))
+               temp |= INPUT_UP;
+            if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_DOWN))
+               temp |= INPUT_DOWN;
+            if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_LEFT))
+               temp |= INPUT_LEFT;
+            if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_RIGHT))
+               temp |= INPUT_RIGHT;
+
+            player++;
+            ret = input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK);
+            break;
+
+         case DEVICE_MOUSE:
+            input.analog[i][0] = input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_X);
+            if (config.invert_mouse)
+               input.analog[i][1] = input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_Y);
+            else
+               input.analog[i][1] = -input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_Y);
+
+            if (input.analog[i][0] < -255)
+               input.analog[i][0] = -255;
+            else if (input.analog[i][0] > 255)
+               input.analog[i][0] = 255;
+            if (input.analog[i][1] < -255)
+               input.analog[i][1] = -255;
+            else if (input.analog[i][1] > 255)
+               input.analog[i][1] = 255;
+
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_LEFT))
+               temp |= INPUT_MOUSE_LEFT;
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_RIGHT))
+               temp |= INPUT_MOUSE_RIGHT;
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_WHEELDOWN))
+               temp |= INPUT_MOUSE_CENTER;
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_MIDDLE))
+               temp |= INPUT_START;
+
+            player++;
+            ret = input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK);
+            break;
+
+         case DEVICE_LIGHTGUN:
+            if ( retro_gun_mode == RetroPointer )
+            {
+               int touch_count;
+               input.analog[i][0] = ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_X) + 0x7fff) * bitmap.viewport.w) / 0xfffe;
+               input.analog[i][1] = ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_Y) + 0x7fff) * bitmap.viewport.h) / 0xfffe;
+               if (input_state_cb(player, RETRO_DEVICE_POINTER, 0,
+                        RETRO_DEVICE_ID_POINTER_PRESSED))
+                  temp |= INPUT_A;
+               touch_count = input_state_cb(player,
+                     RETRO_DEVICE_POINTER, 0,
+                     RETRO_DEVICE_ID_POINTER_COUNT);
+
+               if (touch_count == 2)
+                  temp |= INPUT_B;
+               else if (touch_count == 3)
+                  temp |= INPUT_START;
+               else if (touch_count == 4)
+                  temp |= INPUT_C;
+            }
+            else
+            {
+               /* RetroLightgun is default */
+               if ( input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_IS_OFFSCREEN) )
+               {
+                  input.analog[i][0] = -1000;
+                  input.analog[i][1] = -1000;
+               }
+               else
+               {
+                  input.analog[i][0] = ((input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_SCREEN_X) + 0x7fff) * bitmap.viewport.w) / 0xfffe;
+                  input.analog[i][1] = ((input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_SCREEN_Y) + 0x7fff) * bitmap.viewport.h) / 0xfffe;
+               }
+
+               if (input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_TRIGGER))
+                  temp |= INPUT_A;
+               if (input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_AUX_A))
+                  temp |= INPUT_B;
+               if (input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_AUX_B))
+                  temp |= INPUT_C;
+               if (input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_START))
+                  temp |= INPUT_START;
+            }     
+
+            player++;
+            ret = input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK);
+            break;
+
+         case DEVICE_PADDLE:
+            input.analog[i][0] = (input_state_cb(player, RETRO_DEVICE_ANALOG, 0, RETRO_DEVICE_ID_ANALOG_X) + 0x8000) >> 8;
+
+            if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_B))
+               temp |= INPUT_BUTTON1;
+            if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_START))
+               temp |= INPUT_START;
+
+            player++;
+            ret = input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK);
+            break;
+
+         case DEVICE_SPORTSPAD:
+            input.analog[i][0] = (input_state_cb(player, RETRO_DEVICE_ANALOG, 0, RETRO_DEVICE_ID_ANALOG_X) + 0x8000) >> 8;
+            input.analog[i][1] = (input_state_cb(player, RETRO_DEVICE_ANALOG, 0, RETRO_DEVICE_ID_ANALOG_Y) + 0x8000) >> 8;
+
+            if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_B))
+               temp |= INPUT_BUTTON1;
+            if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_A))
+               temp |= INPUT_BUTTON2;
+            if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_START))
+               temp |= INPUT_START;
+
+            player++;
+            ret = input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK);
+            break;
+
+         case DEVICE_PICO:
+            input.analog[i][0] = 0x03c + ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_X) + 0x7fff) * (0x17c-0x03c)) / 0xfffe;
+            input.analog[i][1] = 0x1fc + ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_Y) + 0x7fff) * (0x2f7-0x1fc)) / 0xfffe;
+
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_LEFT))
+               temp |= INPUT_PICO_PEN;
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_RIGHT))
+               temp |= INPUT_PICO_RED;
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_WHEELUP))
+               pico_current = (pico_current - 1) & 7;
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_WHEELDOWN))
+               pico_current = (pico_current + 1) & 7;
+            if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_UP))
+               temp |= INPUT_UP;
+            if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_DOWN))
+               temp |= INPUT_DOWN;
+            if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_LEFT))
+               temp |= INPUT_LEFT;
+            if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_RIGHT))
+               temp |= INPUT_RIGHT;
+
+            player++;
+            ret = input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK);
+            break;
+
+         case DEVICE_TEREBI:
+            input.analog[i][0] = ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_X) + 0x7fff) * 250) / 0xfffe;
+            input.analog[i][1] = ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_Y) + 0x7fff) * 250) / 0xfffe;
+
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_LEFT))
+               temp |= INPUT_BUTTON1;
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_MIDDLE))
+               temp |= INPUT_START;
+
+            player++;
+            ret = input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK);
+            break;
+
+         case DEVICE_GRAPHIC_BOARD:
+            input.analog[i][0] = ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_X) + 0x7fff) * 255) / 0xfffe;
+            input.analog[i][1] = ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_Y) + 0x7fff) * 255) / 0xfffe;
+
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_LEFT))
+               temp |= INPUT_GRAPHIC_PEN;
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_MIDDLE))
+               temp |= INPUT_GRAPHIC_DO;
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_RIGHT))
+               temp |= INPUT_GRAPHIC_MENU;
+
+            player++;
+            ret = input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK);
+            break;
+
+         case DEVICE_XE_1AP:
+            {
+               int rx = input.analog[i][0] = input_state_cb(player, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X);
+               int ry = input.analog[i][1] = input_state_cb(player, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y);
+               if (abs(rx) > abs(ry))
+                  input.analog[i+1][0] = (rx + 0x8000) >> 8;
+               else 
+                  input.analog[i+1][0] = (0x7fff - ry) >> 8;
+               input.analog[i][0] = (input_state_cb(player, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X) + 0x8000) >> 8;
+               input.analog[i][1] = (input_state_cb(player, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y) + 0x8000) >> 8;
+
+               if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_R))
+                  temp |= INPUT_XE_A;
+               if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_R2))
+                  temp |= INPUT_XE_B;
+               if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_L))
+                  temp |= INPUT_XE_C;
+               if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_L2))
+                  temp |= INPUT_XE_D;
+               if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_Y))
+                  temp |= INPUT_XE_E1;
+               if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_B))
+                  temp |= INPUT_XE_E2;
+               if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_SELECT))
+                  temp |= INPUT_XE_SELECT;
+               if (ret & (1 << RETRO_DEVICE_ID_JOYPAD_START))
+                  temp |= INPUT_XE_START;
+
+               player++;
+               ret = input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK);
+               break;
+            }
+
+         case DEVICE_SMASH:
+         {
+            int pressed;
+            if (retro_gun_mode == RetroPointer)
+            {
+               pressed = input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_PRESSED);
+               input.analog[i][0] = ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_X) + 0x7fff) * bitmap.viewport.w) / 0xfffe;
+               input.analog[i][1] = ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_Y) + 0x7fff) * bitmap.viewport.h) / 0xfffe;
+            }
+            else
+            {
+               pressed = input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_TRIGGER);
+               if (input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_IS_OFFSCREEN))
+               {
+                  input.analog[i][0] = input.analog[i][1] = -1;
+               }
+               else
+               {
+                  input.analog[i][0] = ((input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_SCREEN_X) + 0x7fff) * bitmap.viewport.w) / 0xfffe;
+                  input.analog[i][1] = ((input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_SCREEN_Y) + 0x7fff) * bitmap.viewport.h) / 0xfffe;
+               }
+            }
+
+            /* no buttons pressed by default */
+            temp = 0;
+
+            /* check if trigger button is pressed */
+            if (pressed)
+            {
+               /* horizontal position */
+               int x = input.analog[i][0];
+
+               /* adjust vertical position with default screen offset for Whac-a-Critter / Mallet Legend */
+               /* note: this could be made configurable but no other known game supports this controller */
+               int y = input.analog[i][1] - (bitmap.viewport.h/2);
+
+               /* determine pressed button */
+               if (y < (bitmap.viewport.h/6))
+               {
+                  /* top row */
+                  if (x < (bitmap.viewport.w/3)) temp = INPUT_SMASH_UP_LEFT;
+                  else if (x < ((2*bitmap.viewport.w)/3)) temp = INPUT_SMASH_UP;
+                  else temp = INPUT_SMASH_UP_RIGHT;
+               }
+               else if (y < ((2*bitmap.viewport.h)/6))
+               {
+                  /* middle row */
+                  if (x < (bitmap.viewport.w/3)) temp = INPUT_SMASH_LEFT;
+                  else if (x < ((2*bitmap.viewport.w)/3)) temp = INPUT_SMASH_CENTER;
+                  else temp = INPUT_SMASH_RIGHT;
+               }
+               else if (y < (bitmap.viewport.h/2))
+               {
+                  /* bottom row */
+                  if (x < (bitmap.viewport.w/3)) temp = INPUT_SMASH_DOWN_LEFT;
+                  else if (x < ((2*bitmap.viewport.w)/3)) temp = INPUT_SMASH_DOWN;
+                  else temp = INPUT_SMASH_DOWN_RIGHT;
+               }
+            }
+
+            player++;
+            ret = input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK);
+            break;
+         }
+
+         default:
+            break;
+      }
+
+      input.pad[i] = temp;
+   }
+}
+
+static void osd_input_update_internal(void)
+{
+   int i, player = 0;
+   unsigned int temp;
+
+   for (i = 0; i < MAX_INPUTS; i++)
+   {
+      temp = 0;
+      switch (input.dev[i])
+      {
+         case DEVICE_PAD6B:
+            if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L))
+               temp |= INPUT_X;
+            if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_X))
+               temp |= INPUT_Y;
+            if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R))
+               temp |= INPUT_Z;
+            if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT))
+               temp |= INPUT_MODE;
+
+         case DEVICE_PAD3B:
+            if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y))
+               temp |= INPUT_A;
+
+         case DEVICE_PAD2B:
+            if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B))
+               temp |= INPUT_B;
+            if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A))
+               temp |= INPUT_C;
+            if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START))
+               temp |= INPUT_START;
+            if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP))
+               temp |= INPUT_UP;
+            if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN))
+               temp |= INPUT_DOWN;
+            if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT))
+               temp |= INPUT_LEFT;
+            if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT))
+               temp |= INPUT_RIGHT;
+
+            player++;
+            break;
+
+         case DEVICE_MOUSE:
+            input.analog[i][0] = input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_X);
+            if (config.invert_mouse)
+               input.analog[i][1] = input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_Y);
+            else
+               input.analog[i][1] = -input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_Y);
+
+            if (input.analog[i][0] < -255)
+               input.analog[i][0] = -255;
+            else if (input.analog[i][0] > 255)
+               input.analog[i][0] = 255;
+            if (input.analog[i][1] < -255)
+               input.analog[i][1] = -255;
+            else if (input.analog[i][1] > 255)
+               input.analog[i][1] = 255;
+
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_LEFT))
+               temp |= INPUT_MOUSE_LEFT;
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_RIGHT))
+               temp |= INPUT_MOUSE_RIGHT;
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_WHEELDOWN))
+               temp |= INPUT_MOUSE_CENTER;
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_MIDDLE))
+               temp |= INPUT_START;
+
+            player++;
+            break;
+
+         case DEVICE_LIGHTGUN:
+            if ( retro_gun_mode == RetroPointer )
+            {
+               input.analog[i][0] = ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_X) + 0x7fff) * bitmap.viewport.w) / 0xfffe;
+               input.analog[i][1] = ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_Y) + 0x7fff) * bitmap.viewport.h) / 0xfffe;
+               if (input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_PRESSED))
+                  temp |= INPUT_A;
+            }
+            else
+            {
+               /* RetroLightgun is default */
+               if ( input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_IS_OFFSCREEN) )
+               {
+                  input.analog[i][0] = -1000;
+                  input.analog[i][1] = -1000;
+               }
+               else
+               {
+                  input.analog[i][0] = ((input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_SCREEN_X) + 0x7fff) * bitmap.viewport.w) / 0xfffe;
+                  input.analog[i][1] = ((input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_SCREEN_Y) + 0x7fff) * bitmap.viewport.h) / 0xfffe;
+               }
+
+               if (input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_TRIGGER))
+                  temp |= INPUT_A;
+               if (input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_AUX_A))
+                  temp |= INPUT_B;
+               if (input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_AUX_B))
+                  temp |= INPUT_C;
+               if (input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_START))
+                  temp |= INPUT_START;
+            }
+
+            player++;
+            break;
+
+         case DEVICE_PADDLE:
+            input.analog[i][0] = (input_state_cb(player, RETRO_DEVICE_ANALOG, 0, RETRO_DEVICE_ID_ANALOG_X) + 0x8000) >> 8;
+
+            if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B))
+               temp |= INPUT_BUTTON1;
+            if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START))
+               temp |= INPUT_START;
+
+            player++;
+            break;
+
+         case DEVICE_SPORTSPAD:
+            input.analog[i][0] = (input_state_cb(player, RETRO_DEVICE_ANALOG, 0, RETRO_DEVICE_ID_ANALOG_X) + 0x8000) >> 8;
+            input.analog[i][1] = (input_state_cb(player, RETRO_DEVICE_ANALOG, 0, RETRO_DEVICE_ID_ANALOG_Y) + 0x8000) >> 8;
+
+            if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B))
+               temp |= INPUT_BUTTON1;
+            if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A))
+               temp |= INPUT_BUTTON2;
+            if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START))
+               temp |= INPUT_START;
+
+            player++;
+            break;
+
+         case DEVICE_PICO:
+            input.analog[i][0] = 0x03c + ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_X) + 0x7fff) * (0x17c-0x03c)) / 0xfffe;
+            input.analog[i][1] = 0x1fc + ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_Y) + 0x7fff) * (0x2f7-0x1fc)) / 0xfffe;
+
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_LEFT))
+               temp |= INPUT_PICO_PEN;
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_RIGHT))
+               temp |= INPUT_PICO_RED;
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_WHEELUP))
+               pico_current = (pico_current - 1) & 7;
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_WHEELDOWN))
+               pico_current = (pico_current + 1) & 7;
+            if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP))
+               temp |= INPUT_UP;
+            if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN))
+               temp |= INPUT_DOWN;
+            if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT))
+               temp |= INPUT_LEFT;
+            if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT))
+               temp |= INPUT_RIGHT;
+
+            player++;
+            break;
+
+         case DEVICE_TEREBI:
+            input.analog[i][0] = ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_X) + 0x7fff) * 250) / 0xfffe;
+            input.analog[i][1] = ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_Y) + 0x7fff) * 250) / 0xfffe;
+
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_LEFT))
+               temp |= INPUT_BUTTON1;
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_MIDDLE))
+               temp |= INPUT_START;
+
+            player++;
+            break;
+
+         case DEVICE_GRAPHIC_BOARD:
+            input.analog[i][0] = ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_X) + 0x7fff) * 255) / 0xfffe;
+            input.analog[i][1] = ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_Y) + 0x7fff) * 255) / 0xfffe;
+
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_LEFT))
+               temp |= INPUT_GRAPHIC_PEN;
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_MIDDLE))
+               temp |= INPUT_GRAPHIC_DO;
+            if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_RIGHT))
+               temp |= INPUT_GRAPHIC_MENU;
+
+            player++;
+            break;
+
+         case DEVICE_XE_1AP:
+            {
+               int rx = input.analog[i][0] = input_state_cb(player, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X);
+               int ry = input.analog[i][1] = input_state_cb(player, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y);
+               if (abs(rx) > abs(ry))
+                  input.analog[i+1][0] = (rx + 0x8000) >> 8;
+               else 
+                  input.analog[i+1][0] = (0x7fff - ry) >> 8;
+               input.analog[i][0] = (input_state_cb(player, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X) + 0x8000) >> 8;
+               input.analog[i][1] = (input_state_cb(player, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y) + 0x8000) >> 8;
+
+               if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R))
+                  temp |= INPUT_XE_A;
+               if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R2))
+                  temp |= INPUT_XE_B;
+               if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L))
+                  temp |= INPUT_XE_C;
+               if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L2))
+                  temp |= INPUT_XE_D;
+               if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y))
+                  temp |= INPUT_XE_E1;
+               if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B))
+                  temp |= INPUT_XE_E2;
+               if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT))
+                  temp |= INPUT_XE_SELECT;
+               if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START))
+                  temp |= INPUT_XE_START;
+
+               player++;
+               break;
+            }
+
+         case DEVICE_SMASH:
+         {
+            int pressed;
+            if (retro_gun_mode == RetroPointer)
+            {
+               pressed = input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_PRESSED);
+               input.analog[i][0] = ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_X) + 0x7fff) * bitmap.viewport.w) / 0xfffe;
+               input.analog[i][1] = ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_Y) + 0x7fff) * bitmap.viewport.h) / 0xfffe;
+            }
+            else
+            {
+               pressed = input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_TRIGGER);
+               if (input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_IS_OFFSCREEN))
+               {
+                  input.analog[i][0] = input.analog[i][1] = 512;
+               }
+               else
+               {
+                  input.analog[i][0] = ((input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_SCREEN_X) + 0x7fff) * bitmap.viewport.w) / 0xfffe;
+                  input.analog[i][1] = ((input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_SCREEN_Y) + 0x7fff) * bitmap.viewport.h) / 0xfffe;
+               }
+            }
+
+            /* no buttons pressed by default */
+            temp = 0;
+
+            /* check if trigger button is pressed */
+            if (pressed)
+            {
+               /* horizontal position */
+               int x = input.analog[i][0];
+
+               /* adjust vertical position with default screen offset for Whac-a-Critter / Mallet Legend */
+               /* note: this could be made configurable but no other known game supports this controller */
+               int y = input.analog[i][1] - (bitmap.viewport.h/2);
+
+               /* determine pressed button */
+               if (y < (bitmap.viewport.h/6))
+               {
+                  /* top row */
+                  if (x < (bitmap.viewport.w/3)) temp = INPUT_SMASH_UP_LEFT;
+                  else if (x < ((2*bitmap.viewport.w)/3)) temp = INPUT_SMASH_UP;
+                  else temp = INPUT_SMASH_UP_RIGHT;
+               }
+               else if (y < ((2*bitmap.viewport.h)/6))
+               {
+                  /* middle row */
+                  if (x < (bitmap.viewport.w/3)) temp = INPUT_SMASH_LEFT;
+                  else if (x < ((2*bitmap.viewport.w)/3)) temp = INPUT_SMASH_CENTER;
+                  else temp = INPUT_SMASH_RIGHT;
+               }
+               else if (y < (bitmap.viewport.h/2))
+               {
+                  /* bottom row */
+                  if (x < (bitmap.viewport.w/3)) temp = INPUT_SMASH_DOWN_LEFT;
+                  else if (x < ((2*bitmap.viewport.w)/3)) temp = INPUT_SMASH_DOWN;
+                  else temp = INPUT_SMASH_DOWN_RIGHT;
+               }
+            }
+            player++;
+            break;
+         }
+
+         default:
+            break;
+      }
+
+      input.pad[i] = temp;
+   }
+}
+
 void osd_input_update(void)
 {
-  int i, player = 0;
-  unsigned int temp;
-
   input_poll_cb();
 
   /* Update RAM patches */
   RAMCheatUpdate();
 
-  for (i = 0; i < MAX_INPUTS; i++)
-  {
-    temp = 0;
-    switch (input.dev[i])
-    {
-      case DEVICE_PAD6B:
-      {
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L))
-          temp |= INPUT_X;
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_X))
-          temp |= INPUT_Y;
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R))
-          temp |= INPUT_Z;
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT))
-          temp |= INPUT_MODE;
-      }
-
-      case DEVICE_PAD3B:
-      {
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y))
-          temp |= INPUT_A;
-      }
-
-      case DEVICE_PAD2B:
-      {
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B))
-          temp |= INPUT_B;
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A))
-          temp |= INPUT_C;
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START))
-          temp |= INPUT_START;
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP))
-          temp |= INPUT_UP;
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN))
-          temp |= INPUT_DOWN;
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT))
-          temp |= INPUT_LEFT;
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT))
-          temp |= INPUT_RIGHT;
-
-        player++;
-        break;
-      }
-
-      case DEVICE_MOUSE:
-      {
-        input.analog[i][0] = input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_X);
-        if (config.invert_mouse)
-          input.analog[i][1] = input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_Y);
-        else
-          input.analog[i][1] = -input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_Y);
-
-        if (input.analog[i][0] < -255)
-          input.analog[i][0] = -255;
-        else if (input.analog[i][0] > 255)
-          input.analog[i][0] = 255;
-        if (input.analog[i][1] < -255)
-          input.analog[i][1] = -255;
-        else if (input.analog[i][1] > 255)
-          input.analog[i][1] = 255;
-
-        if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_LEFT))
-          temp |= INPUT_MOUSE_LEFT;
-        if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_RIGHT))
-          temp |= INPUT_MOUSE_RIGHT;
-        if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_WHEELDOWN))
-          temp |= INPUT_MOUSE_CENTER;
-        if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_MIDDLE))
-          temp |= INPUT_START;
-
-        player++;
-        break;
-      }
-
-      case DEVICE_LIGHTGUN:
-      {
-        if ( input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_IS_OFFSCREEN) )
-        {
-           input.analog[i][0] = -1000;
-           input.analog[i][1] = -1000;
-        }
-        else
-        {
-           input.analog[i][0] = ((input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_SCREEN_X) + 0x7fff) * bitmap.viewport.w) / 0xfffe;
-           input.analog[i][1] = ((input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_SCREEN_Y) + 0x7fff) * bitmap.viewport.h) / 0xfffe;
-        }
-
-        if (input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_TRIGGER))
-          temp |= INPUT_A;
-        if (input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_AUX_A))
-          temp |= INPUT_B;
-        if (input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_AUX_B))
-          temp |= INPUT_C;
-        if (input_state_cb(player, RETRO_DEVICE_LIGHTGUN, 0, RETRO_DEVICE_ID_LIGHTGUN_START))
-          temp |= INPUT_START;
-
-        player++;
-        break;
-      }
-
-      case DEVICE_PADDLE:
-      {
-        input.analog[i][0] = (input_state_cb(player, RETRO_DEVICE_ANALOG, 0, RETRO_DEVICE_ID_ANALOG_X) + 0x8000) >> 8;
-
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B))
-          temp |= INPUT_BUTTON1;
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START))
-          temp |= INPUT_START;
-
-        player++;
-        break;
-      }
-
-      case DEVICE_SPORTSPAD:
-      {
-        input.analog[i][0] = (input_state_cb(player, RETRO_DEVICE_ANALOG, 0, RETRO_DEVICE_ID_ANALOG_X) + 0x8000) >> 8;
-        input.analog[i][1] = (input_state_cb(player, RETRO_DEVICE_ANALOG, 0, RETRO_DEVICE_ID_ANALOG_Y) + 0x8000) >> 8;
-
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B))
-          temp |= INPUT_BUTTON1;
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A))
-          temp |= INPUT_BUTTON2;
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START))
-          temp |= INPUT_START;
-
-        player++;
-        break;
-      }
-
-      case DEVICE_PICO:
-      {
-        input.analog[i][0] = 0x03c + ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_X) + 0x7fff) * (0x17c-0x03c)) / 0xfffe;
-        input.analog[i][1] = 0x1fc + ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_Y) + 0x7fff) * (0x2f7-0x1fc)) / 0xfffe;
-
-        if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_LEFT))
-          temp |= INPUT_PICO_PEN;
-        if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_RIGHT))
-          temp |= INPUT_PICO_RED;
-        if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_WHEELUP))
-          pico_current = (pico_current - 1) & 7;
-        if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_WHEELDOWN))
-          pico_current = (pico_current + 1) & 7;
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP))
-          temp |= INPUT_UP;
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN))
-          temp |= INPUT_DOWN;
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT))
-          temp |= INPUT_LEFT;
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT))
-          temp |= INPUT_RIGHT;
-
-        player++;
-        break;
-      }
-
-      case DEVICE_TEREBI:
-      {
-        input.analog[i][0] = ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_X) + 0x7fff) * 250) / 0xfffe;
-        input.analog[i][1] = ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_Y) + 0x7fff) * 250) / 0xfffe;
-
-        if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_LEFT))
-          temp |= INPUT_BUTTON1;
-        if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_MIDDLE))
-          temp |= INPUT_START;
-
-        player++;
-        break;
-      }
-
-      case DEVICE_GRAPHIC_BOARD:
-      {
-        input.analog[i][0] = ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_X) + 0x7fff) * 255) / 0xfffe;
-        input.analog[i][1] = ((input_state_cb(player, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_Y) + 0x7fff) * 255) / 0xfffe;
-
-        if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_LEFT))
-          temp |= INPUT_GRAPHIC_PEN;
-        if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_MIDDLE))
-          temp |= INPUT_GRAPHIC_DO;
-        if (input_state_cb(player, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_RIGHT))
-          temp |= INPUT_GRAPHIC_MENU;
-
-        player++;
-        break;
-      }
-
-      case DEVICE_XE_1AP:
-      {
-        int rx = input.analog[i][0] = input_state_cb(player, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X);
-        int ry = input.analog[i][1] = input_state_cb(player, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y);
-        if (abs(rx) > abs(ry))
-        {
-         input.analog[i+1][0] = (rx + 0x8000) >> 8;
-        }
-        else 
-        {
-         input.analog[i+1][0] = (0x7fff - ry) >> 8;
-        }
-        input.analog[i][0] = (input_state_cb(player, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X) + 0x8000) >> 8;
-        input.analog[i][1] = (input_state_cb(player, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y) + 0x8000) >> 8;
-
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R))
-          temp |= INPUT_XE_A;
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R2))
-          temp |= INPUT_XE_B;
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L))
-          temp |= INPUT_XE_C;
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L2))
-          temp |= INPUT_XE_D;
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y))
-          temp |= INPUT_XE_E1;
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B))
-          temp |= INPUT_XE_E2;
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT))
-          temp |= INPUT_XE_SELECT;
-        if (input_state_cb(player, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START))
-          temp |= INPUT_XE_START;
-
-        player++;
-        break;
-      }
-
-      default:
-        break;
-    }
-
-    input.pad[i] = temp;
-  }
+  if (libretro_supports_bitmasks)
+     osd_input_update_internal_bitmasks();
+  else
+     osd_input_update_internal();
 }
 
 static void draw_cursor(int16_t x, int16_t y, uint16_t color)
@@ -586,10 +1044,12 @@ static void config_default(void)
    /* sound options */
    config.psg_preamp     = 150;
    config.fm_preamp      = 100;
+   config.cdda_volume    = 100;
+   config.pcm_volume     = 100;
    config.hq_fm          = 1; /* high-quality FM resampling (slower) */
    config.hq_psg         = 1; /* high-quality PSG resampling (slower) */
-   config.filter         = 0; /* no filter */
-   config.lp_range       = 0x7fff; /* 0.5 in 0.16 fixed point */
+   config.filter         = 1; /* no filter */
+   config.lp_range       = 0x9999; /* 0.6 in 0.16 fixed point */
    config.low_freq       = 880;
    config.high_freq      = 5000;
    config.lg             = 100;
@@ -598,6 +1058,11 @@ static void config_default(void)
    config.ym2612         = YM2612_DISCRETE; 
    config.ym2413         = 2; /* AUTO */
    config.mono           = 0; /* STEREO output */
+#ifdef USE_PER_SOUND_CHANNELS_CONFIG
+   for (i = 0; i < 4; i++) config.psg_ch_volumes[i]    = 100;  /* individual channel volumes */
+   for (i = 0; i < 6; i++) config.md_ch_volumes[i]     = 100;  /* individual channel volumes */
+   for (i = 0; i < 9; i++) config.sms_fm_ch_volumes[i] = 100;  /* individual channel volumes */
+#endif
 #ifdef HAVE_YM3438_CORE
    config.ym3438         = 0;
 #endif
@@ -614,11 +1079,14 @@ static void config_default(void)
    config.addr_error     = 1;
    config.bios           = 0;
    config.lock_on        = 0;
+   config.add_on         = HW_ADDON_AUTO;
    config.lcd            = 0; /* 0.8 fixed point */
 #ifdef HAVE_OVERCLOCK
    config.overclock      = 100;
 #endif
    config.no_sprite_limit = 0;
+   config.enhanced_vscroll = 0;
+   config.enhanced_vscroll_limit = 8;
 
    /* video options */
    config.overscan = 0;
@@ -627,6 +1095,7 @@ static void config_default(void)
    config.ntsc     = 0;
    config.lcd      = 0;
    config.render   = 0;
+   config.left_border = 0;
 
    /* input options */
    input.system[0] = SYSTEM_GAMEPAD;
@@ -912,15 +1381,22 @@ static void update_overclock(void)
 }
 #endif
 
-static void check_variables(void)
+static void check_variables(bool first_run)
 {
   unsigned orig_value;
   struct retro_system_av_info info;
-  bool update_viewports = false;
-  bool reinit = false;
+#ifdef USE_PER_SOUND_CHANNELS_CONFIG
+  unsigned c;
+  char md_fm_channel_volume_base_str[]  = "genesis_plus_gx_md_channel_0_volume";
+  char sms_fm_channel_volume_base_str[] = "genesis_plus_gx_sms_fm_channel_0_volume";
+  char psg_channel_volume_base_str[]    = "genesis_plus_gx_psg_channel_0_volume";
+#endif
+  bool update_viewports     = false;
+  bool reinit               = false;
+  bool update_frameskip     = false;
   struct retro_variable var = {0};
 
-  var.key = "genesis_plus_gx_bram";
+  var.key = "genesis_plus_gx_system_bram";
   environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var);
   {
 #if defined(_WIN32)
@@ -943,6 +1419,25 @@ static void check_variables(void)
    }
   }
 
+  var.key = "genesis_plus_gx_cart_bram";
+  environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var);
+  {
+#if defined(_WIN32)
+    char slash = '\\';
+#else
+    char slash = '/';
+#endif
+
+   if (!var.value || !strcmp(var.value, "per cart"))
+   {
+     snprintf(CART_BRAM, sizeof(CART_BRAM), "%s%ccart.brm", save_dir, slash);
+   }
+   else
+   {
+     snprintf(CART_BRAM, sizeof(CART_BRAM), "%s%c%s_cart.brm", save_dir, slash, g_rom_name);
+   }
+  }
+
   var.key = "genesis_plus_gx_system_hw";
   environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var);
   {
@@ -951,6 +1446,8 @@ static void check_variables(void)
       config.system = SYSTEM_SG;
     else if (var.value && !strcmp(var.value, "sg-1000 II"))
       config.system = SYSTEM_SGII;
+    else if (var.value && !strcmp(var.value, "sg-1000 II + ram ext."))
+      config.system = SYSTEM_SGII_RAM_EXT;
     else if (var.value && !strcmp(var.value, "mark-III"))
       config.system = SYSTEM_MARKIII;
     else if (var.value && !strcmp(var.value, "master system"))
@@ -1087,6 +1584,89 @@ static void check_variables(void)
 
           update_viewports = true;
         }
+
+        update_frameskip = true;
+      }
+    }
+  }
+
+  var.key = "genesis_plus_gx_vdp_mode";
+  environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var);
+  {
+    orig_value = config.vdp_mode;
+    if (var.value && !strcmp(var.value, "60hz"))
+      config.vdp_mode = 1;
+    else if (var.value && !strcmp(var.value, "50hz"))
+      config.vdp_mode = 2;
+    else
+      config.vdp_mode = 0;
+
+    if (orig_value != config.vdp_mode)
+    {
+      if (system_hw)
+      {
+        get_region(NULL);
+
+        if ((system_hw == SYSTEM_MCD) || ((system_hw & SYSTEM_SMS) && config.bios))
+        {
+          /* system with region BIOS should be reinitialized */
+          reinit = true;
+        }
+        else
+        {
+          static const uint16 vc_table[4][2] = 
+          {
+            /* NTSC, PAL */
+            {0xDA , 0xF2},  /* Mode 4 (192 lines) */
+            {0xEA , 0x102}, /* Mode 5 (224 lines) */
+            {0xDA , 0xF2},  /* Mode 4 (192 lines) */
+            {0x106, 0x10A}  /* Mode 5 (240 lines) */
+          };
+
+          /* framerate might have changed, reinitialize audio timings */
+          audio_set_rate(44100, 0);
+
+          /* reinitialize I/O region register */
+          if (system_hw == SYSTEM_MD)
+          {
+            io_reg[0x00] = 0x20 | region_code | (config.bios & 1);
+          }
+          else if (system_hw == SYSTEM_MCD)
+          {
+            io_reg[0x00] = region_code | (config.bios & 1);
+          }
+          else
+          {
+            io_reg[0x00] = 0x80 | (region_code >> 1);
+          }
+
+          /* reinitialize VDP timings */
+          lines_per_frame = vdp_pal ? 313 : 262;
+
+          /* reinitialize NTSC/PAL mode in VDP status */
+          if (system_hw & SYSTEM_MD)
+          {
+            status = (status & ~1) | vdp_pal;
+          }
+
+          /* reinitialize VC max value */
+          switch (bitmap.viewport.h)
+          {
+            case 192:
+              vc_max = vc_table[0][vdp_pal];
+              break;
+            case 224:
+              vc_max = vc_table[1][vdp_pal];
+              break;
+            case 240:
+              vc_max = vc_table[3][vdp_pal];
+              break;
+          }
+
+          update_viewports = true;
+        }
+
+        update_frameskip = true;
       }
     }
   }
@@ -1107,6 +1687,30 @@ static void check_variables(void)
       m68k.aerr_enabled = config.addr_error = 1;
     else
       m68k.aerr_enabled = config.addr_error = 0;
+  }
+
+  var.key = "genesis_plus_gx_cd_latency";
+  environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var);
+  {
+    if (!var.value || !strcmp(var.value, "enabled"))
+      config.cd_latency = 1;
+    else
+      config.cd_latency = 0;
+  }
+
+  var.key = "genesis_plus_gx_add_on";
+  environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var);
+  {
+    orig_value = config.add_on;
+    if (var.value && !strcmp(var.value, "sega/mega cd"))
+      config.add_on = HW_ADDON_MEGACD;
+    else if (var.value && !strcmp(var.value, "megasd"))
+      config.add_on = HW_ADDON_MEGASD;
+    else if (var.value && !strcmp(var.value, "none"))
+      config.add_on = HW_ADDON_NONE;
+    else
+      config.add_on = HW_ADDON_AUTO;
+    /* note: game needs to be reloaded for change to take effect */
   }
 
   var.key = "genesis_plus_gx_lock_on";
@@ -1182,6 +1786,39 @@ static void check_variables(void)
       config.mono = 0; 
   }
 
+
+  var.key = "genesis_plus_gx_psg_preamp";
+  environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var);
+  {
+    config.psg_preamp = (!var.value) ? 150: atoi(var.value);
+    if ((system_hw & SYSTEM_PBC) == SYSTEM_MD)
+    {
+      psg_config(0, config.psg_preamp, 0xff);
+    }
+    else
+    {
+      psg_config(0, config.psg_preamp, io_reg[6]);
+    }
+  }
+
+  var.key = "genesis_plus_gx_fm_preamp";
+  environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var);
+  {
+    config.fm_preamp = (!var.value) ? 100: atoi(var.value);
+  }
+
+  var.key = "genesis_plus_gx_cdda_volume";
+  environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var);
+  {
+    config.cdda_volume = (!var.value) ? 100: atoi(var.value);
+  }
+
+  var.key = "genesis_plus_gx_pcm_volume";
+  environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var);
+  {
+    config.pcm_volume = (!var.value) ? 100: atoi(var.value);
+  }
+
   var.key = "genesis_plus_gx_audio_filter";
   environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var);
   {
@@ -1200,7 +1837,7 @@ static void check_variables(void)
   var.key = "genesis_plus_gx_lowpass_range";
   environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var);
   {
-    config.lp_range = (!var.value) ? 60 : ((atoi(var.value) * 65536) / 100);
+    config.lp_range = (!var.value) ? 0x9999 : ((atoi(var.value) * 65536) / 100);
   }
 
 #if HAVE_EQ
@@ -1273,6 +1910,28 @@ static void check_variables(void)
       YM2612Config(YM2612_ENHANCED);
     }
   }
+
+  var.key        = "genesis_plus_gx_frameskip";
+  var.value      = NULL;
+  orig_value     = frameskip_type;
+  frameskip_type = 0;
+
+  if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+  {
+    if (strcmp(var.value, "auto") == 0)
+      frameskip_type = 1;
+    else if (strcmp(var.value, "manual") == 0)
+      frameskip_type = 2;
+  }
+
+  update_frameskip = update_frameskip || (frameskip_type != orig_value);
+
+  var.key             = "genesis_plus_gx_frameskip_threshold";
+  var.value           = NULL;
+  frameskip_threshold = 33;
+
+  if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+    frameskip_threshold = strtol(var.value, NULL, 10);
 
   var.key = "genesis_plus_gx_blargg_ntsc_filter";
   environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var);
@@ -1382,6 +2041,15 @@ static void check_variables(void)
       config.gun_cursor = 1;
   }
 
+  var.key = "genesis_plus_gx_gun_input";
+  environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var);
+  {
+    if (!var.value || !strcmp(var.value, "touchscreen"))
+      retro_gun_mode = RetroPointer;
+    else
+      retro_gun_mode = RetroLightgun;
+  }
+
   var.key = "genesis_plus_gx_invert_mouse";
   environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var);
   {
@@ -1389,6 +2057,20 @@ static void check_variables(void)
       config.invert_mouse = 0;
     else
       config.invert_mouse = 1;
+  }
+
+  var.key = "genesis_plus_gx_left_border";
+  environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var);
+  {
+    orig_value = config.left_border;
+    if (!var.value || !strcmp(var.value, "disabled"))
+      config.left_border = 0;
+    else if (var.value && !strcmp(var.value, "left border"))
+      config.left_border = 1;
+    else if (var.value && !strcmp(var.value, "left & right borders"))
+      config.left_border = 2;
+    if (orig_value != config.left_border)
+      update_viewports = true;
   }
 
 #ifdef HAVE_OVERCLOCK
@@ -1420,6 +2102,104 @@ static void check_variables(void)
       config.no_sprite_limit = 1;
   }
 
+  var.key = "genesis_plus_gx_enhanced_vscroll";
+  environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var);
+  {
+      if (!var.value || !strcmp(var.value, "disabled"))
+         config.enhanced_vscroll = 0;
+      else
+         config.enhanced_vscroll = 1;
+  }
+
+  var.key = "genesis_plus_gx_enhanced_vscroll_limit";
+  if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+    config.enhanced_vscroll_limit = strtol(var.value, NULL, 10);
+
+#ifdef USE_PER_SOUND_CHANNELS_CONFIG
+  var.key = psg_channel_volume_base_str;
+  for (c = 0; c < 4; c++)
+  {
+     psg_channel_volume_base_str[28] = c+'0';
+     if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var))
+     {
+        config.psg_ch_volumes[c] = atoi(var.value);
+        /* need to recall config to have the settings applied */
+        if ((system_hw & SYSTEM_PBC) == SYSTEM_MD)
+           psg_config(0, config.psg_preamp, 0xff);
+        else
+           psg_config(0, config.psg_preamp, io_reg[6]);
+     }
+  }
+  
+  var.key = md_fm_channel_volume_base_str;
+  for (c = 0; c < 6; c++)
+  {
+    md_fm_channel_volume_base_str[27] = c+'0';
+    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var))
+      config.md_ch_volumes[c] = atoi(var.value);
+  }
+  
+  var.key = sms_fm_channel_volume_base_str;
+  for (c = 0; c < 9; c++)
+  {
+     sms_fm_channel_volume_base_str[31] = c+'0';
+     if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var))
+        config.sms_fm_ch_volumes[c] = atoi(var.value);
+  }
+
+  var.key = "genesis_plus_gx_show_advanced_audio_settings";
+  var.value = NULL;
+
+  /* If frontend supports core option categories,
+   * then genesis_plus_gx_show_advanced_audio_settings
+   * is ignored and no options should be hidden */
+
+  if (!libretro_supports_option_categories &&
+      environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+  {
+    bool show_advanced_av_settings_prev = show_advanced_av_settings;
+
+    show_advanced_av_settings = true;
+    if (strcmp(var.value, "disabled") == 0)
+      show_advanced_av_settings = false;
+
+    if (show_advanced_av_settings != show_advanced_av_settings_prev)
+    {
+      size_t i;
+      struct retro_core_option_display option_display;
+      char av_keys[19][40] = {
+        "genesis_plus_gx_psg_channel_0_volume",
+        "genesis_plus_gx_psg_channel_1_volume",
+        "genesis_plus_gx_psg_channel_2_volume",
+        "genesis_plus_gx_psg_channel_3_volume",
+        "genesis_plus_gx_md_channel_0_volume",
+        "genesis_plus_gx_md_channel_1_volume",
+        "genesis_plus_gx_md_channel_2_volume",
+        "genesis_plus_gx_md_channel_3_volume",
+        "genesis_plus_gx_md_channel_4_volume",
+        "genesis_plus_gx_md_channel_5_volume",
+        "genesis_plus_gx_sms_fm_channel_0_volume",
+        "genesis_plus_gx_sms_fm_channel_1_volume",
+        "genesis_plus_gx_sms_fm_channel_2_volume",
+        "genesis_plus_gx_sms_fm_channel_3_volume",
+        "genesis_plus_gx_sms_fm_channel_4_volume",
+        "genesis_plus_gx_sms_fm_channel_5_volume",
+        "genesis_plus_gx_sms_fm_channel_6_volume",
+        "genesis_plus_gx_sms_fm_channel_7_volume",
+        "genesis_plus_gx_sms_fm_channel_8_volume"
+      };
+
+      option_display.visible = show_advanced_av_settings;
+
+      for (i = 0; i < 19; i++)
+      {
+        option_display.key = av_keys[i];
+        environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &option_display);
+      }
+    }
+  }
+#endif
+
   if (reinit)
   {
 #ifdef HAVE_OVERCLOCK
@@ -1441,6 +2221,10 @@ static void check_variables(void)
     else
       bitmap.viewport.x = (config.overscan & 2) * 7;
   }
+
+  /* Reinitialise frameskipping, if required */
+  if ((update_frameskip || reinit) && !first_run)
+    init_frameskip();
 }
 
 /* Cheat Support */
@@ -1463,7 +2247,8 @@ static uint32_t decode_cheat(char *string, int index)
          {
             if (i == 4) string++;
             p = strchr (ggvalidchars, *string++);
-            if (p == NULL) return 0;
+            if (!p)
+               return 0;
             n = p - ggvalidchars;
             switch (i)
             {
@@ -1507,7 +2292,8 @@ static uint32_t decode_cheat(char *string, int index)
          for (i=0; i<6; i++)
          {
             p = strchr (arvalidchars, *string++);
-            if (p == NULL) return 0;
+            if (!p)
+               return 0;
             n = (p - arvalidchars) & 0xF;
             address |= (n << ((5 - i) * 4));
          }
@@ -1516,7 +2302,8 @@ static uint32_t decode_cheat(char *string, int index)
          for (i=0; i<4; i++)
          {
             p = strchr (arvalidchars, *string++);
-            if (p == NULL) break;
+            if (!p)
+               break;
             n = (p - arvalidchars) & 0xF;
             data |= (n << ((3 - i) * 4));
          }
@@ -1533,22 +2320,26 @@ static uint32_t decode_cheat(char *string, int index)
          for (i=0; i<2; i++)
          {
             p = strchr (arvalidchars, *string++);
-            if (p == NULL) return 0;
+            if (!p)
+               return 0;
             n = (p - arvalidchars) & 0xF;
             data |= (n << ((1 - i) * 4));
          }
+
          /* decode 16-bit address (low 12-bits) */
          for (i=0; i<3; i++)
          {
             if (i==1) string++; /* skip separator */
             p = strchr (arvalidchars, *string++);
-            if (p == NULL) return 0;
+            if (!p)
+               return 0;
             n = (p - arvalidchars) & 0xF;
             address |= (n << ((2 - i) * 4));
          }
          /* decode 16-bit address (high 4-bits) */
          p = strchr (arvalidchars, *string++);
-         if (p == NULL) return 0;
+         if (!p)
+            return 0;
          n = (p - arvalidchars) & 0xF;
          n ^= 0xF; /* bits inversion */
          address |= (n << 12);
@@ -1559,7 +2350,8 @@ static uint32_t decode_cheat(char *string, int index)
             {
                string++; /* skip separator and 2nd digit */
                p = strchr (arvalidchars, *string++);
-               if (p == NULL) return 0;
+               if (!p)
+                  return 0;
                n = (p - arvalidchars) & 0xF;
                ref |= (n << ((1 - i) * 4));
             }
@@ -1582,7 +2374,8 @@ static uint32_t decode_cheat(char *string, int index)
          for (i=0; i<4; i++)
          {
             p = strchr (arvalidchars, *string++);
-            if (p == NULL) return 0;
+            if (!p)
+               return 0;
             n = (p - arvalidchars) & 0xF;
             address |= (n << ((3 - i) * 4));
             if (i==1) string++;
@@ -1591,7 +2384,8 @@ static uint32_t decode_cheat(char *string, int index)
          for (i=0; i<2; i++)
          {
             p = strchr (arvalidchars, *string++);
-            if (p == NULL) return 0;
+            if (!p)
+               return 0;
             n = (p - arvalidchars) & 0xF;
             data |= (n << ((1 - i) * 4));
          }
@@ -1606,7 +2400,8 @@ static uint32_t decode_cheat(char *string, int index)
          for (i=0; i<4; i++)
          {
             p = strchr (arvalidchars, *string++);
-            if (p == NULL) return 0;
+            if (!p)
+               return 0;
             n = (p - arvalidchars) & 0xF;
             address |= (n << ((3 - i) * 4));
          }
@@ -1615,7 +2410,8 @@ static uint32_t decode_cheat(char *string, int index)
          for (i=0; i<2; i++)
          {
             p = strchr (arvalidchars, *string++);
-            if (p == NULL) return 0;
+            if (!p)
+               return 0;
             n = (p - arvalidchars) & 0xF;
             data |= (n << ((1 - i) * 4));
          }
@@ -1630,7 +2426,8 @@ static uint32_t decode_cheat(char *string, int index)
          for (i=0; i<2; i++)
          {
             p = strchr (arvalidchars, *string++);
-            if (p == NULL) return 0;
+            if (!p)
+               return 0;
             n = (p - arvalidchars) & 0xF;
             ref |= (n << ((1 - i) * 4));
          }
@@ -1638,7 +2435,8 @@ static uint32_t decode_cheat(char *string, int index)
          for (i=0; i<4; i++)
          {
             p = strchr (arvalidchars, *string++);
-            if (p == NULL) return 0;
+            if (!p)
+               return 0;
             n = (p - arvalidchars) & 0xF;
             address |= (n << ((3 - i) * 4));
          }
@@ -1647,7 +2445,8 @@ static uint32_t decode_cheat(char *string, int index)
          for (i=0; i<2; i++)
          {
             p = strchr (arvalidchars, *string++);
-            if (p == NULL) return 0;
+            if (!p)
+               return 0;
             n = (p - arvalidchars) & 0xF;
             data |= (n << ((1 - i) * 4));
          }
@@ -1656,9 +2455,7 @@ static uint32_t decode_cheat(char *string, int index)
       }
       /* convert to 24-bit Work RAM address */
       if (address >= 0xC000)
-      {
          address = 0xFF0000 | (address & 0x1FFF);
-      }
    }
    /* Valid code found ? */
    if (len)
@@ -1683,7 +2480,33 @@ static void apply_cheats(void)
    {
       if (cheatlist[i].enable)
       {
-         if (cheatlist[i].address < cart.romsize)
+         /* detect Work RAM patch */
+         if (cheatlist[i].address >= 0xFF0000)
+         {
+            /* add RAM patch */
+            cheatIndexes[maxRAMcheats++] = i;
+         }
+
+         /* check if Mega-CD game is running */
+         else if ((system_hw == SYSTEM_MCD) && !scd.cartridge.boot)
+         {
+            /* detect PRG-RAM patch (Sub-CPU side) */
+            if (cheatlist[i].address < 0x80000)
+            {
+               /* add RAM patch */
+               cheatIndexes[maxRAMcheats++] = i;
+            }
+
+            /* detect Word-RAM patch (Main-CPU side)*/
+            else if ((cheatlist[i].address >= 0x200000) && (cheatlist[i].address < 0x240000))
+            {
+               /* add RAM patch */
+              cheatIndexes[maxRAMcheats++] = i;
+            }
+         }
+
+         /* detect cartridge ROM patch */
+         else if (cheatlist[i].address < cart.romsize)
          {
             if ((system_hw & SYSTEM_PBC) == SYSTEM_MD)
             {
@@ -1713,19 +2536,20 @@ static void apply_cheats(void)
                }
             }
          }
-         else if (cheatlist[i].address >= 0xFF0000)
-         {
-            /* add RAM patch */
-            cheatIndexes[maxRAMcheats++] = i;
-         }
       }
    }
 }
 
 static void clear_cheats(void)
 {
-   int i = maxcheats;
-   /* disable cheats in reversed order in case the same address is used by multiple patches */
+   int i;
+
+  /* no ROM patches with Mega-CD games */
+   if ((system_hw == SYSTEM_MCD) && !scd.cartridge.boot)
+      return;
+
+   /* disable cheats in reversed order in case the same address is used by multiple ROM patches */
+   i = maxcheats;
    while (i > 0)
    {
       if (cheatlist[i-1].enable)
@@ -1762,21 +2586,45 @@ static void clear_cheats(void)
 ****************************************************************************/
 static void RAMCheatUpdate(void)
 {
+   uint8_t *base;
+   uint32_t mask;
    int index, cnt = maxRAMcheats;
+
    while (cnt)
    {
       /* get cheat index */
       index = cheatIndexes[--cnt];
+
+      /* detect destination RAM */
+      switch ((cheatlist[index].address >> 20) & 0xf)
+      {
+         case 0x0: /* Mega-CD PRG-RAM (512 KB) */
+            base = scd.prg_ram;
+            mask = 0x7fffe;
+            break;
+
+         case 0x2: /* Mega-CD 2M Word-RAM (256 KB) */
+            base = scd.word_ram_2M;
+            mask = 0x3fffe;
+            break;
+
+         default: /* Work-RAM (64 KB) */
+            base = work_ram;
+            mask = 0xfffe;
+            break;
+      }
+
       /* apply RAM patch */
       if (cheatlist[index].data & 0xFF00)
       {
-         /* 16-bit patch */
-         *(uint16_t *)(work_ram + (cheatlist[index].address & 0xFFFE)) = cheatlist[index].data;
+         /* word patch */
+         *(uint16_t *)(base + (cheatlist[index].address & mask)) = cheatlist[index].data;
       }
       else
       {
-         /* 8-bit patch */
-         work_ram[cheatlist[index].address & 0xFFFF] = cheatlist[index].data;
+          /* byte patch */
+          mask |= 1;
+          base[cheatlist[index].address & mask] = cheatlist[index].data;
       }
    }
 }
@@ -1823,6 +2671,26 @@ void ROMCheatUpdate(void)
     /* next ROM patch */
     cnt--;
   }
+}
+
+static void set_memory_maps(void)
+{
+   if (system_hw == SYSTEM_MCD)
+   {
+      const size_t SCD_BIT = 1ULL << 31ULL;
+      const uint64_t mem = RETRO_MEMDESC_SYSTEM_RAM;
+      struct retro_memory_map mmaps;
+      struct retro_memory_descriptor descs[] = {
+         { mem, work_ram,     0,           0xFF0000, 0, 0, 0x10000, "68KRAM" },
+         /* virtual address using SCD_BIT so all 512M of prg_ram can be accessed */
+         /* at address $80020000 */
+         { mem, scd.prg_ram,  0, SCD_BIT | 0x020000, 0, 0, 0x80000, "PRGRAM" },
+      };
+
+      mmaps.descriptors = descs;
+      mmaps.num_descriptors = sizeof(descs) / sizeof(descs[0]);
+      environ_cb(RETRO_ENVIRONMENT_SET_MEMORY_MAPS, &mmaps);
+   }
 }
 
 /****************************************************************************
@@ -1970,48 +2838,6 @@ unsigned retro_api_version(void) { return RETRO_API_VERSION; }
 void retro_set_environment(retro_environment_t cb)
 {
    struct retro_vfs_interface_info vfs_iface_info;
-   static const struct retro_variable vars[] = {
-      { "genesis_plus_gx_system_hw", "System hardware; auto|sg-1000|sg-1000 II|mark-III|master system|master system II|game gear|mega drive / genesis" },
-      { "genesis_plus_gx_region_detect", "System region; auto|ntsc-u|pal|ntsc-j" },
-      { "genesis_plus_gx_force_dtack", "System lockups; enabled|disabled" },
-      { "genesis_plus_gx_bios", "System bootrom; disabled|enabled" },
-      { "genesis_plus_gx_bram", "CD System BRAM; per bios|per game" },
-      { "genesis_plus_gx_addr_error", "68k address error; enabled|disabled" },
-      { "genesis_plus_gx_lock_on", "Cartridge lock-on; disabled|game genie|action replay (pro)|sonic & knuckles" },
-      { "genesis_plus_gx_ym2413", "Master System FM (YM2413); auto|disabled|enabled" },
-#ifdef HAVE_OPLL_CORE
-      { "genesis_plus_gx_ym2413_core", "Master System FM (YM2413) core; mame|nuked" },
-#endif
-#ifdef HAVE_YM3438_CORE
-      { "genesis_plus_gx_ym2612", "Mega Drive / Genesis FM; mame (ym2612)|mame (asic ym3438)|mame (enhanced ym3438)|nuked (ym2612)|nuked (ym3438)" },
-#else
-      { "genesis_plus_gx_ym2612", "Mega Drive / Genesis FM; mame (ym2612)|mame (asic ym3438)|mame (enhanced ym3438)" },
-#endif
-
-      { "genesis_plus_gx_sound_output", "Sound output; stereo|mono" },
-      { "genesis_plus_gx_audio_filter", "Audio filter; disabled|low-pass" },
-      { "genesis_plus_gx_lowpass_range", "Low-pass filter %; 60|65|70|75|80|85|90|95|5|10|15|20|25|30|35|40|45|50|55"},
-      
-      #if HAVE_EQ     
-      { "genesis_plus_gx_audio_eq_low",  "EQ Low;  100|0|5|10|15|20|25|30|35|40|45|50|55|60|65|70|75|80|85|90|95" },
-      { "genesis_plus_gx_audio_eq_mid",  "EQ Mid;  100|0|5|10|15|20|25|30|35|40|45|50|55|60|65|70|75|80|85|90|95" },
-      { "genesis_plus_gx_audio_eq_high", "EQ High; 100|0|5|10|15|20|25|30|35|40|45|50|55|60|65|70|75|80|85|90|95" },
-      #endif
-      
-      { "genesis_plus_gx_blargg_ntsc_filter", "Blargg NTSC filter; disabled|monochrome|composite|svideo|rgb" },
-      { "genesis_plus_gx_lcd_filter", "LCD Ghosting filter; disabled|enabled" },
-      { "genesis_plus_gx_overscan", "Borders; disabled|top/bottom|left/right|full" },
-      { "genesis_plus_gx_gg_extra", "Game Gear extended screen; disabled|enabled" },
-      { "genesis_plus_gx_aspect_ratio", "Core-provided aspect ratio; auto|NTSC PAR|PAL PAR" },
-      { "genesis_plus_gx_render", "Interlaced mode 2 output; single field|double field" },
-      { "genesis_plus_gx_gun_cursor", "Show Lightgun crosshair; disabled|enabled" },
-      { "genesis_plus_gx_invert_mouse", "Invert Mouse Y-axis; disabled|enabled" },
-#ifdef HAVE_OVERCLOCK
-      { "genesis_plus_gx_overclock", "CPU speed; 100%|125%|150%|175%|200%" },
-#endif
-      { "genesis_plus_gx_no_sprite_limit", "Remove per-line sprite limit; disabled|enabled" },
-      { NULL, NULL },
-   };
 
    static const struct retro_controller_description port_1[] = {
       { "Joypad Auto", RETRO_DEVICE_JOYPAD },
@@ -2030,6 +2856,7 @@ void retro_set_environment(retro_environment_t cb)
       { "MS Graphic Board", RETRO_DEVICE_GRAPHIC_BOARD },
       { "MD XE-1AP", RETRO_DEVICE_XE_1AP },
       { "MD Mouse", RETRO_DEVICE_MOUSE },
+      { "MD Smash Controller", RETRO_DEVICE_SMASH_CONTROLLER }
    };
 
    static const struct retro_controller_description port_2[] = {
@@ -2051,11 +2878,12 @@ void retro_set_environment(retro_environment_t cb)
       { "MS Graphic Board", RETRO_DEVICE_GRAPHIC_BOARD },
       { "MD XE-1AP", RETRO_DEVICE_XE_1AP },
       { "MD Mouse", RETRO_DEVICE_MOUSE },
+      { "MD Smash COntroller", RETRO_DEVICE_SMASH_CONTROLLER }
   };
 
    static const struct retro_controller_info ports[] = {
-      { port_1, 16 },
-      { port_2, 18 },
+      { port_1, 17 },
+      { port_2, 19 },
       { 0 },
    };
 
@@ -2167,10 +2995,42 @@ void retro_set_environment(retro_environment_t cb)
       { 0 },
    };
 
+   static const struct retro_system_content_info_override content_overrides[] = {
+      {
+         "mdx|md|bin|smd|gen|bms|sms|gg|sg|68k|sgd", /* extensions */
+#if defined(LOW_MEMORY)
+         true,                                   /* need_fullpath */
+#else
+         false,                                  /* need_fullpath */
+#endif
+         false                                   /* persistent_data */
+      },
+      { NULL, false, false }
+   };
+
    environ_cb = cb;
-   cb(RETRO_ENVIRONMENT_SET_VARIABLES, (void*)vars);
+
+   libretro_supports_option_categories = false;
+   libretro_set_core_options(environ_cb,
+         &libretro_supports_option_categories);
+
+   /* If frontend supports core option categories,
+    * genesis_plus_gx_show_advanced_audio_settings
+    * is unused and should be hidden */
+   if (libretro_supports_option_categories)
+   {
+      struct retro_core_option_display option_display;
+
+      option_display.visible = false;
+      option_display.key     = "genesis_plus_gx_show_advanced_audio_settings";
+
+      environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY,
+            &option_display);
+   }
+
    cb(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void*)ports);
    cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, (void*)desc);
+   cb(RETRO_ENVIRONMENT_SET_CONTENT_INFO_OVERRIDE, (void*)content_overrides);
 
    vfs_iface_info.required_interface_version = 1;
    vfs_iface_info.iface                      = NULL;
@@ -2193,7 +3053,7 @@ void retro_get_system_info(struct retro_system_info *info)
 #define GIT_VERSION ""
 #endif
    info->library_version = "v1.7.4" GIT_VERSION;
-   info->valid_extensions = "m3u|mdx|md|smd|gen|bin|cue|iso|chd|sms|gg|sg";
+   info->valid_extensions = "m3u|mdx|md|smd|gen|bin|cue|iso|chd|bms|sms|gg|sg|68k|sgd";
    info->block_extract = false;
    info->need_fullpath = true;
 }
@@ -2202,8 +3062,31 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
 {
    info->geometry.base_width    = vwidth;
    info->geometry.base_height   = bitmap.viewport.h + (2 * bitmap.viewport.y);
-   info->geometry.max_width     = 720;
-   info->geometry.max_height    = 576;
+   /* Set maximum dimensions based upon emulated system/config */
+   if ((system_hw & SYSTEM_PBC) == SYSTEM_MD)
+   {
+      /* 16 bit system */
+      if (config.ntsc) {
+         info->geometry.max_width = MD_NTSC_OUT_WIDTH(320 + (bitmap.viewport.x * 2));
+      } else {
+         info->geometry.max_width = 320 + (bitmap.viewport.x * 2);
+      }
+      if (config.render) {
+         info->geometry.max_height = 480 + (vdp_pal * 96 * (config.overscan & 1));
+      } else {
+         info->geometry.max_height = 240 + (vdp_pal * 48 * (config.overscan & 1));
+      }
+   }
+   else
+   {
+      /* 8 bit system */
+      if (config.ntsc) {
+         info->geometry.max_width = SMS_NTSC_OUT_WIDTH(256 + (bitmap.viewport.x * 2));
+      } else {
+         info->geometry.max_width = 256 + (bitmap.viewport.x * 2);
+      }
+      info->geometry.max_height = 240 + (vdp_pal * 48 * (config.overscan & 1));
+   }
    info->geometry.aspect_ratio  = vaspect_ratio;
    info->timing.fps             = (double)(system_clock) / (double)lines_per_frame / (double)MCYCLES_PER_LINE;
    info->timing.sample_rate     = SOUND_FREQUENCY;
@@ -2320,6 +3203,9 @@ void retro_set_controller_port_device(unsigned port, unsigned device)
       case RETRO_DEVICE_GRAPHIC_BOARD:
          input.system[port] = SYSTEM_GRAPHIC_BOARD;
          break;
+      case RETRO_DEVICE_SMASH_CONTROLLER:
+         input.system[port] = SYSTEM_SMASH;
+         break;
       case RETRO_DEVICE_JOYPAD:
       default:
       {
@@ -2360,7 +3246,6 @@ bool retro_unserialize(const void *data, size_t size)
       return FALSE;
 
 #ifdef HAVE_OVERCLOCK
-   overclock_delay = OVERCLOCK_FRAME_DELAY;
    update_overclock();
 #endif
 
@@ -2426,18 +3311,75 @@ void retro_cheat_set(unsigned index, bool enabled, const char *code)
 bool retro_load_game(const struct retro_game_info *info)
 {
    int i;
-   char *dir = NULL;
+   char *dir       = NULL;
 #if defined(_WIN32)
    char slash      = '\\';
 #else
    char slash      = '/';
 #endif
+   struct retro_game_info_ext *info_ext = NULL;
+   char content_path[256];
+   char content_ext[8];
 
-   if (!info)
-      return false;
+   content_path[0] = '\0';
+   content_ext[0]  = '\0';
 
-   if (!info->path)
-      return false;
+   g_rom_data      = NULL;
+   g_rom_size      = 0;
+
+   /* Attempt to fetch extended game info */
+   if (environ_cb(RETRO_ENVIRONMENT_GET_GAME_INFO_EXT, &info_ext))
+   {
+#if !defined(LOW_MEMORY)
+      g_rom_data = (const void *)info_ext->data;
+      g_rom_size = info_ext->size;
+#endif
+      strncpy(g_rom_dir, info_ext->dir, sizeof(g_rom_dir));
+      g_rom_dir[sizeof(g_rom_dir) - 1] = '\0';
+
+      strncpy(g_rom_name, info_ext->name, sizeof(g_rom_name));
+      g_rom_name[sizeof(g_rom_name) - 1] = '\0';
+
+      strncpy(content_ext, info_ext->ext, sizeof(content_ext));
+      content_ext[sizeof(content_ext) - 1] = '\0';
+
+      if (info_ext->file_in_archive)
+      {
+         /* We don't have a 'physical' file in this
+          * case, but the core still needs a filename
+          * in order to detect associated content
+          * (Mega CD Mode 1/MegaSD MD+ mode). We therefore
+          * fake it, using the content directory,
+          * canonical content name, and content file
+          * extension */
+         snprintf(content_path, sizeof(content_path), "%s%c%s.%s",
+               g_rom_dir, slash, g_rom_name, content_ext);
+      }
+      else
+      {
+         strncpy(content_path, info_ext->full_path, sizeof(content_path));
+         content_path[sizeof(content_path) - 1] = '\0';
+      }
+   }
+   else
+   {
+      const char *ext = NULL;
+
+      if (!info || !info->path)
+         return false;
+
+      extract_directory(g_rom_dir, info->path, sizeof(g_rom_dir));
+      extract_name(g_rom_name, info->path, sizeof(g_rom_name));
+
+      strncpy(content_path, info->path, sizeof(content_path));
+      content_path[sizeof(content_path) - 1] = '\0';
+
+      if (ext = strrchr(info->path, '.'))
+      {
+         strncpy(content_ext, ext + 1, sizeof(content_ext));
+         content_ext[sizeof(content_ext) - 1] = '\0';
+      }
+   }
 
 #ifdef FRONTEND_SUPPORTS_RGB565
    {
@@ -2453,9 +3395,6 @@ bool retro_load_game(const struct retro_game_info *info)
 
    init_bitmap();
    config_default();
-
-   extract_directory(g_rom_dir, info->path, sizeof(g_rom_dir));
-   extract_name(g_rom_name, info->path, sizeof(g_rom_name));
 
    if (!environ_cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &dir) || !dir)
    {
@@ -2483,9 +3422,8 @@ bool retro_load_game(const struct retro_game_info *info)
    snprintf(CD_BIOS_EU, sizeof(CD_BIOS_EU), "%s%cbios_CD_E.bin", dir, slash);
    snprintf(CD_BIOS_US, sizeof(CD_BIOS_US), "%s%cbios_CD_U.bin", dir, slash);
    snprintf(CD_BIOS_JP, sizeof(CD_BIOS_JP), "%s%cbios_CD_J.bin", dir, slash);
-   snprintf(CART_BRAM, sizeof(CART_BRAM), "%s%ccart.brm", save_dir, slash);
 
-   check_variables();
+   check_variables(true);
 
    if (log_cb)
    {
@@ -2507,9 +3445,6 @@ bool retro_load_game(const struct retro_game_info *info)
       log_cb(RETRO_LOG_INFO, "Sega/Mega CD RAM CART is located at: %s\n", CART_BRAM);
    }
 
-   g_rom_data = (void *)info->data;
-   g_rom_size = info->size;
-
    /* Clear disk interface (already done in retro_unload_game but better be safe) */
    disk_count = 0;
    disk_index = 0;
@@ -2523,9 +3458,9 @@ bool retro_load_game(const struct retro_game_info *info)
    }
 
    /* M3U file list support */
-   if ((strlen(info->path) > 4) && !strncmp(info->path + strlen(info->path) - 4, ".m3u", 4))
+   if (!strcmp(content_ext, "m3u"))
    {
-      RFILE *fd = filestream_open(info->path, RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
+      RFILE *fd = filestream_open(content_path, RETRO_VFS_FILE_ACCESS_READ, RETRO_VFS_FILE_ACCESS_HINT_NONE);
       if (fd)
       {
          int len;
@@ -2596,14 +3531,14 @@ bool retro_load_game(const struct retro_game_info *info)
    }
    else
    {
-      if (load_rom((char *)info->path) <= 0)
+      if (load_rom(content_path) <= 0)
          return false;
 
       /* automatically add loaded CD to disk interface */
       if ((system_hw == SYSTEM_MCD) && cdd.loaded)
       {
          disk_count = 1;
-         disk_info[0] = strdup(info->path);
+         disk_info[0] = strdup(content_path);
       }
    }
 
@@ -2642,6 +3577,10 @@ bool retro_load_game(const struct retro_game_info *info)
    overclock_delay = OVERCLOCK_FRAME_DELAY;
    update_overclock();
 #endif
+
+   set_memory_maps();
+
+   init_frameskip();
 
    return true;
 }
@@ -2702,35 +3641,46 @@ size_t retro_get_memory_size(unsigned id)
    {
       case RETRO_MEMORY_SAVE_RAM:
       {
-        if (!sram.on)
-          return 0;
+         /* return 0 if SRAM is disabled */
+         if (!sram.on)
+            return 0;
 
-        /* if emulation is not running, we assume the frontend is requesting SRAM size for loading */
-        if (!is_running)
-        {
-          /* max supported size is returned */
-          return 0x10000;
-        }
-
-        /* otherwise, we assume this is for saving and we need to check if SRAM data has been modified */
-        /* this is obviously not %100 safe since the frontend could still be trying to load SRAM while emulation is running */
-        /* a better solution would be that the frontend itself checks if data has been modified before writing it to a file */
-        for (i=0xffff; i>=0; i--)
-        {
-          if (sram.sram[i] != 0xff)
-          {
-            /* only save modified size */
-            return (i+1);
-          }
-        }
-      }
-      case RETRO_MEMORY_SYSTEM_RAM:
-         if (system_hw == SYSTEM_SMS || system_hw == SYSTEM_SMS2 || system_hw == SYSTEM_GG || system_hw == SYSTEM_GGMS)
-            return 0x02000;
-         else
+         /* if emulation is not running, we assume the frontend is requesting SRAM size for loading so max supported size is returned */
+         if (!is_running)
             return 0x10000;
-      default:
+
+         /* otherwise, we assume this is for saving and we return the size of SRAM data that has actually been modified */
+         /* this is obviously not %100 safe since the frontend could still be trying to load SRAM while emulation is running */
+         /* a better solution would be that the frontend itself checks if data has been modified before writing it to a file */
+         for (i=0xffff; i>=0; i--)
+            if (sram.sram[i] != 0xff)
+               return (i+1);
+
+         /* return 0 if SRAM is not modified */
          return 0;
+      }
+
+      case RETRO_MEMORY_SYSTEM_RAM:
+      {
+         /* 16-bit hardware */
+         if ((system_hw & SYSTEM_PBC) == SYSTEM_MD)
+            return 0x10000; /* 64KB internal RAM */
+
+         /* get 8-bit cartrige on-board RAM size */
+         i = sms_cart_ram_size();
+
+         if (i > 0)
+            return i + 0x2000; /* on-board RAM size + max 8KB internal RAM */
+         else if (system_hw == SYSTEM_SGII)
+            return 0x0800; /* 2KB internal RAM */
+         else if (system_hw == SYSTEM_SG)
+            return 0x0400; /* 1KB internal RAM */
+         else
+            return 0x2000; /* 8KB internal RAM */
+      }
+
+      default:
+        return 0;
    }
 }
 
@@ -2810,6 +3760,9 @@ void retro_init(void)
    else
       log_cb = NULL;
 
+   if (environ_cb(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, NULL))
+      libretro_supports_bitmasks = true;
+
    check_system_specs();
 
    environ_cb(RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS, &serialization_quirks);
@@ -2817,6 +3770,14 @@ void retro_init(void)
 
    dbg_req_core = create_shared_mem();
    start_debugging();
+   frameskip_type             = 0;
+   frameskip_threshold        = 0;
+   frameskip_counter          = 0;
+   retro_audio_buff_active    = false;
+   retro_audio_buff_occupancy = 0;
+   retro_audio_buff_underrun  = false;
+   audio_latency              = 0;
+   update_audio_latency       = false;
 }
 
 void retro_deinit(void)
@@ -2828,6 +3789,11 @@ void retro_deinit(void)
     DestroyMenu(dbgMenu);
 
     stop_gui();
+   libretro_supports_option_categories = false;
+   libretro_supports_bitmasks          = false;
+
+   g_rom_data = NULL;
+   g_rom_size = 0;
 }
 
 void retro_reset(void)
@@ -2859,7 +3825,10 @@ void retro_run(void)
        return;
    }
 
+   int do_skip = 0;
    bool updated = false;
+   int vwoffset = 0;
+   int bmdoffset = 0;
    is_running = true;
 
 #ifdef HAVE_OVERCLOCK
@@ -2868,17 +3837,65 @@ void retro_run(void)
       update_overclock();
 #endif
 
+   environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated);
+   if (updated)
+   {
+      check_variables(false);
+      if (restart_eq)
+      {
+         audio_set_equalizer();
+         restart_eq = false;
+      }
+   }
+
+  /* Check whether current frame should
+  * be skipped */
+  if ((frameskip_type > 0) &&
+      retro_audio_buff_active &&
+      !do_skip)
+  {
+    switch (frameskip_type)
+    {
+      case 1: /* auto */
+        do_skip = retro_audio_buff_underrun ? 1 : 0;
+        break;
+      case 2: /* manual */
+        do_skip = (retro_audio_buff_occupancy < frameskip_threshold) ? 1 : 0;
+        break;
+      default:
+        do_skip = 0;
+        break;
+    }
+
+    if (!do_skip || (frameskip_counter >= FRAMESKIP_MAX))
+    {
+      do_skip           = 0;
+      frameskip_counter = 0;
+    }
+    else
+      frameskip_counter++;
+  }
+
+  /* If frameskip settings have changed, update
+  * frontend audio latency */
+  if (update_audio_latency)
+  {
+    environ_cb(RETRO_ENVIRONMENT_SET_MINIMUM_AUDIO_LATENCY,
+        &audio_latency);
+    update_audio_latency = false;
+  }
+
    if (system_hw == SYSTEM_MCD)
    {
-      system_frame_scd(0);
+      system_frame_scd(do_skip);
    }
    else if ((system_hw & SYSTEM_PBC) == SYSTEM_MD)
    {
-      system_frame_gen(0);
+      system_frame_gen(do_skip);
    }
    else
    {
-      system_frame_sms(0);
+      system_frame_sms(do_skip);
    }
 
    if (bitmap.viewport.changed & 9)
@@ -2902,7 +3919,7 @@ void retro_run(void)
 
    if (config.gun_cursor)
    {
-      if (input.system[0] == SYSTEM_LIGHTPHASER)
+      if ((input.system[0] == SYSTEM_LIGHTPHASER) || (input.system[0] == SYSTEM_SMASH))
       {
          draw_cursor(input.analog[0][0], input.analog[0][1], 0x001f);
       }
@@ -2911,7 +3928,7 @@ void retro_run(void)
          draw_cursor(input.analog[4][0], input.analog[4][1], 0x001f);
       }
 
-      if (input.system[1] == SYSTEM_LIGHTPHASER)
+      if ((input.system[1] == SYSTEM_LIGHTPHASER) || (input.system[1] == SYSTEM_SMASH))
       {
          draw_cursor(input.analog[4][0], input.analog[4][1], 0xf800);
       }
@@ -2921,19 +3938,25 @@ void retro_run(void)
       }
    }
 
-   video_cb(bitmap.data, vwidth, vheight, 720 * 2);
-   audio_cb(soundbuffer, audio_update(soundbuffer));
-
-   environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated);
-   if (updated)
+   if ((config.left_border != 0) && (reg[0] & 0x20) && (bitmap.viewport.x == 0) && ((system_hw == SYSTEM_MARKIII) || (system_hw & SYSTEM_SMS) || (system_hw == SYSTEM_PBC)))
    {
-      check_variables();
-      if (restart_eq)
-      {
-         audio_set_equalizer();
-         restart_eq = false;
-      }
+       bmdoffset = (16 + (config.ntsc ? 24 : 0));
+       if (config.left_border == 1)
+           vwoffset = (8 + (config.ntsc ? 12 : 0));
+       else
+           vwoffset = (16 + (config.ntsc ? 24 : 0));
    }
+
+   if (!do_skip)
+   {
+        video_cb(bitmap.data + bmdoffset, vwidth - vwoffset, vheight, 720 * 2);	
+   }
+   else
+   {
+        video_cb(NULL, vwidth - vwoffset, vheight, 720 * 2);
+   }
+
+   audio_cb(soundbuffer, audio_update(soundbuffer));
 
    process_request();
 }

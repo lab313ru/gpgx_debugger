@@ -5,7 +5,7 @@
  *  Support for 16-bit & 8-bit hardware modes
  *
  *  Copyright (C) 1998-2003  Charles Mac Donald (original code)
- *  Copyright (C) 2007-2018  Eke-Eke (Genesis Plus GX)
+ *  Copyright (C) 2007-2025  Eke-Eke (Genesis Plus GX)
  *
  *  Redistribution and use of this code or any derivative works are permitted
  *  provided that the following conditions are met:
@@ -43,7 +43,6 @@
 #include "eq.h"
 
 /* Global variables */
-t_config config;
 t_bitmap bitmap;
 t_snd snd;
 uint32 mcycles_vdp;
@@ -131,17 +130,24 @@ void audio_set_rate(int samplerate, double framerate)
   /* resampled to desired rate at the end of each frame, using Blip Buffer.            */
   blip_set_rates(snd.blips[0], mclk, samplerate);
 
-  /* Mega CD sound hardware */
-  if (system_hw == SYSTEM_MCD)
+  /* Mega CD sound hardware enabled ? */
+  if (snd.blips[1] && snd.blips[2])
   {
     /* number of SCD master clocks run per second */
     mclk = (mclk / system_clock) * SCD_CLOCK;
 
-    /* PCM core */
+    /* initialize PCM audio */
     pcm_init(mclk, samplerate);
 
-    /* CDD core */
+    /* initialize CD-DA audio */
     cdd_init(samplerate);
+  }
+
+  /* Cartridge sound hardware enabled ? */
+  if (snd.blips[3])
+  {
+    /* initialize YX5200 audio */
+    // yx5200_init(samplerate);
   }
 
   /* Reinitialize internal rates */
@@ -154,7 +160,7 @@ void audio_reset(void)
   int i;
   
   /* Clear blip buffers */
-  for (i=0; i<3; i++)
+  for (i=0; i<4; i++)
   {
     if (snd.blips[i])
     {
@@ -184,7 +190,7 @@ void audio_shutdown(void)
   int i;
   
   /* Delete blip buffers */
-  for (i=0; i<3; i++)
+  for (i=0; i<4; i++)
   {
     blip_delete(snd.blips[i]);
     snd.blips[i] = 0;
@@ -193,33 +199,48 @@ void audio_shutdown(void)
 
 int audio_update(int16 *buffer)
 {
-  /* run sound chips until end of frame */
+  /* number of audio streams to mix with FM+PSG stream (none by default) */
+  int mixed_blips = 0;
+
+  /* run FM & PSG sound chips until end of frame */
   int size = sound_update(mcycles_vdp);
 
-  /* Mega CD specific */
-  if (system_hw == SYSTEM_MCD)
+  /* Mega CD sound hardware enabled ? */
+  if (snd.blips[1] && snd.blips[2])
   {
     /* sync PCM chip with other sound chips */
     pcm_update(size);
 
-    /* read CDDA samples */
-    cdd_read_audio(size);
+    /* read CD-DA samples */
+    cdd_update_audio(size);
+
+    /* add PCM & CD-DA streams for audio mixing */
+    mixed_blips += 2;
+  }
+
+  /* Cartridge sound hardware enabled ? */
+  if (snd.blips[3])
+  {
+    /* read YX5200 audio samples */
+    // yx5200_update(size);
+
+    /* add cartridge audio stream for audio mixing */
+    mixed_blips++;
+  }
 
 #ifdef ALIGN_SND
-    /* return an aligned number of samples if required */
-    size &= ALIGN_SND;
+  /* return an aligned number of samples if required */
+  size &= ALIGN_SND;
 #endif
 
-    /* resample & mix FM/PSG, PCM & CD-DA streams to output buffer */
-    blip_mix_samples(snd.blips[0], snd.blips[1], snd.blips[2], buffer, size);
+  /* check number of audio streams to mix with FM+PSG stream */
+  if (mixed_blips)
+  {
+    /* resample & mix all audio streams to output buffer */
+    blip_mix_samples(snd.blips[0], (mixed_blips > 1) ? &snd.blips[1] : &snd.blips[3], mixed_blips, buffer, size);
   }
   else
   {
-#ifdef ALIGN_SND
-    /* return an aligned number of samples if required */
-    size &= ALIGN_SND;
-#endif
-
     /* resample FM/PSG mixed stream to output buffer */
     blip_read_samples(snd.blips[0], buffer, size);
   }
@@ -335,8 +356,10 @@ void system_frame_gen(int do_skip)
   mcycles_vdp = 0;
 
   /* reset VDP FIFO */
-  fifo_write_cnt = 0;
-  fifo_slots = 0;
+  fifo_cycles[0] = 0;
+  fifo_cycles[1] = 0;
+  fifo_cycles[2] = 0;
+  fifo_cycles[3] = 0;
 
   /* check if display setings have changed during previous frame */
   if (bitmap.viewport.changed & 2)
@@ -356,16 +379,18 @@ void system_frame_gen(int do_skip)
       /* video mode has changed */
       bitmap.viewport.changed = 5;
 
-      /* update rendering mode */
+      /* update rendering mode (Mode 5 only) */
       if (reg[1] & 0x04)
       {
         if (im2_flag)
         {
+          parse_satb = parse_satb_m5_im2;
           render_bg = (reg[11] & 0x04) ? render_bg_m5_im2_vs : render_bg_m5_im2;
           render_obj = (reg[12] & 0x08) ? render_obj_m5_im2_ste : render_obj_m5_im2;
         }
         else
         {
+          parse_satb = parse_satb_m5;
           render_bg = (reg[11] & 0x04) ? render_bg_m5_vs : render_bg_m5;
           render_obj = (reg[12] & 0x08) ? render_obj_m5_ste : render_obj_m5;
         }
@@ -421,8 +446,8 @@ void system_frame_gen(int do_skip)
   /* clear DMA Busy, FIFO FULL & field flags */
   status &= 0xFEED;
 
-  /* set VBLANK & FIFO EMPTY flags */
-  status |= 0x0208;
+  /* set VBLANK flag */
+  status |= 0x08;
 
   /* check interlaced modes */
   if (interlaced)
@@ -463,14 +488,14 @@ void system_frame_gen(int do_skip)
     v_counter = bitmap.viewport.h;
 
     /* delay between VBLANK flag & Vertical Interrupt (Dracula, OutRunners, VR Troopers) */
-    m68k_run(788);
+    m68k_run(vint_cycle);
     if (zstate == 1)
     {
-      z80_run(788);
+      z80_run(vint_cycle);
     }
 
     /* set VINT flag */
-    status |= 0x80;    
+    status |= 0x80;
    
     /* Vertical Interrupt */
     vint_pending = 0x20;
@@ -660,8 +685,10 @@ void system_frame_gen(int do_skip)
 
   /* adjust timings for next frame */
   input_end_frame(mcycles_vdp);
+  m68k.refresh_cycles -= mcycles_vdp;
   m68k.cycles -= mcycles_vdp;
   Z80.cycles -= mcycles_vdp;
+  dma_endCycles = 0;
 }
 
 void system_frame_scd(int do_skip)
@@ -674,8 +701,10 @@ void system_frame_scd(int do_skip)
   scd.cycles = 0;
 
   /* reset VDP FIFO */
-  fifo_write_cnt = 0;
-  fifo_slots = 0;
+  fifo_cycles[0] = 0;
+  fifo_cycles[1] = 0;
+  fifo_cycles[2] = 0;
+  fifo_cycles[3] = 0;
 
   /* check if display setings have changed during previous frame */
   if (bitmap.viewport.changed & 2)
@@ -695,16 +724,18 @@ void system_frame_scd(int do_skip)
       /* video mode has changed */
       bitmap.viewport.changed = 5;
 
-      /* update rendering mode */
+      /* update rendering mode (Mode 5 only) */
       if (reg[1] & 0x04)
       {
         if (im2_flag)
         {
+          parse_satb = parse_satb_m5_im2;
           render_bg = (reg[11] & 0x04) ? render_bg_m5_im2_vs : render_bg_m5_im2;
           render_obj = (reg[12] & 0x08) ? render_obj_m5_im2_ste : render_obj_m5_im2;
         }
         else
         {
+          parse_satb = parse_satb_m5;
           render_bg = (reg[11] & 0x04) ? render_bg_m5_vs : render_bg_m5;
           render_obj = (reg[12] & 0x08) ? render_obj_m5_ste : render_obj_m5;
         }
@@ -760,8 +791,8 @@ void system_frame_scd(int do_skip)
   /* clear DMA Busy, FIFO FULL & field flags */
   status &= 0xFEED;
 
-  /* set VBLANK & FIFO EMPTY flags */
-  status |= 0x0208;
+  /* set VBLANK flag */
+  status |= 0x08;
 
   /* check interlaced modes */
   if (interlaced)
@@ -802,14 +833,14 @@ void system_frame_scd(int do_skip)
     v_counter = bitmap.viewport.h;
 
     /* delay between VBLANK flag & Vertical Interrupt (Dracula, OutRunners, VR Troopers) */
-    m68k_run(788);
+    m68k_run(vint_cycle);
     if (zstate == 1)
     {
-      z80_run(788);
+      z80_run(vint_cycle);
     }
 
     /* set VINT flag */
-    status |= 0x80;    
+    status |= 0x80;
 
     /* Vertical Interrupt */
     vint_pending = 0x20;
@@ -984,8 +1015,10 @@ void system_frame_scd(int do_skip)
   /* adjust timings for next frame */
   scd_end_frame(scd.cycles);
   input_end_frame(mcycles_vdp);
+  m68k.refresh_cycles -= mcycles_vdp;
   m68k.cycles -= mcycles_vdp;
   Z80.cycles -= mcycles_vdp;
+  dma_endCycles = 0;
 }
 
 void system_frame_sms(int do_skip)
@@ -997,8 +1030,10 @@ void system_frame_sms(int do_skip)
   mcycles_vdp = 0;
 
   /* reset VDP FIFO */
-  fifo_write_cnt = 0;
-  fifo_slots = 0;
+  fifo_cycles[0] = 0;
+  fifo_cycles[1] = 0;
+  fifo_cycles[2] = 0;
+  fifo_cycles[3] = 0;
 
   /* check if display settings has changed during previous frame */
   if (bitmap.viewport.changed & 2)
@@ -1022,16 +1057,18 @@ void system_frame_sms(int do_skip)
         /* video mode has changed */
         bitmap.viewport.changed = 5;
 
-        /* update rendering mode */
+        /* update rendering mode (Mode 5 only) */
         if (reg[1] & 0x04)
         {
           if (im2_flag)
           {
+            parse_satb = parse_satb_m5_im2;
             render_bg = (reg[11] & 0x04) ? render_bg_m5_im2_vs : render_bg_m5_im2;
             render_obj = (reg[12] & 0x08) ? render_obj_m5_im2_ste : render_obj_m5_im2;
           }
           else
           {
+            parse_satb = parse_satb_m5;
             render_bg = (reg[11] & 0x04) ? render_bg_m5_vs : render_bg_m5;
             render_obj = (reg[12] & 0x08) ? render_obj_m5_ste : render_obj_m5;
           }

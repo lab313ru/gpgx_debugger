@@ -3,7 +3,7 @@
  *  Z80 bank access to 68k bus
  *
  *  Copyright (C) 1998-2003  Charles Mac Donald (original code)
- *  Copyright (C) 2007-2020  Eke-Eke (Genesis Plus GX)
+ *  Copyright (C) 2007-2016  Eke-Eke (Genesis Plus GX)
  *
  *  Redistribution and use of this code or any derivative works are permitted
  *  provided that the following conditions are met:
@@ -57,9 +57,9 @@ typedef struct
 {
   unsigned int (*read)(unsigned int address);
   void (*write)(unsigned int address, unsigned int data);
-} t_zbank_memory_map;
+} _zbank_memory_map;
 
-extern t_zbank_memory_map zbank_memory_map[256];
+extern _zbank_memory_map zbank_memory_map[256];
 
 #ifdef __cplusplus
 }

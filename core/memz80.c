@@ -5,7 +5,7 @@
  *  Support for SG-1000, Mark-III, Master System, Game Gear & Mega Drive ports access
  *
  *  Copyright (C) 1998-2003  Charles Mac Donald (original code)
- *  Copyright (C) 2007-2020  Eke-Eke (Genesis Plus GX)
+ *  Copyright (C) 2007-2025  Eke-Eke (Genesis Plus GX)
  *
  *  Redistribution and use of this code or any derivative works are permitted
  *  provided that the following conditions are met:
@@ -92,6 +92,31 @@ INLINE unsigned char z80_lockup_r(unsigned int address)
 /*  Z80 Memory handlers (Genesis mode)                                      */
 /*--------------------------------------------------------------------------*/
 
+static void z80_request_68k_bus_access(void)
+{
+  /* check if 68k bus is accessed by VDP DMA */
+  if ((Z80.cycles < dma_endCycles) && (dma_type < 2))
+  {
+    /* force Z80 to wait until end of DMA */
+    Z80.cycles = dma_endCycles;
+
+    /* check if DMA is not finished at the end of current timeframe */
+    if (dma_length)
+    {
+      /* indicate Z80 will still be waiting for 68k bus at the end of current DMA timeframe */
+      zstate |= 4;
+    }
+  }
+
+  /* approximate 68k wait-states during Z80 access to 68k bus (cf https://docs.google.com/document/d/1ST9GbFfPnIjLT5loytFCm3pB0kWQ1Oe34DCBBV8saY8) */
+  /* value is adjusted to get ride of graphical glitches in Rick Dangerous 2 title screen when bus refresh delays are also emulated and still get */
+  /* "M68K DELAY ON Z80 ROM READ" test "passed" in Ti_'s test ROM (misc_test.bin), although the measured delay value is still slightly too high. */
+  m68k.cycles += (((Z80.cycles % 7) + 72)/7)*7;
+
+  /* average Z80 wait-states when accessing 68k bus (cf https://docs.google.com/document/d/1ST9GbFfPnIjLT5loytFCm3pB0kWQ1Oe34DCBBV8saY8) */
+  Z80.cycles += (3 * 15);
+}
+
 unsigned char z80_memory_r(unsigned int address)
 {
   switch((address >> 13) & 7)
@@ -111,8 +136,10 @@ unsigned char z80_memory_r(unsigned int address)
     {
       if ((address >> 8) == 0x7F)
       {
-        /* average Z80 wait-states when accessing 68k area */
-        Z80.cycles += 3 * 15;
+        /* request access to 68k bus */
+        z80_request_68k_bus_access();
+
+        /* read from $C00000-$C0FFFF area */
         return (*zbank_memory_map[0xc0].read)(address);
       }
       return z80_unused_r(address);
@@ -120,9 +147,10 @@ unsigned char z80_memory_r(unsigned int address)
       
     default: /* $8000-$FFFF: 68k bank (32K) */
     {
-      /* average Z80 wait-states when accessing 68k area */
-      Z80.cycles += 3 * 15;
+      /* request access to 68k bus */
+      z80_request_68k_bus_access();
 
+      /* read from 68k banked area */
       address = zbank | (address & 0x7FFF);
       if (zbank_memory_map[address >> 16].read)
       {
@@ -163,8 +191,10 @@ void z80_memory_w(unsigned int address, unsigned char data)
 
         case 0x7F: /* $7F00-$7FFF: VDP */
         {
-          /* average Z80 wait-states when accessing 68k area */
-          Z80.cycles += 3 * 15;
+          /* request access to 68k bus */
+          z80_request_68k_bus_access();
+
+          /* write to $C00000-$C0FFFF area */
           (*zbank_memory_map[0xc0].write)(address, data);
           return;
         }
@@ -179,9 +209,10 @@ void z80_memory_w(unsigned int address, unsigned char data)
 
     default: /* $8000-$FFFF: 68k bank (32K) */
     {
-      /* average Z80 wait-states when accessing 68k area */
-      Z80.cycles += 3 * 15;
+      /* request access to 68k bus */
+      z80_request_68k_bus_access();
 
+      /* write to 68k banked area */
       address = zbank | (address & 0x7FFF);
       if (zbank_memory_map[address >> 16].write)
       {
@@ -639,10 +670,17 @@ void z80_m3_port_w(unsigned int port, unsigned char data)
 
     default:
     {
-      /* write FM chip if enabled */
+      /* write to FM sound unit (FM-70) if enabled */
       if (!(port & 4) && (config.ym2413 & 1))
       {
         fm_write(Z80.cycles, port, data);
+
+        /* FM output control "register" */
+        if (port & 2)
+        {
+          /* PSG output is automatically disabled (resp. enabled) by FM sound unit hardware if FM output is enabled (resp. disabled) */
+          psg_config(Z80.cycles, config.psg_preamp, (data & 0x01) ? 0x00 : 0xff);
+        }
         return;
       }
 
@@ -684,10 +722,10 @@ unsigned char z80_m3_port_r(unsigned int port)
 
     default:
     {
-      /* read FM chip if enabled */
+      /* read FM sound unit (FM-70) if enabled */
       if (!(port & 4) && (config.ym2413 & 1))
       {
-        /* I/O ports are automatically disabled by hardware */
+        /* I/O ports are automatically disabled by FM sound unit hardware */
         return fm_read(Z80.cycles, port);
       }
 

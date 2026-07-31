@@ -29,12 +29,11 @@ static void continue_execution()
 
 static void stop_debugging()
 {
-    send_dbg_request(dbg_req, request_type_t::REQ_STOP, 1);
+    send_dbg_request(dbg_req, request_type_t::REQ_STOP, 0);
 }
 
-static eventlist_t g_events;
+eventlist_t g_events;
 static qthread_t events_thread = NULL;
-static qthread_t pc_map_thread = NULL;
 
 static const char *const SRReg[] =
 {
@@ -171,14 +170,6 @@ static void finish_execution()
         qthread_kill(events_thread);
         events_thread = NULL;
     }
-
-    if (pc_map_thread != NULL)
-    {
-        qthread_join(pc_map_thread);
-        qthread_free(pc_map_thread);
-        qthread_kill(pc_map_thread);
-        pc_map_thread = NULL;
-    }
 }
 
 static drc_t idaapi init_debugger(const char* hostname, int portnum, const char* password, qstring *errbuf)
@@ -279,19 +270,6 @@ static int idaapi check_debugger_events(void *ud)
     return 0;
 }
 
-static int idaapi apply_pc_map(void* ud) {
-    while (dbg_req && dbg_req->dbg_active == 1) {
-        for (int addr = 0; dbg_req && dbg_req->dbg_active == 1 && !dbg_req->dbg_paused && addr < (MAXROMSIZE >> 1); ++addr) {
-            if (dbg_req && dbg_req->pc_map[addr].to_apply == 1 && !dbg_req->pc_map[addr].applied) {
-                dbg_req->pc_map[addr].applied = 1;
-                auto_make_code((ea_t)(addr << 1));
-            }
-        }
-    }
-
-    return 0;
-}
-
 static drc_t idaapi s_start_process(const char *path,
     const char *args,
     const char *startdir,
@@ -328,9 +306,8 @@ static drc_t idaapi s_start_process(const char *path,
 
     if (dbg_req) {
         events_thread = qthread_create(check_debugger_events, NULL);
-        send_dbg_request(dbg_req, request_type_t::REQ_ATTACH, 1);
 
-        pc_map_thread = qthread_create(apply_pc_map, NULL);
+        send_dbg_request(dbg_req, request_type_t::REQ_ATTACH, 1);
 
         return DRC_OK;
     }

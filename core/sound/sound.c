@@ -99,6 +99,25 @@ INLINE void fm_update(int cycles)
   }
 }
 
+#ifdef HOOK_CPU
+/* Raw FM register shadow for the debugger (both YM2612 and YM3438 cores route
+   through the fm_write dispatchers below, so one shadow covers both). */
+uint8 fm_debug_regs[2][0x100];
+static uint8 fm_debug_latch[2];
+
+static void fm_debug_shadow(unsigned int a, unsigned int v)
+{
+  unsigned int port = (a >> 1) & 1;
+  if (a & 1)
+    fm_debug_regs[port][fm_debug_latch[port]] = (uint8)v;
+  else
+    fm_debug_latch[port] = (uint8)v;
+}
+#define FM_DEBUG_SHADOW(a, v) fm_debug_shadow(a, v)
+#else
+#define FM_DEBUG_SHADOW(a, v)
+#endif
+
 static void YM2612_Reset(unsigned int cycles)
 {
   /* synchronize FM chip with CPU */
@@ -125,6 +144,7 @@ static void YM2612_Write(unsigned int cycles, unsigned int a, unsigned int v)
   }
 
   /* write FM register */
+  FM_DEBUG_SHADOW(a, v);
   YM2612Write(a, v);
 }
 
@@ -218,6 +238,7 @@ static void YM3438_Write(unsigned int cycles, unsigned int a, unsigned int v)
   fm_update(cycles);
 
   /* write FM register */
+  FM_DEBUG_SHADOW(a, v);
   OPN2_Write(&ym3438, a, v);
 }
 

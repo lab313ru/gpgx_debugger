@@ -15,58 +15,8 @@
 
 static HANDLE hThread = NULL;
 
-typedef struct {
-    char Name[12];
-    unsigned char*  Array;
-    int Offset;
-    int Size;
-    int Active;
-    unsigned char   Swap;
-} HexRegion;
-
-typedef enum {
-    NO,
-    CELL,
-    TEXT
-} MousePos;
-
-typedef struct {
-    HDC  DC;
-    char InputDigit;
-    int
-        MouseButtonHeld, SecondDigitPrompted, Running,
-        TextView, DrawLines, FontBold;
-    int
-        FontHeight, FontWidth, FontWeight,
-        Gap, GapHeaderX, GapHeaderY,
-        CellHeight, CellWidth,
-        DialogPosX, DialogPosY,
-        OffsetVisibleFirst, OffsetVisibleTotal,
-        AddressSelectedFirst, AddressSelectedTotal, AddressSelectedLast;
-    COLORREF
-        ColorFont, ColorBG;
-    HexRegion CurrentRegion;
-    MousePos MouseArea;
-    SCROLLINFO SI;
-} HexParams;
-
-typedef struct {
-    unsigned char*  Array;
-    UINT Start;
-    UINT Size;
-    char*Name;
-} SymbolName;
-
-typedef struct {
-    unsigned char*  Array;
-    UINT Address;
-    UINT Value;
-    int Active;
-} HardPatch;
-
-HWND HexEditorHwnd = NULL;
-HexParams HexEditor;
-HexParams HexOrder;
+std::vector<HexParams *> HexEditors;
+std::vector<HexParams *> HexOrder;
 std::vector<SymbolName>  HexNames;
 //std::vector<HardPatch>   HexPatches;
 HMENU HexEditorMenu;
@@ -82,22 +32,6 @@ RowCount = 16;	// Offset consists of 16 bytes
 
 static int is_cram_region = 0;
 
-static unsigned char read_cram_byte(unsigned char *array, unsigned int addr)
-{
-    unsigned short pp = *(unsigned short *)&array[(addr >> 1) << 1];
-    return cram_9b_to_16b(pp) >> ((addr & 1) ? 0 : 8);
-}
-
-static void write_cram_byte(HexRegion *array, unsigned int addr, unsigned char val)
-{
-    int is_odd = addr & 1;
-    unsigned int wpos = ((addr >> 1) << 1);
-    unsigned short vv = (read_cram_byte(array->Array, addr ^ array->Swap) << (is_odd ? 8 : 0)) | (val << (is_odd ? 0 : 8));
-    vv = cram_16b_to_9b(vv);
-    array->Array[wpos + 1] = (vv >> 8) & 0xFF;
-    array->Array[wpos + 0] = (vv >> 0) & 0xFF;
-}
-
 HexRegion HexRegions[] = {
     { "ROM", (unsigned char *)cart.rom, 0, sizeof(cart.rom), true, 1 },
     { "RAM 68K", (unsigned char *)work_ram, 0xFF0000, sizeof(work_ram), true, 1 },
@@ -107,13 +41,12 @@ HexRegion HexRegions[] = {
     { "Regs 68K", (unsigned char *)m68k.dar, 0, sizeof(int) * 16, true, 3 },
     { "Regs Z80", (unsigned char *)&Z80.pc, 0, sizeof(int) * 20, true, 3 },
     { "Regs VDP", (unsigned char *)reg, 0, sizeof(reg), true, 0 },
-    { NULL, NULL, 0, 0, 0, 0 },
 };
 
 HexParams HexCommon = {
-    NULL,					// HWND, DC
-    0,						    // instance limit, input digit
-    0,						    // multiple instances, mouse button held
+    NULL, NULL,					// HWND, DC
+    10, 0,						// instance limit, input digit
+    1, 0,						// multiple instances, mouse button held
     0, 0,						// second digit prompted, running
     1, 1,						// text area, lines visible
     0, 17, 8,					// font				// bold, height, width,
@@ -175,15 +108,15 @@ void HexSetColors(HexParams *Hex, bool Selection) {
 
 void HexUpdateDialog(HexParams *Hex, int ClearBG) {
     if (ClearBG)
-        InvalidateRect(HexEditorHwnd, NULL, TRUE);
+        InvalidateRect(Hex->Hwnd, NULL, TRUE);
     else
-        InvalidateRect(HexEditorHwnd, NULL, FALSE);
+        InvalidateRect(Hex->Hwnd, NULL, FALSE);
 }
 
 void HexUpdateCommon(HexParams *Hex) {
     RECT r;
-    if (!IsIconic(HexEditorHwnd)) {
-        GetWindowRect(HexEditorHwnd, &r);
+    if (!IsIconic(Hex->Hwnd)) {
+        GetWindowRect(Hex->Hwnd, &r);
         HexCommon.DialogPosX = HexCap(r.left, GetSystemMetrics(SM_CXSCREEN) - (r.right - r.left), 1);
         HexCommon.DialogPosY = HexCap(r.top, GetSystemMetrics(SM_CYSCREEN) - (r.bottom - r.top), 1);
         HexCommon.DialogPosX = HexCap(HexCommon.DialogPosX, 0, 0);
@@ -203,6 +136,8 @@ void HexAddName(unsigned char* Array, UINT Start, UINT Length, const char *Name)
 }
 
 void HexLoadSymbols() {
+    if (HexEditors.size() > 1)
+        return;
     int size;
     char buf[60];
     unsigned char *Array;
@@ -273,6 +208,8 @@ void HexLoadSymbols() {
 }
 
 void HexUnloadSymbols() {
+    if (HexEditors.size() > 1)
+        return;
     for (UINT i = 0; i < HexNames.size(); i++)
         free(HexNames[i].Name);
     HexNames.~vector();
@@ -316,7 +253,7 @@ void HexUpdateCaption(HexParams *Hex) {
             SELECTION_START + Hex->CurrentRegion.Offset,
             SELECTION_END + Hex->CurrentRegion.Offset,
             Hex->AddressSelectedTotal);
-    SetWindowText(HexEditorHwnd, str);
+    SetWindowText(Hex->Hwnd, str);
     return;
 }
 
@@ -405,14 +342,35 @@ void HexCopy(HexParams *Hex, char type)
     if (type == 0) {
         // numbers
         for (int i = 0; i < Hex->AddressSelectedTotal; i++) {
-            sprintf(str, "%02X", (unsigned char)(is_cram_region ? read_cram_byte(Hex->CurrentRegion.Array, i + SELECTION_START) : Hex->CurrentRegion.Array[(i + SELECTION_START) ^ Hex->CurrentRegion.Swap]));
+            unsigned char vv = Hex->CurrentRegion.Array[(i + SELECTION_START) ^ Hex->CurrentRegion.Swap];
+
+            if (is_cram_region)
+            {
+                int rpos = ((i + SELECTION_START) >> 1) << 1;
+                unsigned short pp = *(unsigned short *)&Hex->CurrentRegion.Array[rpos];
+                vv = cram_9b_to_16b(pp) >> (((i + SELECTION_START) & 1) ? 0 : 8);
+            }
+
+            sprintf(str, "%02X", vv);
             strcat(pGlobal, str);
         }
     }
     else if (type == 1) {
         // chars
         for (int i = 0; i < Hex->AddressSelectedTotal; i++) {
-            pGlobal[i] = (unsigned char)(is_cram_region ? read_cram_byte(Hex->CurrentRegion.Array, i + SELECTION_START) : Hex->CurrentRegion.Array[(i + SELECTION_START) ^ Hex->CurrentRegion.Swap]);
+            UINT8 check = Hex->CurrentRegion.Array[(i + SELECTION_START) ^ Hex->CurrentRegion.Swap];
+
+            if (is_cram_region)
+            {
+                int rpos = ((i + SELECTION_START) >> 1) << 1;
+                unsigned short pp = *(unsigned short *)&Hex->CurrentRegion.Array[rpos];
+                check = cram_9b_to_16b(pp) >> (((i + SELECTION_START) & 1) ? 0 : 8);
+            }
+
+            //if((check >= 32) && (check <= 127))
+            pGlobal[i] = (char)check;
+            //else
+            //	pGlobal[i] = '.';
         }
         pGlobal[Hex->AddressSelectedTotal] = 0;
     }
@@ -432,7 +390,7 @@ void HexCopy(HexParams *Hex, char type)
 void HexPaste(HexParams *Hex, UINT8 type) {
     char result;
     Hex->SecondDigitPrompted = 0;
-    OpenClipboard(HexEditorHwnd);
+    OpenClipboard(Hex->Hwnd);
     HGLOBAL hGlobal = GetClipboardData(CF_TEXT);
     if (hGlobal == NULL) {
         CloseClipboard();
@@ -460,28 +418,31 @@ void HexPaste(HexParams *Hex, UINT8 type) {
             else {
                 Hex->InputDigit = (Hex->InputDigit << 4) + result;
 
+                int wpos = Hex->AddressSelectedFirst ^ Hex->CurrentRegion.Swap;
+                unsigned char ww = Hex->InputDigit;
                 if (is_cram_region)
                 {
-                    write_cram_byte(&Hex->CurrentRegion, Hex->AddressSelectedFirst, Hex->InputDigit);
+                    wpos = (Hex->AddressSelectedFirst >> 1) << 1;
+                    unsigned short pp = *(unsigned short *)&Hex->CurrentRegion.Array[wpos];
+                    unsigned short vv = (cram_9b_to_16b(pp) & (0xFF << ((Hex->AddressSelectedFirst & 1) ? 8 : 0))) | ww;
+                    ww = cram_16b_to_9b(vv) >> ((Hex->AddressSelectedFirst & 1) ? 0 : 8);
                 }
-                else
-                {
-                    Hex->CurrentRegion.Array[Hex->AddressSelectedFirst ^ Hex->CurrentRegion.Swap] = Hex->InputDigit;
-                }
-                
+                Hex->CurrentRegion.Array[wpos] = ww;
                 HexSelectAddress(Hex, Hex->AddressSelectedFirst + 1, 1);
             }
         }
         else if (type == 1) {
+            int wpos = Hex->AddressSelectedFirst ^ Hex->CurrentRegion.Swap;
+            unsigned char ww = pGlobal[i];
             if (is_cram_region)
             {
-                write_cram_byte(&Hex->CurrentRegion, Hex->AddressSelectedFirst, pGlobal[i]);
-            }
-            else
-            {
-                Hex->CurrentRegion.Array[Hex->AddressSelectedFirst ^ Hex->CurrentRegion.Swap] = pGlobal[i];
+                wpos = (Hex->AddressSelectedFirst >> 1) << 1;
+                unsigned short pp = *(unsigned short *)&Hex->CurrentRegion.Array[wpos];
+                unsigned short vv = (cram_9b_to_16b(pp) & (0xFF << ((Hex->AddressSelectedFirst & 1) ? 8 : 0))) | ww;
+                ww = cram_16b_to_9b(vv) >> ((Hex->AddressSelectedFirst & 1) ? 0 : 8);
             }
 
+            Hex->CurrentRegion.Array[wpos] = ww;
             if ((Hex->AddressSelectedFirst < Hex->CurrentRegion.Size - 1) && (pGlobal[i] != 0))
                 HexSelectAddress(Hex, Hex->AddressSelectedFirst + 1, 1);
             else
@@ -506,7 +467,7 @@ void HexDestroySelection(HexParams *Hex) {
 
 void HexSwitchRegion(HexParams *Hex) {
     RECT r;
-    GetClientRect(HexEditorHwnd, &r);
+    GetClientRect(Hex->Hwnd, &r);
     Hex->SI.nPage = r.bottom / Hex->CellHeight - 1;
     for (int i = 0; i < REGION_COUNT, HexRegions[i].Active; i++)
         CheckMenuItem(HexRegionsMenu, IDC_C_HEX_REGION + i,
@@ -522,17 +483,27 @@ void HexSwitchRegion(HexParams *Hex) {
 
 void HexDestroyDialog(HexParams *Hex) {
     HexUpdateCommon(Hex);
+    for (UINT i = 0; i < HexOrder.size(); i++) {
+        if (HexOrder[i] == Hex)
+            HexOrder.erase(HexOrder.begin() + i);
+    }
     HexDestroySelection(Hex);
-    ReleaseDC(HexEditorHwnd, Hex->DC);
-
-    DeleteObject(HexFont);
-    HexFont = 0;
-    HexUnloadSymbols();
-
-    DestroyWindow(HexEditorHwnd);
-
-    HexEditorHwnd = NULL;
+    ReleaseDC(Hex->Hwnd, Hex->DC);
+    DestroyWindow(Hex->Hwnd);
+    if (HexEditors.size() == 1) {
+        UnregisterClass("HEXEDITOR", dbg_wnd_hinst);
+        DeleteObject(HexFont);
+        HexFont = 0;
+        HexUnloadSymbols();
+    }
+    Hex->Hwnd = 0;
     Hex->Running = 0;
+    for (UINT i = 0; i < HexEditors.size(); i++) {
+        if (HexEditors[i]->Hwnd == Hex->Hwnd)
+            HexEditors.erase(HexEditors.begin() + i);
+    }
+    free(Hex);
+    return;
 }
 
 LRESULT CALLBACK HexGoToProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lParam) {
@@ -566,12 +537,13 @@ LRESULT CALLBACK HexGoToProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
         case IDOK: {
             GetDlgItemText(hDlg, IDC_PROMPT_EDIT, Str_Tmp, 10);
             int Address;
-            if ((_strnicmp(Str_Tmp, "ff", 2) == 0) && (sscanf(Str_Tmp + 2, "%x", &Address)))
+            if ((strnicmp(Str_Tmp, "ff", 2) == 0) && (sscanf(Str_Tmp + 2, "%x", &Address)))
                 HexGoToAddress(Hex, Address);
             EndDialog(hDlg, true);
             return true;
             break;
         }
+        case ID_CANCEL:
         case IDCANCEL:
             EndDialog(hDlg, false);
             return false;
@@ -580,7 +552,8 @@ LRESULT CALLBACK HexGoToProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
         break;
 
     case WM_CLOSE:
-        EndDialog(hDlg, 0);
+        EndDialog(hDlg, false);
+        return false;
         break;
     }
     return false;
@@ -607,8 +580,8 @@ LRESULT CALLBACK HexEditorProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
     case WM_CREATE: {
         HexEditorMenu = GetMenu(hDlg);
         HexRegionsMenu = CreatePopupMenu();
-        InsertMenu(HexEditorMenu, GetMenuItemCount(HexEditorMenu), MF_BYPOSITION | MF_POPUP | MF_STRING,
-            (UINT_PTR)HexRegionsMenu, "&Region");
+        InsertMenu(HexEditorMenu, GetMenuItemCount(HexEditorMenu) + 1, MF_BYPOSITION | MF_POPUP | MF_STRING,
+            (UINT)HexRegionsMenu, "&Region");
         for (int i = 0; i < REGION_COUNT, HexRegions[i].Active; i++)
             InsertMenu(HexRegionsMenu, i,
             (Hex->CurrentRegion.Array == HexRegions[i].Array) ? MF_CHECKED : MF_UNCHECKED,
@@ -621,11 +594,21 @@ LRESULT CALLBACK HexEditorProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
         int ScrollbarWidth = GetSystemMetrics(SM_CXVSCROLL);
         AdjustWindowRectEx(&r, GetWindowLong(hDlg, GWL_STYLE),
             (GetMenu(hDlg) > 0), GetWindowLong(hDlg, GWL_EXSTYLE));
-        // Force the dialog to fit into the screen
-        Hex->DialogPosX = HexCap(HexCommon.DialogPosX, GetSystemMetrics(SM_CXSCREEN) - (r.right - r.left), 1);
-        Hex->DialogPosY = HexCap(HexCommon.DialogPosY, GetSystemMetrics(SM_CYSCREEN) - (r.bottom - r.top), 1);
-        Hex->DialogPosX = HexCap(Hex->DialogPosX, 0, 0);
-        Hex->DialogPosY = HexCap(Hex->DialogPosY, 0, 0);
+        if (HexEditors.size() > 1) {
+            for (UINT i = 0; i < HexEditors.size(); i++) {
+                if (HexEditors[i] == HexOrder[1]) {
+                    Hex->DialogPosX = HexEditors[i]->DialogPosX + GetSystemMetrics(SM_CYCAPTION);
+                    Hex->DialogPosY = HexEditors[i]->DialogPosY + GetSystemMetrics(SM_CYCAPTION);
+                }
+            }
+        }
+        else {
+            // Force the dialog to fit into the screen
+            Hex->DialogPosX = HexCap(HexCommon.DialogPosX, GetSystemMetrics(SM_CXSCREEN) - (r.right - r.left), 1);
+            Hex->DialogPosY = HexCap(HexCommon.DialogPosY, GetSystemMetrics(SM_CYSCREEN) - (r.bottom - r.top), 1);
+            Hex->DialogPosX = HexCap(Hex->DialogPosX, 0, 0);
+            Hex->DialogPosY = HexCap(Hex->DialogPosY, 0, 0);
+        }
         SetWindowPos(hDlg, NULL, Hex->DialogPosX, Hex->DialogPosY,
             r.right - r.left + ScrollbarWidth, r.bottom - r.top,
             SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
@@ -650,14 +633,14 @@ LRESULT CALLBACK HexEditorProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
             MoveToEx(Hex->DC, row * Hex->CellWidth + CellArea.left + GAP_CHECK, -1, NULL);
             HexSetColors(Hex, 0);
             sprintf(buf, "%2X", row);
-            TextOut(Hex->DC, 0, 0, buf, (int)strlen(buf));
+            TextOut(Hex->DC, 0, 0, buf, strlen(buf));
         }
         // LEFT HEADER, semi-dynamic.
         for (line = 0; line < Hex->OffsetVisibleTotal; line++) {
             MoveToEx(Hex->DC, Hex->Gap / 2, line * Hex->CellHeight + CellArea.top, NULL);
             HexSetColors(Hex, 0);
             sprintf(buf, "%06X:", Hex->OffsetVisibleFirst + line * RowCount + Hex->CurrentRegion.Offset);
-            TextOut(Hex->DC, 0, 0, buf, (int)strlen(buf));
+            TextOut(Hex->DC, 0, 0, buf, strlen(buf));
         }
         // RAM, dynamic.
         for (line = 0; line < Hex->OffsetVisibleTotal; line++) {
@@ -688,9 +671,17 @@ LRESULT CALLBACK HexEditorProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
                     sprintf(buf, "%1X.", Hex->InputDigit);
                 else
                 {
-                    sprintf(buf, "%02X", (unsigned char)(is_cram_region ? read_cram_byte(Hex->CurrentRegion.Array, carriage) : Hex->CurrentRegion.Array[carriage ^ Hex->CurrentRegion.Swap]));
+                    unsigned char vv = Hex->CurrentRegion.Array[carriage ^ Hex->CurrentRegion.Swap];
+                    if (is_cram_region)
+                    {
+                        int rpos = (carriage >> 1) << 1;
+                        unsigned short pp = *(unsigned short *)&Hex->CurrentRegion.Array[rpos];
+                        vv = cram_9b_to_16b(pp) >> ((carriage & 1) ? 0 : 8);
+                    }
+
+                    sprintf(buf, "%02X", vv);
                 }
-                TextOut(Hex->DC, 0, 0, buf, (int)strlen(buf));
+                TextOut(Hex->DC, 0, 0, buf, strlen(buf));
                 // Print chars on the right
                 if (Hex->TextView) {
                     MoveToEx(Hex->DC, row * Hex->FontWidth + TextArea.left + Hex->Gap / 2,
@@ -700,7 +691,13 @@ LRESULT CALLBACK HexEditorProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
                     else
                         HexSetColors(Hex, 0);
 
-                    unsigned char check = (unsigned char)(is_cram_region ? read_cram_byte(Hex->CurrentRegion.Array, carriage) : Hex->CurrentRegion.Array[carriage ^ Hex->CurrentRegion.Swap]);
+                    unsigned char check = Hex->CurrentRegion.Array[carriage ^ Hex->CurrentRegion.Swap];
+                    if (is_cram_region)
+                    {
+                        int rpos = (carriage >> 1) << 1;
+                        unsigned short pp = *(unsigned short *)&Hex->CurrentRegion.Array[rpos];
+                        check = cram_9b_to_16b(pp) >> ((carriage & 1) ? 0 : 8);
+                    }
 
                     if ((check >= 0x20) && (check <= 0x7e))
                         buf[0] = (char)check;
@@ -750,7 +747,7 @@ LRESULT CALLBACK HexEditorProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
         }
         switch (wParam) {
         case IDC_C_HEX_GOTO:
-            DialogBoxParam(pinst, MAKEINTRESOURCE(IDD_PROMPT), hDlg, (DLGPROC)HexGoToProc, (LPARAM)Hex);
+            DialogBoxParam(dbg_wnd_hinst, MAKEINTRESOURCE(IDD_PROMPT), hDlg, (DLGPROC)HexGoToProc, (LPARAM)Hex);
             break;
 
         case IDC_C_HEX_DUMP: {
@@ -761,7 +758,14 @@ LRESULT CALLBACK HexEditorProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
                 int i;
                 for (i = 0; i < Hex->CurrentRegion.Size; ++i)
                 {
-                    fwrite((const void *)(unsigned char)(is_cram_region ? read_cram_byte(Hex->CurrentRegion.Array, i) : Hex->CurrentRegion.Array[i ^ Hex->CurrentRegion.Swap]), 1, 1, out);
+                    unsigned char vv = Hex->CurrentRegion.Array[i^Hex->CurrentRegion.Swap];
+                    if (is_cram_region)
+                    {
+                        int rpos = (i >> 1) << 1;
+                        unsigned short pp = *(unsigned short *)&Hex->CurrentRegion.Array[rpos];
+                        vv = cram_9b_to_16b(pp) >> ((i & 1) ? 0 : 8);
+                    }
+                    fwrite((const void *)vv, 1, 1, out);
                 }
                 fclose(out);
             }
@@ -813,17 +817,18 @@ LRESULT CALLBACK HexEditorProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
         c[0] = (char)(wParam & 0xFF);
         c[1] = 0;
         Hex->AddressSelectedFirst = Hex->AddressSelectedLast = SELECTION_START;
-        if (Hex->MouseArea == TEXT)
-        {
+        if (Hex->MouseArea == TEXT) {
+            int wpos = Hex->AddressSelectedFirst ^ Hex->CurrentRegion.Swap;
+            unsigned char ww = c[0];
             if (is_cram_region)
             {
-                write_cram_byte(&Hex->CurrentRegion, Hex->AddressSelectedFirst, c[0]);
-            }
-            else
-            {
-                Hex->CurrentRegion.Array[Hex->AddressSelectedFirst ^ Hex->CurrentRegion.Swap] = c[0];
+                wpos = (Hex->AddressSelectedFirst >> 1) << 1;
+                unsigned short pp = *(unsigned short *)&Hex->CurrentRegion.Array[wpos];
+                unsigned short vv = (cram_9b_to_16b(pp) & (0xFF << ((Hex->AddressSelectedFirst & 1) ? 8 : 0))) | ww;
+                ww = cram_16b_to_9b(vv) >> ((Hex->AddressSelectedFirst & 1) ? 0 : 8);
             }
 
+            Hex->CurrentRegion.Array[wpos] = ww;
             Hex->AddressSelectedFirst++;
             Hex->AddressSelectedLast = Hex->AddressSelectedFirst;
         }
@@ -839,15 +844,17 @@ LRESULT CALLBACK HexEditorProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
             else {
                 Hex->InputDigit = (Hex->InputDigit << 4) + result;
 
+                int wpos = Hex->AddressSelectedFirst ^ Hex->CurrentRegion.Swap;
+                unsigned char ww = Hex->InputDigit;
                 if (is_cram_region)
                 {
-                    write_cram_byte(&Hex->CurrentRegion, Hex->AddressSelectedFirst, Hex->InputDigit);
-                }
-                else
-                {
-                    Hex->CurrentRegion.Array[Hex->AddressSelectedFirst ^ Hex->CurrentRegion.Swap] = Hex->InputDigit;
+                    wpos = (Hex->AddressSelectedFirst >> 1) << 1;
+                    unsigned short pp = *(unsigned short *)&Hex->CurrentRegion.Array[wpos];
+                    unsigned short vv = (cram_9b_to_16b(pp) & (0xFF << ((Hex->AddressSelectedFirst & 1) ? 8 : 0))) | ww;
+                    ww = cram_16b_to_9b(vv) >> ((Hex->AddressSelectedFirst & 1) ? 0 : 8);
                 }
 
+                Hex->CurrentRegion.Array[wpos] = ww;
                 HexSelectAddress(Hex, Hex->AddressSelectedFirst + 1, 1);
                 Hex->AddressSelectedLast = Hex->AddressSelectedFirst;
                 HexUpdateCaption(Hex);
@@ -1030,110 +1037,142 @@ LRESULT CALLBACK HexEditorProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
     }
 
     case WM_SETFOCUS: {
+        if (HexOrder.size() > 1)
+            for (UINT i = 1; i < HexOrder.size(); i++) {
+                if (HexOrder[i] == Hex) {
+                    HexOrder.erase(HexOrder.begin() + i);
+                    HexOrder.insert(HexOrder.begin(), Hex);
+                }
+            }
         return 0;
         break;
     }
 
     case WM_CLOSE:
         HexDestroyDialog(Hex);
-        UnregisterClass("HEXEDITOR", pinst);
-        PostQuitMessage(0);
-
-        if (hThread) {
-            CloseHandle(hThread);
-            hThread = 0;
-        }
-
-        return FALSE;
+        return 0;
+        break;
     }
     return DefWindowProc(hDlg, uMsg, wParam, lParam);
 }
 
 void HexCreateDialog() {
     WNDCLASSEX wndclass;
-    HexEditor = HexCommon;
-    memset(&wndclass, 0, sizeof(wndclass));
-    wndclass.cbSize = sizeof(WNDCLASSEX);
-    wndclass.style = CS_HREDRAW | CS_VREDRAW;
-    wndclass.lpfnWndProc = HexEditorProc;
-    wndclass.cbClsExtra = 0;
-    wndclass.cbWndExtra = sizeof(HexParams *);
-    wndclass.hInstance = pinst;
-    wndclass.hIcon = LoadIcon(pinst, MAKEINTRESOURCE(IDI_GENS));
-    wndclass.hIconSm = LoadIcon(pinst, MAKEINTRESOURCE(IDI_GENS));
-    wndclass.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wndclass.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
-    wndclass.lpszMenuName = "HEXEDITOR_MENU";
-    wndclass.lpszClassName = "HEXEDITOR";
-    if (!RegisterClassEx(&wndclass)) {
-        return;
+    HexParams *Hex;
+    char tmp[100];
+    if (HexCommon.MultiInstance) {
+        if (HexEditors.size() == HexCommon.InstanceLimit) {
+            sprintf(tmp, "%d Hex Editor instances", HexCommon.InstanceLimit);
+            MessageBox(NULL, tmp, "Stop already!", MB_OK);
+            ShowWindow(HexEditors.back()->Hwnd, SW_SHOWNORMAL);
+            SetForegroundWindow(HexEditors.back()->Hwnd);
+            HexUpdateCaption(HexEditors.back());
+            return;
+        }
+        Hex = (HexParams *)malloc(sizeof(HexParams));
+        *Hex = HexCommon;
+        if (HexEditors.empty()) {
+            memset(&wndclass, 0, sizeof(wndclass));
+            wndclass.cbSize = sizeof(WNDCLASSEX);
+            wndclass.style = CS_HREDRAW | CS_VREDRAW;
+            wndclass.lpfnWndProc = HexEditorProc;
+            wndclass.cbClsExtra = 0;
+            wndclass.cbWndExtra = sizeof(HexParams *);
+            wndclass.hInstance = dbg_wnd_hinst;
+            wndclass.hIcon = LoadIcon(dbg_wnd_hinst, MAKEINTRESOURCE(IDI_GENS));
+            wndclass.hIconSm = LoadIcon(dbg_wnd_hinst, MAKEINTRESOURCE(IDI_GENS));
+            wndclass.hCursor = LoadCursor(NULL, IDC_ARROW);
+            wndclass.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+            wndclass.lpszMenuName = "HEXEDITOR_MENU";
+            wndclass.lpszClassName = "HEXEDITOR";
+            if (!RegisterClassEx(&wndclass)) {
+                return;
+            }
+            HexFont = CreateFont(
+                HexCommon.FontHeight,			// height
+                HexCommon.FontWidth,			// width
+                0, 0, HexCommon.FontWeight,		// escapement, orientation, weight
+                FALSE, FALSE, FALSE,			// italic, underline, strikeout
+                ANSI_CHARSET, OUT_DEVICE_PRECIS,// charset, precision
+                CLIP_MASK, DEFAULT_QUALITY,		// clipping, quality
+                DEFAULT_PITCH, "Courier New"); 	// pitch, name
+            HexLoadSymbols();
+        }
+        HexEditors.push_back(Hex);
+        HexOrder.insert(HexOrder.begin(), Hex);
+        HexEditors.back()->Hwnd = CreateWindowEx(0, "HEXEDITOR", "Hex Editor",
+            WS_SYSMENU | WS_SIZEBOX | WS_MINIMIZEBOX | WS_VSCROLL,
+            0, 0, 100, 100, NULL, NULL, dbg_wnd_hinst, Hex);
+        HexOrder.front() = HexEditors.back();
+        ShowWindow(HexEditors.back()->Hwnd, SW_SHOW);
+        HexUpdateCaption(HexEditors.back());
     }
-    HexFont = CreateFont(
-        HexCommon.FontHeight,			// height
-        HexCommon.FontWidth,			// width
-        0, 0, HexCommon.FontWeight,		// escapement, orientation, weight
-        FALSE, FALSE, FALSE,			// italic, underline, strikeout
-        ANSI_CHARSET, OUT_DEVICE_PRECIS,// charset, precision
-        CLIP_MASK, DEFAULT_QUALITY,		// clipping, quality
-        DEFAULT_PITCH, "Courier New"); 	// pitch, name
-    HexLoadSymbols();
-    HexEditorHwnd = CreateWindowEx(0, "HEXEDITOR", "Hex Editor",
-        WS_SYSMENU | WS_SIZEBOX | WS_MINIMIZEBOX | WS_VSCROLL,
-        0, 0, 100, 100, NULL, NULL, pinst, &HexEditor);
-    ShowWindow(HexEditorHwnd, SW_SHOW);
-    HexUpdateCaption(&HexEditor);
+    else {
+        ShowWindow(HexEditors.back()->Hwnd, SW_SHOWNORMAL);
+        SetForegroundWindow(HexEditors.back()->Hwnd);
+        HexUpdateCaption(HexEditors.back());
+    }
+}
+
+HexParams *get_hexeditor(int index)
+{
+    if (index < HexEditors.size())
+        return HexEditors[index];
+    return NULL;
 }
 
 static DWORD WINAPI ThreadProc(LPVOID lpParam)
 {
-    MSG msg;
+    MSG messages;
 
     HexCreateDialog();
 
-    HANDLE hMutex = CreateMutex(NULL, FALSE, HEX_EDITOR_MUTEX);
-
-    while (GetMessage(&msg, NULL, 0, 0))
+    while (GetMessage(&messages, NULL, 0, 0))
     {
-        if (IsDialogMessage(HexEditorHwnd, &msg))
+        bool docontinue = false;
+        for (UINT i = 0; i < HexEditors.size(); i++)
         {
-            if (msg.message == WM_CHAR)
-                SendMessage(HexEditorHwnd, msg.message, msg.wParam, msg.lParam);
+            if (HexEditors[i]->Hwnd && IsDialogMessage(HexEditors[i]->Hwnd, &messages))
+            {
+                if (messages.message == WM_CHAR)
+                    SendMessage(HexEditors[i]->Hwnd, messages.message, messages.wParam, messages.lParam);
+                docontinue = true;
+            }
         }
-        else
-        {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-        }
-    }
 
-    CloseHandle(hMutex);
+        if (docontinue)
+            continue;
+    
+        TranslateMessage(&messages);
+        DispatchMessage(&messages);
+    }
 
     return 1;
 }
 
 void create_hex_editor()
 {
-    if (HexEditorHwnd == NULL) {
-        hThread = CreateThread(0, NULL, ThreadProc, NULL, NULL, NULL);
-    }
+    hThread = CreateThread(0, NULL, ThreadProc, NULL, NULL, NULL);
 }
 
 void destroy_hex_editor()
 {
-    if (HexEditorHwnd) {
-        SendMessage(HexEditorHwnd, WM_CLOSE, 0, 0);
+    if (HexEditors.size() > 0)
+    {
+        for (int i = (int)HexEditors.size() - 1; i >= 0; i--)
+            HexDestroyDialog(HexEditors[i]);
     }
 
-    if (hThread) {
-        TerminateThread(hThread, 0);
-        CloseHandle(hThread);
-        hThread = 0;
-    }
+    TerminateThread(hThread, 0);
+    CloseHandle(hThread);
 }
 
 void update_hex_editor()
 {
-    if (HexEditorHwnd) {
-        HexUpdateDialog(&HexEditor, 0);
+    if (!HexEditors.empty())
+    {
+        for (UINT i = 0; i < HexEditors.size(); i++)
+            HexUpdateDialog(HexEditors[i], 0);
     }
 }
+

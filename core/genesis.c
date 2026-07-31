@@ -5,7 +5,7 @@
  *  Support for SG-1000, Mark-III, Master System, Game Gear, Mega Drive & Mega CD hardware
  *
  *  Copyright (C) 1998-2003  Charles Mac Donald (original code)
- *  Copyright (C) 2007-2020  Eke-Eke (Genesis Plus GX)
+ *  Copyright (C) 2007-2024  Eke-Eke (Genesis Plus GX)
  *
  *  Redistribution and use of this code or any derivative works are permitted
  *  provided that the following conditions are met:
@@ -50,7 +50,7 @@ uint8 boot_rom[0x800];    /* Genesis BOOT ROM   */
 uint8 work_ram[0x10000];  /* 68K RAM  */
 uint8 zram[0x2000];       /* Z80 RAM  */
 uint32 zbank;             /* Z80 bank window address */
-uint8 zstate;             /* Z80 bus state (d0 = BUSACK, d1 = /RESET) */
+uint8 zstate;             /* Z80 bus state (d0 = /RESET, d1 = BUSREQ, d2 = WAIT) */
 uint8 pico_current;       /* PICO current page */
 
 static uint8 tmss[4];     /* TMSS security register */
@@ -161,6 +161,7 @@ void gen_init(void)
     {
       /* initialize SUB-CPU */
       s68k_init();
+      s68k.aerr_enabled = config.addr_error; 
 
       /* initialize CD hardware */
       scd_init();
@@ -220,6 +221,7 @@ void gen_init(void)
       /* SG-1000 hardware */
       case SYSTEM_SG:
       case SYSTEM_SGII:
+      case SYSTEM_SGII_RAM_EXT:
       {
         z80_writeport = z80_sg_port_w;
         z80_readport  = z80_sg_port_r;

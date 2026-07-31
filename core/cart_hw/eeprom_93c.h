@@ -2,7 +2,7 @@
  *  Genesis Plus
  *  Microwire Serial EEPROM (93C46 only) support
  *
- *  Copyright (C) 2011  Eke-Eke (Genesis Plus GX)
+ *  Copyright (C) 2011-2026  Eke-Eke (Genesis Plus GX)
  *
  *  Redistribution and use of this code or any derivative works are permitted
  *  provided that the following conditions are met:
@@ -65,7 +65,7 @@ typedef struct
 extern T_EEPROM_93C eeprom_93c;
 
 /* Function prototypes */
-extern void eeprom_93c_init();
+extern void eeprom_93c_init(void);
 extern void eeprom_93c_write(unsigned char data);
 extern unsigned char eeprom_93c_read(void);
 

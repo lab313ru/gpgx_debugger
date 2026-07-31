@@ -23,7 +23,7 @@
 #include "gui.h"
 #include "vdp_ram_debug.h"
 
-HWND VDPRamHWnd = NULL;
+static HWND VDPRamHWnd = NULL;
 static HANDLE hThread = NULL;
 
 static int VDPRamPal, VDPRamTile;
@@ -837,7 +837,7 @@ INT_PTR msgRegistersWM_INITDIALOG(HWND hDlg, WPARAM wparam, LPARAM lparam)
     return TRUE;
 }
 
-static void redraw_vdp_view()
+void Redraw_VDP_View()
 {
     if (!VDPRamHWnd) return;
 
@@ -997,7 +997,6 @@ LRESULT CALLBACK ButtonsProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
                 FILE *in = fopen(fname, "rb");
                 fread(cram, 1, sizeof(cram), in);
                 fclose(in);
-                redraw_vdp_view();
             }
             return FALSE;
         } break;
@@ -1065,7 +1064,6 @@ LRESULT CALLBACK ButtonsProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
 				((char*)&cram)[(VDP_PAL_COLORS * 2 + i) * 2 + 0] = (w >> 0) & 0xFF;
 				((char*)&cram)[(VDP_PAL_COLORS * 2 + i) * 2 + 1] = (w >> 8) & 0xFF;
 			}
-            redraw_vdp_view();
 
 			return FALSE;
 		} break;
@@ -1090,20 +1088,19 @@ LRESULT CALLBACK ButtonsProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
                 FILE *in = fopen(fname, "rb");
                 fread(vram, 1, sizeof(vram), in);
                 fclose(in);
-                redraw_vdp_view();
             }
             return FALSE;
         } break;
         case IDC_VDP_VIEW_VRAM:
         {
             IsVRAM = true;
-            redraw_vdp_view();
+            Redraw_VDP_View();
             return FALSE;
         } break;
         case IDC_VDP_VIEW_RAM:
         {
             IsVRAM = false;
-            redraw_vdp_view();
+            Redraw_VDP_View();
             return FALSE;
         } break;
         }
@@ -1558,7 +1555,7 @@ LRESULT CALLBACK VDPRamProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
         } break;
         }
         SetScrollPos(GetDlgItem(hDlg, IDC_VDP_TILES_SCROLLBAR), SB_CTL, CurPos, TRUE);
-        redraw_vdp_view();
+        Redraw_VDP_View();
     } break;
 
     case WM_LBUTTONDOWN:
@@ -1575,7 +1572,7 @@ LRESULT CALLBACK VDPRamProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
         if (PtInRect(&r, pt))
         {
             VDPRamPal = (pt.y - r.top) / VDP_BLOCK_H;
-            redraw_vdp_view();
+            Redraw_VDP_View();
         }
         else
         {
@@ -1589,14 +1586,14 @@ LRESULT CALLBACK VDPRamProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 int col = (pt.x - r.left) / VDP_BLOCK_W;
                 VDPRamTile = row * VDP_TILES_IN_ROW + col;
 
-                redraw_vdp_view();
+                Redraw_VDP_View();
             }
         }
     } break;
 
     case UpdateMSG:
     {
-        redraw_vdp_view();
+        Redraw_VDP_View();
     } break;
 
     case WM_CLOSE:
@@ -1632,8 +1629,6 @@ static DWORD WINAPI ThreadProc(LPVOID lpParam)
     UpdateWindow(VDPRamHWnd);
     SetForegroundWindow(VDPRamHWnd);
 
-    HANDLE hMutex = CreateMutex(NULL, FALSE, VDP_RAM_MUTEX);
-
     while (GetMessage(&msg, NULL, 0, 0))
     {
         if (!IsDialogMessage(VDPRamHWnd, &msg))
@@ -1642,8 +1637,6 @@ static DWORD WINAPI ThreadProc(LPVOID lpParam)
             DispatchMessage(&msg);
         }
 	}
-
-    CloseHandle(hMutex);
 
     return 1;
 }

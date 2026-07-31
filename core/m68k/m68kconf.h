@@ -51,12 +51,18 @@
 #define M68K_EMULATE_FC             OPT_OFF
 #define M68K_SET_FC_CALLBACK(A)     your_set_fc_handler_function(A)
 
+ /* If ON, CPU will call the instruction hook callback before every
+ * instruction.
+ */
+#define M68K_INSTRUCTION_HOOK       OPT_SPECIFY_HANDLER
+#define M68K_INSTRUCTION_CALLBACK() m68k_instr_callback()
+
 /* If ON, the CPU will monitor the trace flags and take trace exceptions
  */
 #define M68K_EMULATE_TRACE          OPT_OFF
 
 /* If ON, the CPU will emulate the 4-byte prefetch queue of a real 68000 */
-#define M68K_EMULATE_PREFETCH       OPT_OFF
+#define M68K_EMULATE_PREFETCH       OPT_ON
 
 /* If ON, the CPU will generate address error exceptions if it tries to
  * access a word or longword at an odd address.

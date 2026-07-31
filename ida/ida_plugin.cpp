@@ -749,15 +749,11 @@ const char* bpts_w_name = "M68000 Breakpoints";
 static QTableWidget* bpList = nullptr;
 static QLineEdit* bpAddr = nullptr;
 static QComboBox* bpSize = nullptr;
-static QRadioButton* bp68kTypeBtn = nullptr, /**bpZ80TypeBtn = nullptr,*/ *bpVramTypeBtn,
+static QRadioButton* bp68kTypeBtn = nullptr, *bpZ80TypeBtn = nullptr, *bpVramTypeBtn,
                      *bpCramTypeBtn = nullptr, *bpVsramTypeBtn = nullptr;
 static QCheckBox* bpExecType = nullptr, *bpReadType = nullptr, *bpWriteType = nullptr;
 
 static void add_bpt_list_item(const bpt_data_t* bpt_item, int index) {
-    if (bpts_w == nullptr) {
-        return;
-    }
-
     if (index == -1) {
         index = bpList->rowCount();
     }
@@ -799,14 +795,14 @@ static void add_bpt_list_item(const bpt_data_t* bpt_item, int index) {
     case BPT_VSRAM_RW: type = "VSRAM_RW"; break;
 
         // Z80
-    //case BPT_Z80_E: type = "Z80_E"; break;
-    //case BPT_Z80_R: type = "Z80_R"; break;
-    //case BPT_Z80_W: type = "Z80_W"; break;
-    //case BPT_Z80_RE: type = "Z80_RE"; break;
-    //case BPT_Z80_WE: type = "Z80_WE"; break;
-    //case BPT_Z80_RW: type = "Z80_RW"; break;
-    //case BPT_Z80_RWE: type = "Z80_RWE"; break;
-        //break;
+    case BPT_Z80_E: type = "Z80_E"; break;
+    case BPT_Z80_R: type = "Z80_R"; break;
+    case BPT_Z80_W: type = "Z80_W"; break;
+    case BPT_Z80_RE: type = "Z80_RE"; break;
+    case BPT_Z80_WE: type = "Z80_WE"; break;
+    case BPT_Z80_RW: type = "Z80_RW"; break;
+    case BPT_Z80_RWE: type = "Z80_RWE"; break;
+        break;
     }
 
     QTableWidgetItem* item3 = new QTableWidgetItem(type);
@@ -837,7 +833,7 @@ static bpt_type_t strToBptType(const QString& text) {
     else if (!text.compare("M68K_RWE")) {
         return BPT_M68K_RWE;
     }
-    /*else if (!text.compare("Z80_E")) {
+    else if (!text.compare("Z80_E")) {
         return BPT_Z80_E;
     }
     else if (!text.compare("Z80_R")) {
@@ -857,7 +853,7 @@ static bpt_type_t strToBptType(const QString& text) {
     }
     else if (!text.compare("Z80_RWE")) {
         return BPT_Z80_RWE;
-    }*/
+    }
     else if (!text.compare("VRAM_R")) {
         return BPT_VRAM_R;
     }
@@ -891,10 +887,6 @@ static bpt_type_t strToBptType(const QString& text) {
 }
 
 static void delete_breakpoint_from_list(int index, bool from_event) {
-    if (bpts_w == nullptr) {
-        return;
-    }
-
     if (index == -1) {
         return;
     }
@@ -950,10 +942,6 @@ static bpttype_t gxBptToIda(bpt_type_t type) {
 
 bpt_type_t idaBptToGx(bpttype_t type) {
     bpt_type_t gxType = BPT_ANY;
-
-    if (type & BPT_SOFT) {
-        return BPT_M68K_RWE;
-    }
 
     if (type & BPT_READ) {
         gxType = BPT_M68K_R;
@@ -1023,13 +1011,13 @@ void BptsWindow::addBreakpoint() {
         if (isWrite)
             type = (bpt_type_t)(type | BPT_VSRAM_W);
     }
-    //else if (bpZ80TypeBtn->isChecked())
-    //{
-    //    if (isRead)
-    //        type = BPT_Z80_R;
-    //    if (isWrite)
-    //        type = (bpt_type_t)(type | BPT_Z80_W);
-    //}
+    else if (bpZ80TypeBtn->isChecked())
+    {
+        if (isRead)
+            type = BPT_Z80_R;
+        if (isWrite)
+            type = (bpt_type_t)(type | BPT_Z80_W);
+    }
 
     bool res = true;
 
@@ -1144,18 +1132,18 @@ static ssize_t idaapi hook_ui(void *user_data, int notification_code, va_list va
             bp68kTypeBtn->setChecked(true);
             bp68kTypeBtn->setFont(font);
             bpTypesGbLayout->addWidget(bp68kTypeBtn, 0, 0);
-            /*bpZ80TypeBtn = new QRadioButton("Z80 RAM", w);
+            bpZ80TypeBtn = new QRadioButton("Z80 RAM", w);
             bpZ80TypeBtn->setFont(font);
-            bpTypesGbLayout->addWidget(bpZ80TypeBtn, 0, 1);*/
+            bpTypesGbLayout->addWidget(bpZ80TypeBtn, 0, 1);
             bpVramTypeBtn = new QRadioButton("VRAM", w);
             bpVramTypeBtn->setFont(font);
-            bpTypesGbLayout->addWidget(bpVramTypeBtn, 0, 1);
+            bpTypesGbLayout->addWidget(bpVramTypeBtn, 0, 2);
             bpCramTypeBtn = new QRadioButton("CRAM", w);
             bpCramTypeBtn->setFont(font);
-            bpTypesGbLayout->addWidget(bpCramTypeBtn, 0, 2);
+            bpTypesGbLayout->addWidget(bpCramTypeBtn, 0, 3);
             bpVsramTypeBtn = new QRadioButton("VSRAM", w);
             bpVsramTypeBtn->setFont(font);
-            bpTypesGbLayout->addWidget(bpVsramTypeBtn, 0, 3);
+            bpTypesGbLayout->addWidget(bpVsramTypeBtn, 0, 4);
             bpTypesGb->setLayout(bpTypesGbLayout);
             bpTypesGb->setAlignment(Qt::AlignTop);
 
@@ -1221,21 +1209,6 @@ static ssize_t idaapi hook_ui(void *user_data, int notification_code, va_list va
             bpList->horizontalHeaderItem(3)->setToolTip("Breakpoint type");
 
             bpList->resizeColumnsToContents();
-
-            int idaBpts = get_bpt_qty();
-
-            for (int i = 0; i < idaBpts; ++i) {
-                bpt_t bp;
-                getn_bpt(i, &bp);
-
-                bpt_data_t bpt_data;
-                bpt_data.enabled = bp.enabled() ? 1 : 0;
-                bpt_data.address = (unsigned int)bp.ea;
-                bpt_data.width = bp.size;
-
-                bpt_data.type = idaBptToGx(bp.type);
-                add_bpt_list_item(&bpt_data, -1);
-            }
 
             mainLayout->addWidget(bpTypesGb, 0, 0);
             mainLayout->addLayout(bpAddrLayout, 0, 1);
@@ -1616,8 +1589,6 @@ struct bpt_events_visitor_t : public post_event_visitor_t
     {
         switch (notification_code) {
         case dbg_notification_t::dbg_process_start: {
-            set_dock_pos(bpts_w_name, nullptr, DP_TAB);
-
             const debug_event_t* dbg_evt = va_arg(va, const debug_event_t*);
 
             int rows_count = bpList->rowCount();

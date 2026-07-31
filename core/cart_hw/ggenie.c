@@ -1,8 +1,8 @@
 /****************************************************************************
  *  Genesis Plus
- *  Game Genie Hardware emulation
+ *  Game Genie hardware support
  *
- *  Copyright (C) 2009-2014  Eke-Eke (Genesis Plus GX)
+ *  Copyright (C) 2009-2025  Eke-Eke (Genesis Plus GX)
  *
  *  Based on documentation from Charles McDonald
  *  (http://cgfm2.emuviews.com/txt/genie.txt)
@@ -44,7 +44,6 @@
 static struct
 {
   uint8 enabled;
-  uint8 *rom;
   uint16 regs[0x20];
   uint16 old[6];
   uint16 data[6];
@@ -58,29 +57,25 @@ static void ggenie_write_word(unsigned int address, unsigned int data);
 static void ggenie_write_regs(unsigned int offset, unsigned int data);
 
 void ggenie_init(void)
-{  
-  memset(&ggenie,0,sizeof(ggenie));
+{
+  ggenie.enabled = 0;
 
-  /* Store Game Genie ROM (32k) above cartridge ROM + SRAM area */
-  if (cart.romsize > 0x810000) return;
-  ggenie.rom = cart.rom + 0x810000;
-
-  /* Try to load Game Genie ROM file */
-  if (load_archive(GG_ROM, ggenie.rom, 0x8000, NULL) > 0)
+  /* Try to load Game Genie ROM file (32KB) */
+  if (load_archive(GG_ROM, cart.lockrom, 0x8000, NULL) > 0)
   {
 #ifdef LSB_FIRST
     int i;
     for (i=0; i<0x8000; i+=2)
     {
       /* Byteswap ROM */
-      uint8 temp = ggenie.rom[i];
-      ggenie.rom[i] = ggenie.rom[i+1];
-      ggenie.rom[i+1] = temp;
+      uint8 temp = cart.lockrom[i];
+      cart.lockrom[i] = cart.lockrom[i+1];
+      cart.lockrom[i+1] = temp;
     }
 #endif
 
     /* $0000-$7fff mirrored into $8000-$ffff */
-    memcpy(ggenie.rom + 0x8000, ggenie.rom, 0x8000);
+    memcpy(cart.lockrom + 0x8000, cart.lockrom, 0x8000);
 
     /* Game Genie hardware is enabled */
     ggenie.enabled = 1;
@@ -100,11 +95,11 @@ void ggenie_reset(int hard)
 {
   if (ggenie.enabled)
   {
+    /* Reset any existing patches */
+    ggenie_switch(0);
+
     if (hard)
     {
-      /* clear codes */
-      ggenie_switch(0);
-
       /* reset internal state */
       memset(ggenie.regs,0,sizeof(ggenie.regs));
       memset(ggenie.old,0,sizeof(ggenie.old));
@@ -113,7 +108,7 @@ void ggenie_reset(int hard)
     }
 
     /* Game Genie ROM is mapped at $000000-$007fff */
-    m68k.memory_map[0].base = ggenie.rom;
+    m68k.memory_map[0].base = cart.lockrom;
 
     /* Internal registers are mapped at $000000-$00001f */
     m68k.memory_map[0].write8   = ggenie_write_byte;
@@ -206,22 +201,22 @@ static void ggenie_write_regs(unsigned int offset, unsigned int data)
     /* MODE bit */
     if (data & 0x400)
     {
-      /* $0000-$7ffff reads mapped to Cartridge ROM */
+      /* $0000-$7fff reads mapped to cartridge ROM */
       m68k.memory_map[0].base = cart.rom;
       m68k.memory_map[0].read8 = NULL; 
       m68k.memory_map[0].read16 = NULL; 
     }
     else
     {
-      /* $0000-$7ffff reads mapped to Game Genie ROM */
-      m68k.memory_map[0].base = ggenie.rom;
+      /* $0000-$7fff reads mapped to Game Genie ROM */
+      m68k.memory_map[0].base = cart.lockrom;
       m68k.memory_map[0].read8 = NULL; 
       m68k.memory_map[0].read16 = NULL; 
 
       /* READ_ENABLE bit */
       if (data & 0x200)
       {
-        /* $0000-$7ffff reads mapped to Game Genie Registers */
+        /* $0000-$7fff reads mapped to Game Genie registers */
         /* code doing this should execute in RAM so we don't need to modify base address */
         m68k.memory_map[0].read8 = ggenie_read_byte; 
         m68k.memory_map[0].read16 = ggenie_read_word; 
@@ -252,7 +247,7 @@ static void ggenie_write_regs(unsigned int offset, unsigned int data)
       m68k.memory_map[0].write8   = m68k_unused_8_w;
       m68k.memory_map[0].write16  = m68k_unused_16_w;
 
-      /* patch ROM when GG program exits (LOCK bit set) */
+      /* patch ROM when Game Genie program exits (LOCK bit set) */
       /* this is done here to handle patched program reads faster & more easily */
       /* on real HW, address decoding would be done on each reads */
       ggenie_switch(1);

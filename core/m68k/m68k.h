@@ -30,15 +30,24 @@ extern "C" {
 
     - removed unused stuff to reduce memory usage / optimize execution (multiple CPU types support, NMI support, ...)
     - moved stuff to compile statically in a single object file
-    - implemented support for global cycle count (shared by 68k & Z80 CPU)
+    - added support for global cycle counter (shared by 68k & Z80 CPU)
     - added support for interrupt latency (Sesame's Street Counting Cafe, Fatal Rewind)
-    - added proper cycle use on reset
-    - added cycle accurate timings for MUL/DIV instructions (thanks to Jorge Cwik !) 
-    - fixed undocumented flags for DIV instructions (Blood Shot)
-    - fixed undocumented behaviors for ABCD/SBCD/NBCD instructions (thanks to flamewing for his test ROM)
+    - added MAIN-CPU & SUB-CPU support for Mega-CD emulation
+    - added (optional) support for CPU overclock
+    - added basic emulation of bus access refresh delays (Mega Drive hardware specific)
+    - fixed cycle use on reset
+    - fixed timing of MULU/MULS/DIVU/DIVS instructions (cf. https://pasti.fxatari.com/68kdocs/div68kCycleAccurate.c) 
+    - fixed undocumented flags of DIVU/DIVS instructions (Blood Shot)
+    - fixed undocumented behaviors of ABCD/SBCD/NBCD instructions (thanks to Flamewing for his test ROM)
+    - fixed behavior of NBCD instruction when using register operand
+    - fixed timing of BTST Dn,#Imm instruction (verified by Flamewing in original microcode)
+    - fixed timing of STOP instruction when STOP instruction unmasks pending interrupt
+    - fixed timing of ANDI.L #Imm,Dn, ADDQ.W #Imm,An and TAS instructions (cf. Yacht.txt)
+    - fixed timing of BCHG, BCLR, BTST Dn,#Imm and Dn,Dm instructions when bit number is less than 16 (cf. Yacht.txt)
+    - fixed timing of CHK, TRAP, TRAPV, LINEA and LINEF exceptions (cf. Yacht.txt)
+    - fixed prefetch emulation (still not fully accurate, cf. https://pasti.fxatari.com/68kdocs/68kPrefetch.html)
     - improved auto-vectored interrupts acknowledge cycle timing accuracy
-    - added MAIN-CPU & SUB-CPU support for Mega CD emulation
-    
+    - improved MOVEM instruction accuracy (implements extra read cycle from memory as verified on real hardware)
   */
 
 /* ======================================================================== */
@@ -243,12 +252,16 @@ typedef struct
 
   cpu_idle_t poll;      /* polling detection */
 
-  uint cycles;          /* current master cycle count */ 
+  sint cycles;          /* current master cycle count */ 
+  sint refresh_cycles;  /* external bus refresh cycle */ 
   uint cycle_end;       /* aimed master cycle count for current execution frame */
 
   uint dar[16];         /* Data and Address Registers */
   uint ppc;             /* Previous program counter */
   uint pc;              /* Program Counter */
+  uint prev_pc;         /* Previous Program Counter */
+  uint prev_dr[8];      /* Previous Data Registers */
+  uint prev_ar[8];      /* Previous Address Registers */
   uint sp[5];           /* User and Interrupt Stack Pointers */
   uint ir;              /* Instruction Register */
   uint t1_flag;         /* Trace 1 */
@@ -389,6 +402,9 @@ extern void m68k_clear_halt(void);
 extern void s68k_pulse_halt(void);
 extern void s68k_clear_halt(void);
 
+/* Put the CPU in waiting state until DTACK pin is asserted during bus access */
+extern void s68k_pulse_wait(unsigned int address, unsigned int write_access);
+extern void s68k_clear_wait(void);
 
 /* Peek at the internals of a CPU context.  This can either be a context
  * retrieved using m68k_get_context() or the currently running context.

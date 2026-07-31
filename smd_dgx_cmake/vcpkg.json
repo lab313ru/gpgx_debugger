@@ -1,0 +1,12 @@
+{
+  "name": "smd-dgx",
+  "version-string": "0.1.0",
+  "dependencies": [
+    "sdl2",
+    {
+      "name": "imgui",
+      "features": ["opengl3-binding", "sdl2-binding", "docking-experimental"]
+    },
+    "zlib"
+  ]
+}

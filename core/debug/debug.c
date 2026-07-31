@@ -157,22 +157,22 @@ static void send_dbg_event(unsigned int address, dbg_event_type_t type)
     dbg_req_core->dbg_events_count += 1;
 }
 
-void check_breakpoint(bpt_type_t type, int width, unsigned int address, unsigned int value)
-{
-    if (!dbg_req_core || !dbg_req_core->dbg_active == 1 || dbg_dont_check_bp)
-        return;
-
-    breakpoint_t *bp;
-    for (bp = first_bp; bp; bp = next_breakpoint(bp)) {
-        if (!(bp->type & type) || !bp->enabled) continue;
-        if ((address <= (bp->address + bp->width)) && ((address + width) >= bp->address)) {
-            dbg_req_core->dbg_paused = 1;
-
-            send_dbg_event(address, DBG_EVT_BREAK);
-            break;
-        }
-    }
-}
+//void check_breakpoint(bpt_type_t type, int width, unsigned int address, unsigned int value)
+//{
+//    if (!dbg_req_core || !dbg_req_core->dbg_active == 1 || dbg_dont_check_bp)
+//        return;
+//
+//    breakpoint_t *bp;
+//    for (bp = first_bp; bp; bp = next_breakpoint(bp)) {
+//        if (!(bp->type & type) || !bp->enabled) continue;
+//        if ((address <= (bp->address + bp->width)) && ((address + width) >= bp->address)) {
+//            dbg_req_core->dbg_paused = 1;
+//
+//            send_dbg_event(address, DBG_EVT_BREAK);
+//            break;
+//        }
+//    }
+//}
 
 static void pause_debugger()
 {
@@ -692,10 +692,6 @@ void process_breakpoints(bpt_type_t type, int width, unsigned int address, unsig
         }
 
         if (!dbg_req_core->dbg_paused) {
-            if (address < MAXROMSIZE && !dbg_req_core->pc_map[address >> 1].applied) {
-                dbg_req_core->pc_map[address >> 1].to_apply = 1;
-            }
-
             if (dbg_step_over && address == dbg_step_over_addr) {
                 dbg_step_over = 0;
                 dbg_step_over_addr = 0;
@@ -708,7 +704,7 @@ void process_breakpoints(bpt_type_t type, int width, unsigned int address, unsig
             }
 
             if (!dbg_continue_after_bp) {
-                check_breakpoint(BPT_M68K_E, 1, address, address);
+                // check_breakpoint(BPT_M68K_E, 1, address, address);
             }
 
             if (dbg_req_core->dbg_paused) {
@@ -729,7 +725,8 @@ void process_breakpoints(bpt_type_t type, int width, unsigned int address, unsig
         }
     } break;
     default: {
-        check_breakpoint(type, width, address, value);
+        return;
+        // check_breakpoint(type, width, address, value);
     }
     }
 }

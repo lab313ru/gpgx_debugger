@@ -2,7 +2,7 @@
  *  Genesis Plus
  *  I2C Serial EEPROM (24Cxx) boards
  *
- *  Copyright (C) 2007-2016  Eke-Eke (Genesis Plus GX)
+ *  Copyright (C) 2007-2026  Eke-Eke (Genesis Plus GX)
  *
  *  Redistribution and use of this code or any derivative works are permitted
  *  provided that the following conditions are met:
@@ -40,6 +40,6 @@
 #define _EEPROM_I2C_H_
 
 /* Function prototypes */
-extern void eeprom_i2c_init();
+extern void eeprom_i2c_init(void);
 
 #endif

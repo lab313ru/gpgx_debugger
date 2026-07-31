@@ -39,6 +39,10 @@
  *          VRC VII decap and die shot.
  *
  *  version: 1.0
+ *
+ *  additional changes (EkeEke):
+ *  - fixed attack phase rates 11.1 to 11.3
+ *  - fixed ch8&ch9 modulator wave leakage into output (backported from nukeyt core version 1.0.2)
  */
 
 #include <string.h>
@@ -634,13 +638,8 @@ void OPLL_EnvelopeGenerate(opll_t *chip) {
     switch (state) {
     case eg_num_attack:
         if (!chip->eg_maxrate && (chip->eg_kon & 2) && !zero) {
-            int32_t shift = chip->eg_rate_hi - 11 + chip->eg_inc_hi;
-            if (chip->eg_inc_lo) {
-                shift = 1;
-            }
+            int32_t shift = (chip->eg_rate_hi < 12) ? chip->eg_inc_lo : (chip->eg_rate_hi - 11 + chip->eg_inc_hi);
             if (shift > 0) {
-                if (shift > 4)
-                    shift = 4;
                 step = ~level >> (5 - shift);
             }
         }
@@ -957,6 +956,9 @@ void OPLL_Operator(opll_t *chip) {
             break;
         }
     }
+
+    if (!(chip->rm_enable & 0x80))
+        routput = 0;
 
     chip->ch_out = ismod1 ? routput : (output>>3);
 }

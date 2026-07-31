@@ -54,6 +54,11 @@ extern void (*fm_reset)(unsigned int cycles);
 extern void (*fm_write)(unsigned int cycles, unsigned int address, unsigned int data);
 extern unsigned int (*fm_read)(unsigned int cycles, unsigned int address);
 
+#ifdef HOOK_CPU
+/* Raw FM register shadow for the debugger (part I / part II banks) */
+extern uint8 fm_debug_regs[2][0x100];
+#endif
+
 #ifdef __cplusplus
 }
 #endif
