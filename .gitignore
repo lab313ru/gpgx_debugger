@@ -24,3 +24,13 @@ builds/
 # next to whatever the working directory happened to be.
 *.srm
 *.gpz
+
+# Python bytecode. Never useful in a repository, and it is what actually got
+# swept in here: a blanket "git add -A" picks up whatever the interpreter left
+# behind on its last run.
+__pycache__/
+*.pyc
+
+# Game-specific reverse-engineering scripts live with the investigation, not
+# with the debugger.
+smd_dgx_cmake/tools/
