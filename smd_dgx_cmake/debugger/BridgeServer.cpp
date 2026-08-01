@@ -1,7 +1,9 @@
 #include "BridgeServer.h"
 #include "EmuHost.h"
 
+#include <cerrno>
 #include <chrono>
+#include <thread>
 #include <cstdio>
 #include <cstring>
 #include <sstream>
@@ -62,6 +64,41 @@ uint32_t parseU32(const std::string& s, int base = 16)
     return static_cast<uint32_t>(std::strtoul(s.c_str(), nullptr, base));
 }
 
+// Parse a WHOLE token as a number.
+//
+// The old parser was strtoul with a null endptr, which cannot fail: a missing
+// argument became 0 and a half-numeric one was truncated. That is how "bpadd"
+// with no arguments answered "ok" and set a breakpoint at address 0, and how a
+// length of "6c" quietly became 6. Anything the caller did not clearly mean is
+// now a refusal.
+//
+// An explicit 0x prefix always means hex, whatever the default base is — that
+// is the escape hatch for the decimal-length arguments.
+bool parseNum(const std::string& s, uint32_t& out, int base = 16)
+{
+    if (s.empty()) return false;
+
+    const char* p = s.c_str();
+    int b = base;
+    if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) { p += 2; b = 16; }
+
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long v = std::strtoul(p, &end, b);
+    if (end == p || *end != 0) return false;      // empty, or trailing garbage
+    if (errno == ERANGE || v > 0xFFFFFFFFul) return false;
+
+    out = static_cast<uint32_t>(v);
+    return true;
+}
+
+
+// An optional numeric argument: absent is fine and keeps the default, but a
+// token that is not a number is a mistake and must not silently become one.
+bool optNum(const std::string& tok, uint32_t& out, int base = 16)
+{
+    return tok.empty() || parseNum(tok, out, base);
+}
 
 unsigned currentPid()
 {
@@ -357,10 +394,17 @@ std::string BridgeServer::handle(const std::string& line, Client& client)
     }
 
     if (cmd == "status") {
-        char out[128];
-        std::snprintf(out, sizeof out, "ok running=%d paused=%d pc=%06X",
+        // stops and frames are monotonic. "resume then poll until paused=1" is
+        // unsound without them: the poll can see the pause the caller was
+        // already standing on and call it a new one, so a frame-stepping loop
+        // silently re-reads the same frame. Remember stops and compare.
+        char out[192];
+        std::snprintf(out, sizeof out,
+                      "ok running=%d paused=%d pc=%06X stops=%llu frames=%llu",
                       host_->isRunning() ? 1 : 0, be->isPaused() ? 1 : 0,
-                      be->getM68kRegs().pc & 0xFFFFFF);
+                      be->getM68kRegs().pc & 0xFFFFFF,
+                      (unsigned long long)host_->stopCount(),
+                      (unsigned long long)host_->frameCount());
         return out;
     }
 
@@ -399,15 +443,19 @@ std::string BridgeServer::handle(const std::string& line, Client& client)
     }
 
     if (cmd == "read") {
-        const uint32_t a = parseU32(arg());
-        const uint32_t n = parseU32(arg(), 10);
+        static const char* kUsage =
+            "err usage: read <hex-addr> <dec-len> (0x prefix allowed)";
+        uint32_t a = 0, n = 0;
+        if (!parseNum(arg(), a))     return kUsage;
+        if (!parseNum(arg(), n, 10)) return kUsage;
         if (n == 0 || n > (1u << 20)) return "err bad size";
         const auto d = be->readMemory(a, n);
         return "ok " + toHex(d.data(), d.size());
     }
 
     if (cmd == "write") {
-        const uint32_t a = parseU32(arg());
+        uint32_t a = 0;
+        if (!parseNum(arg(), a)) return "err usage: write <hex-addr> <hex-bytes>";
         const auto d = fromHex(arg());
         if (d.empty()) return "err no data";
         return be->writeMemory(a, d.data(), (uint32_t)d.size()) ? "ok" : "err write failed";
@@ -429,9 +477,18 @@ std::string BridgeServer::handle(const std::string& line, Client& client)
     }
 
     if (cmd == "readregion") {
-        const int id     = (int)parseU32(arg(), 10);
-        const uint32_t o = parseU32(arg());
-        const uint32_t n = parseU32(arg(), 10);
+        // Bases differ between the two numbers and always have: the offset is
+        // hex, the length decimal. Changing that would break every existing
+        // caller, so instead both accept an explicit 0x prefix and neither
+        // tolerates trailing characters — a length of "6c" is a mistake, not
+        // the number 6, and used to return a short buffer with no complaint.
+        static const char* kUsage =
+            "err usage: readregion <dec-id> <hex-offset> <dec-len> (0x prefix allowed)";
+        uint32_t idv = 0, o = 0, n = 0;
+        if (!parseNum(arg(), idv, 10)) return kUsage;
+        if (!parseNum(arg(), o))       return kUsage;
+        if (!parseNum(arg(), n, 10))   return kUsage;
+        const int id = (int)idv;
         if (n == 0 || n > (1u << 20)) return "err bad size";
         const auto d = be->readRegion(id, o, n);
         return "ok " + toHex(d.data(), d.size());
@@ -439,7 +496,9 @@ std::string BridgeServer::handle(const std::string& line, Client& client)
 
 
     if (cmd == "events") {
-        int max = (int)parseU32(arg(), 10);
+        uint32_t maxv = 64;
+        if (!optNum(arg(), maxv, 10)) return "err usage: events [dec-max]";
+        int max = (int)maxv;
         if (max <= 0 || max > 256) max = 64;
         return handleEvents(client, max);
     }
@@ -447,7 +506,9 @@ std::string BridgeServer::handle(const std::string& line, Client& client)
     // Block until the machine stops. Default 10s: long enough for a breakpoint
     // deep in a level, short enough that a wedged emulator still answers.
     if (cmd == "wait") {
-        int ms = (int)parseU32(arg(), 10);
+        uint32_t msv = 10000;
+        if (!optNum(arg(), msv, 10)) return "err usage: wait [dec-milliseconds]";
+        int ms = (int)msv;
         if (ms <= 0) ms = 10000;
         if (ms > 120000) ms = 120000;
         return handleWait(client, ms);
@@ -456,7 +517,9 @@ std::string BridgeServer::handle(const std::string& line, Client& client)
     // Run exactly n frames and stop. The only way to time an input: while the
     // emulator is being debugged it is not bound to the wall clock.
     if (cmd == "frameadv") {
-        int n = (int)parseU32(arg(), 10);
+        uint32_t nv = 1;
+        if (!optNum(arg(), nv, 10)) return "err usage: frameadv [dec-count]";
+        int n = (int)nv;
         if (n <= 0) n = 1;
         if (n > 100000) return "err too many frames";
         host_->advanceFrames(n);
@@ -467,9 +530,16 @@ std::string BridgeServer::handle(const std::string& line, Client& client)
     // Find a byte pattern in a region. Server-side because the alternative is
     // hauling the whole region across as ASCII hex on every attempt.
     if (cmd == "search") {
-        const int id = (int)parseU32(arg(), 10);
+        static const char* kUsage =
+            "err usage: search <dec-region-id> <hex-pattern> [dec-max-hits]";
+        uint32_t idv = 0, maxv = 256;
+        // A missing id used to default to 0 — which is ROM, a perfectly real
+        // region, so a typo searched the wrong thing and said nothing.
+        if (!parseNum(arg(), idv, 10)) return kUsage;
         const auto pat = fromHex(arg());
-        int max = (int)parseU32(arg(), 10);
+        if (!optNum(arg(), maxv, 10)) return kUsage;
+        const int id = (int)idv;
+        int max = (int)maxv;
         if (pat.empty()) return "err empty pattern";
         if (max <= 0 || max > 4096) max = 256;
 
@@ -492,7 +562,9 @@ std::string BridgeServer::handle(const std::string& line, Client& client)
 
     // Snapshot a region for later comparison.
     if (cmd == "snap") {
-        const int id = (int)parseU32(arg(), 10);
+        uint32_t idv = 0;
+        if (!parseNum(arg(), idv, 10)) return "err usage: snap <dec-region-id>";
+        const int id = (int)idv;
         uint32_t size = 0;
         for (const auto& r : be->getMemRegions()) if (r.id == id) size = r.size;
         if (!size) return "err no such region";
@@ -510,8 +582,12 @@ std::string BridgeServer::handle(const std::string& line, Client& client)
     // What changed since `snap`. Returns offset:old:new triples — the RAM-search
     // loop that finds a variable by playing the game and asking what moved.
     if (cmd == "diff") {
-        const int id = (int)parseU32(arg(), 10);
-        int max = (int)parseU32(arg(), 10);
+        static const char* kUsage = "err usage: diff <dec-region-id> [dec-max-hits]";
+        uint32_t idv = 0, maxv = 256;
+        if (!parseNum(arg(), idv, 10)) return kUsage;
+        if (!optNum(arg(), maxv, 10)) return kUsage;
+        const int id = (int)idv;
+        int max = (int)maxv;
         if (max <= 0 || max > 4096) max = 256;
 
         std::vector<uint8_t> before;
@@ -582,24 +658,34 @@ std::string BridgeServer::handle(const std::string& line, Client& client)
     }
 
     if (cmd == "readz80") {
-        const uint32_t a = parseU32(arg());
-        const uint32_t n = parseU32(arg(), 10);
+        static const char* kUsage = "err usage: readz80 <hex-addr> <dec-len>";
+        uint32_t a = 0, n = 0;
+        if (!parseNum(arg(), a))     return kUsage;
+        if (!parseNum(arg(), n, 10)) return kUsage;
         if (n == 0 || n > (1u << 16)) return "err bad size";
         const auto d = be->readZ80Memory(uint16_t(a), uint16_t(n));
         return "ok " + toHex(d.data(), d.size());
     }
 
     if (cmd == "writeregion") {
-        const int id     = (int)parseU32(arg(), 10);
-        const uint32_t o = parseU32(arg());
+        static const char* kUsage =
+            "err usage: writeregion <dec-id> <hex-offset> <hex-bytes>";
+        uint32_t idv = 0, o = 0;
+        if (!parseNum(arg(), idv, 10)) return kUsage;
+        if (!parseNum(arg(), o))       return kUsage;
+        const int id = (int)idv;
         const auto d = fromHex(arg());
         if (d.empty()) return "err no data";
         return be->writeRegion(id, o, d.data(), (uint32_t)d.size()) ? "ok" : "err write failed";
     }
 
     if (cmd == "setvdpreg") {
-        const int idx = (int)parseU32(arg(), 10);
-        be->setVdpReg(idx, uint8_t(parseU32(arg())));
+        static const char* kUsage = "err usage: setvdpreg <dec-index 0-23> <hex-byte>";
+        uint32_t idx = 0, v = 0;
+        if (!parseNum(arg(), idx, 10)) return kUsage;
+        if (!parseNum(arg(), v))       return kUsage;
+        if (idx > 23 || v > 0xFF)      return kUsage;
+        be->setVdpReg((int)idx, (uint8_t)v);
         return "ok";
     }
 
@@ -620,7 +706,10 @@ std::string BridgeServer::handle(const std::string& line, Client& client)
     }
 
     if (cmd == "getpad") {
-        const int port = (int)parseU32(arg(), 10);
+        uint32_t portv = 0;
+        const std::string p = arg();
+        if (!p.empty() && !parseNum(p, portv, 10)) return "err usage: getpad [dec-port]";
+        const int port = (int)portv;
         std::ostringstream o; o << "ok " << std::hex << be->getPad(port);
         return o.str();
     }
@@ -638,7 +727,49 @@ std::string BridgeServer::handle(const std::string& line, Client& client)
     if (cmd == "resume") {
         const auto& hm = host_->hostMutations();
         if (!(hm.resume && hm.resume())) be->resume();
-        return "ok";
+
+        // Do not return while the caller could still observe the stale pause.
+        // "Still paused" is not the same as "did not move": a breakpoint one
+        // instruction away puts it straight back, and that is a success. What
+        // must be true before returning is that the OLD stop is behind us —
+        // either the machine is running, or a new stop has replaced it.
+        const uint64_t before = host_->stopCount();
+        for (int i = 0; i < 500; ++i) {
+            if (!be->isPaused() || host_->stopCount() != before) return "ok";
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        // Still paused after half a second. Not a failure — the request was
+        // accepted and a host may reach the emulator asynchronously (IDA's
+        // continue_process does) — but the caller must not read the next
+        // status as a fresh stop, so say which of the two this is.
+        return "ok pending";
+    }
+
+    // Run exactly one video frame and come back. The whole resume/poll dance
+    // exists only because this was missing, and frame stepping is the common
+    // case for instrumenting a game.
+    if (cmd == "stepframe") {
+        uint32_t n = 1;
+        const std::string tok = arg();
+        if (!tok.empty() && !parseNum(tok, n, 10))
+            return "err usage: stepframe [dec-count]";
+        if (n == 0 || n > 100000) return "err bad frame count";
+
+        const uint64_t before = host_->stopCount();
+        host_->advanceFrames((int)n);
+        be->resume();
+
+        // Frames are ~17 ms; allow generously for a breakpoint landing first.
+        for (int i = 0; i < 2000 && host_->stopCount() == before; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (host_->stopCount() == before) return "err frame did not complete";
+
+        char out[160];
+        std::snprintf(out, sizeof out, "ok pc=%06X stops=%llu frames=%llu",
+                      be->getM68kRegs().pc & 0xFFFFFF,
+                      (unsigned long long)host_->stopCount(),
+                      (unsigned long long)host_->frameCount());
+        return out;
     }
     // optional trailing "z80" selects the sound CPU
     if (cmd == "stepi" || cmd == "stepo") {
@@ -648,24 +779,49 @@ std::string BridgeServer::handle(const std::string& line, Client& client)
     }
 
     if (cmd == "pad") {
-        const uint16_t mask = (uint16_t)parseU32(arg());
+        static const char* kUsage = "err usage: pad <hex-button-mask> [dec-port]";
+        uint32_t maskv = 0, portv = 0;
+        if (!parseNum(arg(), maskv)) return kUsage;
         const std::string p = arg();
-        be->setPad(p.empty() ? 0 : (int)parseU32(p, 10), mask);
+        if (!p.empty() && !parseNum(p, portv, 10)) return kUsage;
+        be->setPad((int)portv, (uint16_t)maskv);
         return "ok";
     }
 
     if (cmd == "bpadd") {
+        static const char* kUsage =
+            "err usage: bpadd <x|r|w> <hex-start> [hex-end] "
+            "[cpu=m68k|z80] [vdp=0|1] [elang=N] [cond=...]";
+
         Breakpoint bp;
         const std::string t = arg();
-        bp.type  = (t == "r") ? BpType::Read : (t == "w") ? BpType::Write : BpType::PC;
-        bp.start = parseU32(arg());
-        bp.end   = parseU32(arg());
-        if (bp.end < bp.start) bp.end = bp.start;
+        // The type is required and must be one of three letters. It used to
+        // fall through to PC for anything, so "bpadd 74e0" read the address as
+        // a type, defaulted the address to 0, and answered ok — a breakpoint
+        // that can never fire and never says why.
+        if      (t == "x") bp.type = BpType::PC;
+        else if (t == "r") bp.type = BpType::Read;
+        else if (t == "w") bp.type = BpType::Write;
+        else return kUsage;
+
+        if (!parseNum(arg(), bp.start)) return kUsage;
+
+        // The next token is either the end address or the first key=value.
+        // Read it once and decide, rather than trying to push it back.
+        bp.end = bp.start;
+        std::string tok = arg();
+        if (!tok.empty() && tok.find('=') == std::string::npos) {
+            if (!parseNum(tok, bp.end)) return kUsage;
+            if (bp.end < bp.start) bp.end = bp.start;
+            tok = arg();
+        }
+
         // Optional key=value tail. cpu and vdp are not cosmetic: matchBreakpoint
         // requires both to agree or the breakpoint silently never fires.
-        for (std::string kv; is >> kv; ) {
+        for (; !tok.empty(); tok = arg()) {
+            const std::string kv = tok;
             const size_t eq = kv.find('=');
-            if (eq == std::string::npos) continue;
+            if (eq == std::string::npos) return kUsage;
             const std::string k = kv.substr(0, eq), v = kv.substr(eq + 1);
             if      (k == "cpu")   bp.cpu     = (v == "z80") ? Cpu::Z80 : Cpu::M68K;
             else if (k == "vdp")   bp.is_vdp  = (v != "0");
@@ -687,7 +843,9 @@ std::string BridgeServer::handle(const std::string& line, Client& client)
     }
 
     if (cmd == "bpdel") {
-        const int id = (int)parseU32(arg(), 10);
+        uint32_t idv = 0;
+        if (!parseNum(arg(), idv, 10)) return "err usage: bpdel <id>";
+        const int id = (int)idv;
         const auto& hm = host_->hostMutations();
         if (!(hm.removeBreakpoint && hm.removeBreakpoint(id)))
             be->removeBreakpoint(id);

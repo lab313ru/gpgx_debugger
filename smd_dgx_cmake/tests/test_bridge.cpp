@@ -478,8 +478,10 @@ TEST(bridge_routes_mutations_through_the_host_when_one_is_installed)
     } seen;
 
     EmuHost::HostMutations hm;
-    hm.resume = [&] { ++seen.resume; return true; };
-    hm.pause  = [&] { ++seen.pause;  return true; };
+    // A host that claims an operation must actually perform it — IDA reaches
+    // the backend through ev_resume; here we stand in for that.
+    hm.resume = [&] { ++seen.resume; w.emu.backend()->resume(); return true; };
+    hm.pause  = [&] { ++seen.pause;  w.emu.backend()->pause();  return true; };
     hm.addBreakpoint = [&](const Breakpoint&, int* id) {
         ++seen.add; if (id) *id = 4242; return true;
     };
@@ -528,6 +530,113 @@ TEST(bridge_falls_through_to_the_backend_without_a_host)
 
     w.emu.backend()->clearBreakpoints();
     w.emu.host()->setHostMutations({});
+}
+
+// ---------------------------------------------------------------------------
+// Saying "ok" to input you did not understand.
+//
+// The dispatcher used to parse numbers with strtoul and a null endptr, which
+// cannot fail: a missing argument became 0, and a half-numeric one was
+// truncated. Every case below was hit while driving a real ROM, and each one
+// produced plausible-looking wrong data rather than an error.
+// ---------------------------------------------------------------------------
+TEST(bridge_bpadd_refuses_a_malformed_command)
+{
+    Wired w(19);
+    REQUIRE(w.ok);
+    Raw raw;
+    REQUIRE(raw.connect(portFor(19)));
+
+    // The reported case: an address where the type belongs. This used to answer
+    // "ok 1" and set a breakpoint at 0 that could never fire.
+    CHECK(raw.cmd("bpadd 74e0").rfind("err", 0) == 0);
+    // ...and no arguments at all.
+    CHECK(raw.cmd("bpadd").rfind("err", 0) == 0);
+    // A junk type, and a junk address.
+    CHECK(raw.cmd("bpadd q 74e0").rfind("err", 0) == 0);
+    CHECK(raw.cmd("bpadd x zzz").rfind("err", 0) == 0);
+    // Nothing was created by any of them.
+    CHECK(w.emu.backend()->getBreakpoints().empty());
+
+    // The correct form still works, with and without an explicit end.
+    CHECK(raw.cmd("bpadd x 74e0").rfind("ok ", 0) == 0);
+    CHECK(raw.cmd("bpadd w 74e0 74e3 cpu=m68k").rfind("ok ", 0) == 0);
+
+    const auto bps = w.emu.backend()->getBreakpoints();
+    REQUIRE(bps.size() == 2);
+    CHECK_EQ(bps[0].start, 0x74E0u);
+    CHECK_EQ(bps[0].end,   0x74E0u);      // end defaults to start, not to 0
+    CHECK_EQ(bps[1].end,   0x74E3u);
+
+    CHECK(raw.cmd("bpdel").rfind("err", 0) == 0);   // id is required too
+    w.emu.backend()->clearBreakpoints();
+}
+
+TEST(bridge_rejects_a_number_with_trailing_garbage)
+{
+    Wired w(20);
+    REQUIRE(w.ok);
+    Raw raw;
+    REQUIRE(raw.connect(portFor(20)));
+
+    // The reported case: a decimal length of "6c" silently became 6, so the
+    // caller got a six-byte buffer and no hint that anything was wrong.
+    CHECK(raw.cmd("readregion 1 212a 6c").rfind("err", 0) == 0);
+    // A plain decimal length still works...
+    CHECK_EQ(raw.cmd("readregion 1 21d8 64").size(), size_t(3 + 64 * 2));
+    // ...and 0x is the escape hatch for callers who think in hex.
+    CHECK_EQ(raw.cmd("readregion 1 21d8 0x40").size(), size_t(3 + 64 * 2));
+
+    // The same parser guards every command that takes a number.
+    CHECK(raw.cmd("read 21d8 6c").rfind("err", 0) == 0);
+    CHECK(raw.cmd("readregion").rfind("err", 0) == 0);
+    CHECK(raw.cmd("snap").rfind("err", 0) == 0);        // id 0 is ROM: a real
+    CHECK(raw.cmd("search").rfind("err", 0) == 0);      // region, so defaulting
+    CHECK(raw.cmd("diff").rfind("err", 0) == 0);        // it searched the wrong one
+    CHECK(raw.cmd("setvdpreg 99 00").rfind("err", 0) == 0);
+}
+
+// A frame-stepping loop must be able to tell a new stop from the one it was
+// already standing on. Without that, "resume then poll until paused" returns
+// immediately and the caller re-reads the same frame — in a real trace this
+// produced runs of identical samples that looked entirely plausible.
+TEST(bridge_status_counters_distinguish_a_new_stop)
+{
+    Wired w(21);
+    REQUIRE(w.ok);
+    Raw raw;
+    REQUIRE(raw.connect(portFor(21)));
+
+    auto field = [](const std::string& s, const char* key) -> unsigned long long {
+        const size_t p = s.find(key);
+        if (p == std::string::npos) return 0;
+        return std::strtoull(s.c_str() + p + std::strlen(key), nullptr, 10);
+    };
+
+    const std::string s0 = raw.cmd("status");
+    CHECK(s0.find("stops=") != std::string::npos);
+    CHECK(s0.find("frames=") != std::string::npos);
+    const unsigned long long stops0 = field(s0, "stops=");
+
+    // resume must not return while still paused, or the status right after it
+    // reports the stale value.
+    CHECK_STR(raw.cmd("resume"), "ok");
+    CHECK(raw.cmd("status").find("paused=0") != std::string::npos);
+
+    // One frame, synchronously — the whole poll dance exists because this was
+    // missing.
+    const std::string f = raw.cmd("stepframe");
+    REQUIRE(f.rfind("ok", 0) == 0);
+    const unsigned long long stops1 = field(f, "stops=");
+    CHECK(stops1 > stops0);                       // a genuinely new stop
+    CHECK(w.emu.backend()->isPaused());
+
+    const std::string f2 = raw.cmd("stepframe");
+    REQUIRE(f2.rfind("ok", 0) == 0);
+    CHECK(field(f2, "stops=")  > stops1);
+    CHECK(field(f2, "frames=") > field(f, "frames="));
+
+    CHECK(raw.cmd("stepframe zz").rfind("err", 0) == 0);
 }
 
 TEST(bridge_rejects_absurd_sizes_instead_of_allocating)

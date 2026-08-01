@@ -84,6 +84,16 @@ public:
     // Run n more frames, then pause. Zero cancels a pending advance.
     void advanceFrames(int n) { framesLeft_.store(n < 0 ? 0 : n); }
 
+    // Monotonic counters a client can compare across calls.
+    //
+    // Without them, "resume then poll until paused" is unsound: the poll can
+    // observe the pause the caller was already standing on and conclude a new
+    // one has happened. A caller that remembers the stop count instead cannot
+    // be fooled — and the frame count answers "how long did that take?" on its
+    // own.
+    uint64_t stopCount()  const { return stops_.load(); }
+    uint64_t frameCount() const { return frames_.load(); }
+
     // A host that keeps its OWN model of run control and breakpoints installs
     // these. IDA does: its Breakpoints window and its run state are IDA's, not
     // ours, and it has no way to learn that something else changed them —
@@ -135,6 +145,8 @@ private:
     std::atomic<bool> stopFlag_ { false };
     std::atomic<bool> running_  { false };
     std::atomic<int>  framesLeft_ { 0 };   // frame-advance countdown
+    std::atomic<uint64_t> stops_  { 0 };
+    std::atomic<uint64_t> frames_ { 0 };
     HostMutations     hostMut_;
 
     // Work handed to the emulation thread by invoke().

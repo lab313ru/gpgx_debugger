@@ -409,10 +409,14 @@ def frame_advance(frames: int = 1) -> dict[str, str]:
     """Run exactly this many frames, then stop. Resumes first if paused.
 
     This is how an input is timed: hold buttons with set_buttons, advance the
-    frames you want them held for, then release.
+    frames you want them held for, then release. Returns pc and the monotonic
+    stops/frames counters — compare stops across calls to be sure you are
+    looking at a NEW stop and not the one you were already standing on.
     """
-    bridge.command(f"frameadv {int(frames)}")
-    return wait_for_stop(30000)
+    reply = bridge.command(f"stepframe {int(frames)}")
+    out = {"reason": "paused"}
+    out.update(_kv(reply))
+    return out
 
 
 @mcp.tool()

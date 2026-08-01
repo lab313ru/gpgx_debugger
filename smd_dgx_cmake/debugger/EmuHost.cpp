@@ -43,6 +43,7 @@ bool EmuHost::start(const std::string& romPath)
         ev.cpu = cpu;
         ev.pc = pc;
         ev.bpId = backend_.lastStopBreakpoint();
+        ev.stopSeq = stops_.fetch_add(1) + 1;
         ev.changed = backend_.takeCodemap();
         emitEvent(ev);
     });
@@ -92,6 +93,7 @@ void EmuHost::run(std::string /*romPath*/)
         drainCommands();
 
         system_frame_gen(0);      // one field/frame; blocks in firePause on bp
+        frames_.fetch_add(1);
 
         // Frame advance: run exactly N frames, then stop. An agent cannot
         // time an input by sleeping — while it is being debugged the
