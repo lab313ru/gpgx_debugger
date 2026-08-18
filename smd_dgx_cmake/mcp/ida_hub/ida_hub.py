@@ -284,13 +284,53 @@ def _register_plugin_tools() -> int:
     return n
 
 
+# ---------------------------------------------------------------------------
+# lazy registration
+#
+# The hub is usually started by the MCP host BEFORE any IDA is open — with
+# autostart that is the normal order. Registering only at startup would leave
+# such a hub with three tools forever, and an agent calling
+# decompile_function would get "Unknown tool" with no hint why. So the plugin
+# tools are (re)registered on every tools/list, and a call to a name that is
+# not registered yet triggers one more attempt before it is refused.
+# ---------------------------------------------------------------------------
+_orig_list_tools = mcp.list_tools
+_orig_call_tool = mcp.call_tool
+
+
+async def _list_tools_lazy():
+    _register_plugin_tools()
+    return await _orig_list_tools()
+
+
+async def _call_tool_lazy(name: str, arguments: dict[str, Any]):
+    if name not in mcp._tool_manager._tools:               # noqa: SLF001
+        _register_plugin_tools()
+    if name not in mcp._tool_manager._tools:               # noqa: SLF001
+        sessions = _discover()
+        if not sessions:
+            raise RuntimeError(f"unknown tool '{name}': " + _NO_IDA)
+        raise RuntimeError(f"unknown tool '{name}' — not offered by the IDA(s) "
+                           f"currently running ({_fmt(sessions)})")
+    return await _orig_call_tool(name, arguments)
+
+
+mcp.list_tools = _list_tools_lazy
+mcp.call_tool = _call_tool_lazy
+# The low-level server captured the ORIGINAL bound methods in _setup_handlers;
+# rebind so it sees the lazy ones.
+mcp._mcp_server.list_tools()(mcp.list_tools)              # noqa: SLF001
+mcp._mcp_server.call_tool(validate_input=False)(mcp.call_tool)  # noqa: SLF001
+
+
 if __name__ == "__main__":
     n = _register_plugin_tools()
     if n == 0:
-        # Not fatal — the session tools still work — but a hub with three tools
-        # looks broken, so say why.
-        print("ida-hub: no IDA answering yet; only the session tools are available "
-              "until one is running (start the MCP server in IDA with Ctrl-Alt-M)",
+        # Not fatal, and no longer permanent: the plugin tools appear on the
+        # next tools/list once an IDA is up. Say so anyway, so a hub with three
+        # tools does not read as broken.
+        print("ida-hub: no IDA answering yet; the plugin tools will appear as soon "
+              "as one is running (with the companion, that is when a database opens)",
               file=sys.stderr)
     else:
         print(f"ida-hub: forwarding {n} tools from the ida-pro-mcp plugin", file=sys.stderr)
