@@ -1057,3 +1057,21 @@ The IDA SDK is NOT redistributed here. Building the IDA modules requires the
 SDK separately; it is published by Hex-Rays under the MIT licence at
 https://github.com/HexRaysSA/ida-sdk . Any SDK signatures quoted in comments or
 in smd_dgx_cmake/ida_plugin/IDA93_SDK_NOTES.md are used under that licence.
+
+The following component is vendored with a modification and carries its own
+licence:
+
+  smd_dgx_cmake/mcp/ida_hub/mcp-plugin.py
+  smd_dgx_cmake/mcp/ida_hub/LICENSE-ida-pro-mcp
+
+    ida-pro-mcp IDA plugin, version 1.5.0.
+    Copyright (c) 2025 Duncan Ogilvie (mrexodia)
+    https://github.com/mrexodia/ida-pro-mcp — MIT License (see the LICENSE
+    file alongside it).
+
+    Vendored so that one fix survives reinstalling the upstream package:
+    on Windows the plugin bound its port with SO_REUSEADDR, which lets a
+    second process bind a port already in use, so several IDA instances
+    all reported the same port and only one was reachable. The change is
+    marked "patched by ida-hub/install.py" in the file. Nothing else is
+    altered.

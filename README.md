@@ -123,6 +123,24 @@ loop actually needs:
   what moved. Emulator-side, so a RAM search is not 64 KB of hex per round.
 - `screenshot` — the framebuffer as a PNG, so a model can *see* the game.
 
+### The other MCP: IDA itself
+
+`mcp/ida_hub/` is a small proxy in front of
+[ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp), the third-party server
+that gives an agent IDA's static side — decompilation, xrefs, names. That
+plugin already handles several IDAs (each takes the next port from 13337), but
+its client is a hardcoded port, so an agent only ever saw the first IDA that
+started. The hub scans, asks each IDA which file it has open, and forwards
+every plugin tool to the one you pick with `use_ida_session("sonic")`. With
+two IDAs and no choice made it refuses rather than guessing.
+
+`python mcp/ida_hub/install.py` adds two things on the IDA side: a companion
+plugin that starts the MCP server the moment a database opens (no more
+`Ctrl-Alt-M` per instance), and a one-line fix to the plugin — on Windows
+`SO_REUSEADDR` let every IDA bind 13337 at once, so they all reported the same
+port and only one was reachable. Reinstalling ida-pro-mcp overwrites the plugin;
+re-run the installer.
+
 Several emulators can run at once. Each takes a free port from 27042 upward and
 identifies itself — pid, ROM checksum, serial, title — so `list_sessions` tells
 you whose game is whose. Two games means two processes: the emulator core is
