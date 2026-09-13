@@ -11,7 +11,9 @@
           "CMAKE_C_COMPILER": "cl.exe",
           "CMAKE_CXX_COMPILER": "cl.exe",
           "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-          "CMAKE_PREFIX_PATH": "C:/Qt/6.8.2/msvc2022_64"
+          "CMAKE_PREFIX_PATH": "C:/Qt/6.8.2/msvc2022_64",
+          "IDA_SDK_DIR": "F:/Projects/ida-sdk-9.3/src",
+          "IDA_INSTALL_DIR": "C:/Program Files/IDA Professional 9.3"
         },
         "condition": {
           "type": "equals",
