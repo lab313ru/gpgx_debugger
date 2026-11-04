@@ -293,6 +293,16 @@ void BridgeServer::onEmuEvent(const void* evp)
     for (auto& c : clients_) {
         if (c->events.size() >= 256) { c->events.pop_front(); ++c->dropped; }
         c->events.push_back(QueuedEvent{ seq, uint8_t(ev.type), uint8_t(ev.cpu), ev.pc, ev.bpId });
+        // The codemap rides the same event but cannot ride the same queue: it
+        // is a set, not a stream — two pauses may repeat the same pcs and the
+        // client only cares about the union since it last asked.
+        for (const auto& kv : ev.changed) {
+            if (c->codemap.size() >= 262144 && !c->codemap.count(kv.first)) {
+                c->codemapTrunc = true;
+                break;
+            }
+            c->codemap[kv.first] = kv.second;
+        }
     }
     eventCv_.notify_all();
 }
@@ -503,6 +513,33 @@ std::string BridgeServer::handle(const std::string& line, Client& client)
         return handleEvents(client, max);
     }
 
+    // Executed-pc -> predecessor-pc pairs accumulated since this client last
+    // asked. This is what an attached IDA feeds auto_make_code: without it the
+    // in-process plugin marks code on every pause and an attached one learns
+    // nothing. Drained on read; `more=1` says call again.
+    if (cmd == "codemap") {
+        uint32_t maxv = 4096;
+        if (!optNum(arg(), maxv, 10)) return "err usage: codemap [dec-max]";
+        size_t max = maxv;
+        if (max == 0 || max > 16384) max = 4096;
+
+        std::lock_guard<std::mutex> lk(clientsMx_);
+        std::ostringstream o;
+        size_t n = 0;
+        std::ostringstream pairs;
+        auto it = client.codemap.begin();
+        for (; it != client.codemap.end() && n < max; ++n) {
+            pairs << " " << std::hex << it->first << ":" << it->second;
+            it = client.codemap.erase(it);
+        }
+        o << "ok " << std::dec << n
+          << " more=" << (client.codemap.empty() ? 0 : 1)
+          << " trunc=" << (client.codemapTrunc ? 1 : 0)
+          << pairs.str();
+        client.codemapTrunc = false;
+        return o.str();
+    }
+
     // Block until the machine stops. Default 10s: long enough for a breakpoint
     // deep in a level, short enough that a wedged emulator still answers.
     if (cmd == "wait") {
@@ -630,8 +667,11 @@ std::string BridgeServer::handle(const std::string& line, Client& client)
             else if (k == "usp") r.usp = v;
             else if (k == "isp") r.isp = v;
         }
-        be->setM68kRegs(r);
-        return "ok";
+        // Same rule as wregz80 below: writing PC mid-instruction is only sound
+        // while the core is parked.
+        bool done = false;
+        if (!host_->invoke([&] { be->setM68kRegs(r); done = true; })) return "err emulator not running";
+        return done ? "ok" : "err failed";
     }
 
     if (cmd == "wregz80") {

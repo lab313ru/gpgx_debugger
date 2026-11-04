@@ -104,6 +104,28 @@ reported in the Z80 database at the Z80's own PC. Detaching leaves the game
 running. Z80 breakpoints carry their CPU, so the same numeric address in the two
 databases never collides.
 
+### Attaching to an emulator that is already running
+
+The 68000 debugger can also drive an emulator running somewhere else: the
+standalone app, or another IDA. The game keeps its own window, sound and views,
+and IDA can come and go.
+
+- **Debugger → Attach to process...** lists every running emulator by game and
+  port.
+- Or **Debugger → Process options → Parameters**, then `F9`: `attach`,
+  `attach:27043` for a port, or `attach:sonic` for part of the game's name. Empty
+  Parameters means the usual run inside IDA. A name that matches two emulators
+  is refused rather than guessed.
+
+Attaching stops the game on its current instruction. Registers, memory, stepping,
+execute/read/write breakpoints and the code map all work as they do in-process.
+Detaching removes this database's breakpoints and lets the game run on.
+
+What stays with the emulator's own host: breakpoint conditions are not evaluated
+(the far side has no way to call back into IDA, so a conditional breakpoint always
+stops), and the SMD docks, layout presets, save-state actions and ROM patching do
+not operate on an attached session. Use the standalone app's own windows for those.
+
 ## Driving it from an agent
 
 The emulator serves a line protocol on loopback — one command per line, one
@@ -219,6 +241,10 @@ plan against.
 breakpoints, including data breakpoints with width-aware matching; the
 byte-order and region contracts; CRAM packing; save states; the whole bridge
 protocol; multi-session port allocation; and every standalone view listed above.
+
+**Verified by a scripted run inside real IDA 9.3, not by hand:** attaching the
+68000 debugger through both routes above, with stepping, breakpoints, memory and
+register writes, the code map and detach, against a running game.
 
 **Built but never driven by hand:**
 

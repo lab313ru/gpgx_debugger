@@ -66,6 +66,13 @@ private:
         // RAM-search loop, done here so an agent compares 64K of memory
         // without hauling it across the wire as ASCII hex every round.
         std::map<int, std::vector<uint8_t>> snaps;
+        // Executed-pc -> predecessor-pc pairs accumulated from DebugEvent::changed,
+        // drained by `codemap`. Kept per client for the same reason events are:
+        // an attached IDA marks code from it, and what one client has read must
+        // not disappear for another. Bounded so a client that never asks cannot
+        // grow it forever; overflow is reported once, like dropped events.
+        std::map<uint32_t, uint32_t> codemap;
+        bool codemapTrunc = false;
     };
 
     bool bindOne(unsigned short port, long long& fdOut);

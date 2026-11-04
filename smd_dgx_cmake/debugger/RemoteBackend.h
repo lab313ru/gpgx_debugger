@@ -41,8 +41,15 @@ public:
     bool isConnected() const { return fd_ >= 0; }
 
     // Drain queued events. Returns false when nothing is pending.
-    struct RemoteEvent { DebugEvent::Type type; Cpu cpu; uint32_t pc; };
+    struct RemoteEvent { DebugEvent::Type type; Cpu cpu; uint32_t pc; int bpId = -1; };
     bool pollEvent(RemoteEvent& out);
+
+    // Executed-pc -> predecessor-pc pairs the far side accumulated since the
+    // last fetch (the `codemap` command; the server drains on read). Appends
+    // into `out` and loops while the server says more=1. This is what an
+    // attached IDA feeds auto_make_code — the in-process plugin gets the same
+    // map inside DebugEvent::changed, which does not cross the socket.
+    bool fetchCodemap(std::map<uint32_t, uint32_t>& out);
 
     // --- IDebugBackend ---
     M68kRegs   getM68kRegs() override;

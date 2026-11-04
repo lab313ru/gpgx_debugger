@@ -14,6 +14,8 @@
 #include "debugger/SocketCompat.h"
 
 #include <algorithm>
+#include <chrono>
+#include <map>
 #include <thread>
 
 using namespace synth;
@@ -199,6 +201,45 @@ TEST(bridge_events_report_the_stopping_cpu)
         if (!sawPause) std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     CHECK(sawPause);
+    w.remote.clearBreakpoints();
+}
+
+// The codemap exists so an ATTACHED IDA can mark code: in-process it rides
+// DebugEvent::changed, which never crosses the socket, so the `codemap`
+// command is the only road. It must deliver executed pcs after a stop, and a
+// second fetch must come back empty — the server drains what a client has read.
+TEST(bridge_codemap_crosses_the_wire_once)
+{
+    Wired w(22);
+    REQUIRE(w.ok);
+
+    RemoteBackend::RemoteEvent ev;
+    while (w.remote.pollEvent(ev)) {}
+
+    Breakpoint bp;
+    bp.type = BpType::PC; bp.cpu = Cpu::M68K; bp.is_vdp = false;
+    bp.start = kSubEntry; bp.end = kSubEntry;
+    w.remote.addBreakpoint(bp);
+    w.remote.resume();
+
+    bool sawPause = false;
+    for (int i = 0; i < 60 && !sawPause; ++i) {
+        while (w.remote.pollEvent(ev))
+            if (ev.type == DebugEvent::Type::Paused) { sawPause = true; break; }
+        if (!sawPause) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    REQUIRE(sawPause);
+
+    std::map<uint32_t, uint32_t> cm;
+    CHECK(w.remote.fetchCodemap(cm));
+    CHECK(!cm.empty());
+    // The pc we stopped on executed, so the map must know it.
+    CHECK(cm.count(kSubEntry) == 1);
+
+    // Drained on read: what one fetch returned must not come back.
+    std::map<uint32_t, uint32_t> again;
+    CHECK(!w.remote.fetchCodemap(again));
+    CHECK(again.empty());
     w.remote.clearBreakpoints();
 }
 
@@ -391,6 +432,17 @@ TEST(bridge_diff_reports_what_changed_since_the_snapshot)
 // unable to say whose game it had reached. The server now takes the first free
 // port in its range and says who it is; the client scans and picks.
 // ---------------------------------------------------------------------------
+// IDA's Attach dialog and every "find the emulator" path block on this. Blocking
+// connects measured 2 s per closed port on Windows: 32 s for the empty range.
+TEST(bridge_discovery_does_not_wait_out_closed_ports)
+{
+    const auto start = std::chrono::steady_clock::now();
+    RemoteBackend::discover();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    CHECK(ms < 5000);
+}
+
 TEST(bridge_two_sessions_get_different_ports_and_are_told_apart)
 {
     // Two *servers*, one emulator. Two emulators cannot be tested in one

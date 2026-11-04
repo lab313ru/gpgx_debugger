@@ -28,7 +28,13 @@
 // emulator (NO Qt here)
 #include "debugger/EmuHost.h"
 #include "debugger/BridgeServer.h"
+#include "debugger/RemoteBackend.h"
 #include "platform/AudioOutput.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <thread>
 
 #include "ida_registers.h"
 
@@ -79,6 +85,15 @@ struct EventList {
 
 EventList g_events;
 EmuHost*  g_host = nullptr;
+
+// Attach mode: this database drives an emulator that is already running
+// somewhere else (the standalone app, or another IDA), the way the Z80
+// database always has. Exactly one of g_host / g_remote68 is non-null while
+// a session is live; everything below reaches the emulator through
+// cur_backend() and does not care which mode it is in.
+RemoteBackend*    g_remote68 = nullptr;
+std::atomic<bool> g_polling68{ false };
+std::thread       g_pollThread68;
 
 // breakpoint identity (type,start,end,is_vdp) -> backend id, needed because
 // IDebugBackend deletes by id while IDA deletes by address/type
@@ -211,6 +226,262 @@ bool evaluate_condition(uint32_t elang, const std::string& expr)
 
 
 // ---------------------------------------------------------------------------
+// attach mode
+// ---------------------------------------------------------------------------
+IDebugBackend* cur_backend()
+{
+    if (g_remote68) return g_remote68;
+    return g_host ? g_host->backend() : nullptr;
+}
+
+// The poll thread must never wait on the main thread: the stop event is queued
+// only after this returns, and IDA's main thread may itself be waiting for that
+// event or for detach to join the poll thread. So pcs collect here and at most
+// one no-wait request applies them on the next UI loop.
+struct pending_codemap_req;
+std::mutex                   g_cmMx;
+std::map<uint32_t, uint32_t> g_cmPending;
+pending_codemap_req*         g_cmReq = nullptr;
+int                          g_cmReqId = 0;
+uint64_t                     g_cmGen = 0;
+
+struct pending_codemap_req : public exec_request_t {
+    ssize_t idaapi execute() override {
+        std::map<uint32_t, uint32_t> changed;
+        {
+            std::lock_guard<std::mutex> lk(g_cmMx);
+            changed.swap(g_cmPending);
+            g_cmReq = nullptr;
+        }
+        for (const auto& kv : changed) {
+            auto_make_code((ea_t)kv.first);
+            plan_ea((ea_t)kv.first);
+        }
+        delete this;            // a no-wait request has no other owner
+        return 0;
+    }
+};
+
+void post_codemap68(const std::map<uint32_t, uint32_t>& changed)
+{
+    if (changed.empty()) return;
+    pending_codemap_req* req;
+    uint64_t gen;
+    {
+        std::lock_guard<std::mutex> lk(g_cmMx);
+        g_cmPending.insert(changed.begin(), changed.end());
+        if (g_cmReq) return;
+        g_cmReq = req = new pending_codemap_req();
+        gen = ++g_cmGen;
+    }
+    // Outside the lock: even with MFF_NOWAIT this call waits for the main thread,
+    // which may already be inside execute() wanting the same lock. req may be
+    // gone by the time it returns, hence the generation rather than the pointer.
+    const int id = (int)execute_sync(*req, MFF_WRITE | MFF_NOWAIT);
+    std::lock_guard<std::mutex> lk(g_cmMx);
+    if (g_cmReq && g_cmGen == gen) g_cmReqId = id;
+}
+
+// Unloading the plugin with a request still queued would leave IDA calling a
+// vtable in a freed DLL.
+void cancel_codemap68()
+{
+    pending_codemap_req* req;
+    int id;
+    {
+        std::lock_guard<std::mutex> lk(g_cmMx);
+        g_cmPending.clear();
+        req = g_cmReq;
+        id = g_cmReqId;
+        g_cmReq = nullptr;
+    }
+    if (req && cancel_exec_request(id)) delete req;
+}
+
+// Same shape as the Z80 database's poll loop: the line protocol cannot push,
+// so the far side queues and we ask every 20 ms. The one 68k-specific duty is
+// the codemap — in-process it rides DebugEvent::changed, over the wire it has
+// to be fetched; a pause is the only moment it can have grown.
+void poll_loop68()
+{
+    while (g_polling68.load()) {
+        RemoteBackend::RemoteEvent ev;
+        bool any = false;
+        while (g_remote68 && g_remote68->pollEvent(ev)) {
+            any = true;
+            debug_event_t ida_ev;
+            ida_ev.pid = 1;
+            ida_ev.tid = 1;
+            ida_ev.handled = true;
+
+            switch (ev.type) {
+            case DebugEvent::Type::Paused: {
+                std::map<uint32_t, uint32_t> cm;
+                if (g_remote68->fetchCodemap(cm)) post_codemap68(cm);
+                ida_ev.set_eid(PROCESS_SUSPENDED);
+                // This database points at 68k code: on a Z80-side stop report
+                // our own PC, exactly as the Z80 database reports its own.
+                ida_ev.ea = (ev.cpu == Cpu::M68K) ? ev.pc
+                                                  : g_remote68->getM68kRegs().pc;
+                g_events.enqueue(ida_ev);
+                break;
+            }
+            case DebugEvent::Type::Stopped:
+                ida_ev.set_exit_code(PROCESS_EXITED, 0);
+                ida_ev.ea = BADADDR;
+                g_events.enqueue(ida_ev);
+                break;
+            default:
+                break;          // Resumed/Started need no IDA event here
+            }
+        }
+        if (!any)
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+}
+
+void start_polling68()
+{
+    if (g_polling68.load()) return;
+    g_polling68.store(true);
+    g_pollThread68 = std::thread(poll_loop68);
+}
+
+void stop_polling68()
+{
+    if (!g_polling68.load()) return;
+    g_polling68.store(false);
+    if (g_pollThread68.joinable()) g_pollThread68.join();
+}
+
+// Undo an attach. Our breakpoints are removed (they are this database's, not
+// the emulator's), and the game is resumed: detaching must leave the
+// standalone playable, not frozen at wherever we last stopped it.
+void detach68()
+{
+    stop_polling68();
+    if (g_remote68) {
+        for (const auto& kv : g_bpIds) g_remote68->removeBreakpoint(kv.second);
+        if (g_remote68->isConnected()) g_remote68->resume();
+        g_remote68->disconnect();
+    }
+    delete g_remote68;
+    g_remote68 = nullptr;
+    g_bpIds.clear();
+}
+
+// target: "" = the only/lowest session on the scan range; digits = a port;
+// anything else = a case-insensitive substring of the running game's name.
+// With several emulators running an ambiguous name is refused, not guessed —
+// silently picking the first is how a session ends up debugging the wrong game.
+drc_t attach68(const std::string& target, bool as_attach)
+{
+    stop_polling68();           // before the delete: the poll thread uses g_remote68
+    delete g_remote68;
+    g_remote68 = new RemoteBackend();
+    g_romSize = 0;
+    g_bpIds.clear();
+    { std::lock_guard<std::mutex> lk(g_events.mx); g_events.q.clear(); }
+
+    unsigned short port = 0;
+    if (!target.empty()) {
+        bool digits = true;
+        for (char ch : target) if (ch < '0' || ch > '9') { digits = false; break; }
+        if (digits) {
+            port = (unsigned short)strtoul(target.c_str(), nullptr, 10);
+        } else {
+            auto lower = [](std::string s) {
+                for (char& ch : s) if (ch >= 'A' && ch <= 'Z') ch += 32;
+                return s;
+            };
+            const std::string want = lower(target);
+            std::string seen;
+            int hits = 0;
+            for (const auto& s : RemoteBackend::discover()) {
+                if (!seen.empty()) seen += ", ";
+                seen += s.name;
+                if (lower(s.name).find(want) != std::string::npos) {
+                    port = s.port;
+                    ++hits;
+                }
+            }
+            if (hits != 1) {
+                delete g_remote68; g_remote68 = nullptr;
+                warning("SMD DGX: \"%s\" matches %d running emulators.\n\nRunning now: %s",
+                        target.c_str(), hits, seen.empty() ? "none" : seen.c_str());
+                return DRC_FAILED;
+            }
+        }
+    }
+
+    if (!g_remote68->connect("127.0.0.1", port)) {
+        delete g_remote68; g_remote68 = nullptr;
+        warning("SMD DGX: no emulator to attach to on 127.0.0.1:%u.\n\n"
+                "Start the game in the standalone app (or another IDA) first —\n"
+                "in attach mode this database does not run its own.",
+                port ? port : RemoteBackend::kBasePort);
+        return DRC_FAILED;
+    }
+
+    // Park the emulator before telling IDA anything, and consume its Paused
+    // event here: IDA gets exactly one stop for this, whether the game was
+    // running or an agent had already parked it (a parked emulator emits none).
+    if (!g_remote68->isPaused()) {
+        g_remote68->pause();    // marks itself paused at once: wait for the event
+        bool parked = false;
+        RemoteBackend::RemoteEvent drained;
+        for (int i = 0; i < 100 && !parked; ++i) {
+            if (g_remote68->pollEvent(drained))
+                parked = drained.type == DebugEvent::Type::Paused;
+            else
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        if (!parked) {
+            const unsigned shown = g_remote68->session().port;
+            delete g_remote68; g_remote68 = nullptr;
+            warning("SMD DGX: the emulator on 127.0.0.1:%u did not stop when asked.", shown);
+            return DRC_FAILED;
+        }
+    }
+    const ea_t stop_pc = g_remote68->getM68kRegs().pc & 0xFFFFFF;
+
+    auto enqueue_module_event = [&](event_id_t id, ea_t ea) {
+        debug_event_t ev;
+        ev.pid = 1;
+        ev.tid = 1;
+        ev.handled = true;
+        modinfo_t& mi = ev.set_modinfo(id);
+        ev.ea = ea;
+        mi.name = "GPGX";
+        mi.base = 0;
+        mi.size = 0;
+        mi.rebase_to = BADADDR;
+        g_events.enqueue(ev);
+    };
+    // IDA learns the process from PROCESS_STARTED in both cases, as the SDK's own
+    // modules do. PROCESS_ATTACHED is itself a stop (this debugger is not
+    // FAKE_ATTACH); a plain start needs the suspend spelled out.
+    enqueue_module_event(PROCESS_STARTED, BADADDR);
+    if (as_attach) {
+        enqueue_module_event(PROCESS_ATTACHED, stop_pc);
+    } else {
+        debug_event_t sus;
+        sus.pid = 1; sus.tid = 1; sus.handled = true;
+        sus.set_eid(PROCESS_SUSPENDED);
+        sus.ea = stop_pc;
+        g_events.enqueue(sus);
+    }
+
+    std::map<uint32_t, uint32_t> history;
+    if (g_remote68->fetchCodemap(history)) post_codemap68(history);
+
+    start_polling68();
+    msg(PLUGIN_NAME ": attached to \"%s\" on 127.0.0.1:%u\n",
+        g_remote68->session().name.c_str(), g_remote68->session().port);
+    return DRC_OK;
+}
+
+// ---------------------------------------------------------------------------
 // Bridge mutations, performed the way IDA performs them
 //
 // An external client (the MCP server, the Z80 database) must not reach into the
@@ -331,8 +602,8 @@ bool host_clear_bpts()
 // ---------------------------------------------------------------------------
 ssize_t region_rw(ea_t ea, void* buf, size_t size, bool write)
 {
-    if (!g_host) return 0;
-    IDebugBackend* be = g_host->backend();
+    IDebugBackend* be = cur_backend();
+    if (!be) return 0;
     uint8_t* p = (uint8_t*)buf;
 
     // ROM size from the region table. Session state, not a one-shot static:
@@ -344,26 +615,42 @@ ssize_t region_rw(ea_t ea, void* buf, size_t size, bool write)
             if (r.id == 0) g_romSize = r.size;
     const uint32_t romSize = g_romSize;
 
-    for (size_t i = 0; i < size; ++i) {
-        uint32_t a = (uint32_t)(ea + i);
-        int region = -1; uint32_t off = 0;
-        if (a < romSize)                                { region = 0; off = a; }
-        else if (a >= 0xFF0000 && a <= 0xFFFFFF)        { region = 1; off = a - 0xFF0000; }
-        else if (a >= 0xA00000 && a <  0xA02000)        { region = 2; off = a - 0xA00000; }
-        else if (a >= BREAKPOINTS_BASE && a < BREAKPOINTS_BASE + 0x10000)
-                                                        { region = 3; off = a - BREAKPOINTS_BASE; }
-        else if (a >= BREAKPOINTS_BASE + 0x10000 && a < BREAKPOINTS_BASE + 0x20000)
-                                                        { region = 4; off = a - BREAKPOINTS_BASE - 0x10000; }
-        else if (a >= BREAKPOINTS_BASE + 0x20000 && a < BREAKPOINTS_BASE + 0x30000)
-                                                        { region = 5; off = a - BREAKPOINTS_BASE - 0x20000; }
-
-        if (region < 0) { if (!write) p[i] = 0; continue; }
-        if (write) {
-            be->writeRegion(region, off, &p[i], 1);
-        } else {
-            auto b = be->readRegion(region, off, 1);
-            p[i] = b.empty() ? 0 : b[0];
+    // Address -> (region, offset, bytes left in that region). Whole runs, not
+    // single bytes: in attach mode every readRegion is a socket round trip,
+    // and a hex page read byte-by-byte is a thousand of them.
+    auto map_addr = [&](uint32_t a, int& region, uint32_t& off, uint32_t& left) {
+        region = -1; off = 0; left = 1;
+        if (a < romSize)                         { region = 0; off = a;            left = romSize - a; }
+        else if (a >= 0xFF0000 && a <= 0xFFFFFF) { region = 1; off = a - 0xFF0000; left = 0x1000000 - a; }
+        else if (a >= 0xA00000 && a <  0xA02000) { region = 2; off = a - 0xA00000; left = 0xA02000 - a; }
+        else if (a >= BREAKPOINTS_BASE && a < BREAKPOINTS_BASE + 0x30000) {
+            const uint32_t v = a - BREAKPOINTS_BASE;
+            region = 3 + (int)(v >> 16);
+            off    = v & 0xFFFF;
+            left   = 0x10000 - off;
         }
+    };
+
+    size_t i = 0;
+    while (i < size) {
+        const uint32_t a = (uint32_t)(ea + i);
+        int region; uint32_t off, left;
+        map_addr(a, region, off, left);
+
+        if (region < 0) {       // unmapped reads as 0, like Gens; writes vanish
+            if (!write) p[i] = 0;
+            ++i;
+            continue;
+        }
+        const uint32_t run = (uint32_t)std::min<size_t>(size - i, left);
+        if (write) {
+            be->writeRegion(region, off, &p[i], run);
+        } else {
+            auto b = be->readRegion(region, off, run);
+            if (b.size() < run) b.resize(run, 0);
+            memcpy(&p[i], b.data(), run);
+        }
+        i += run;
     }
     return (ssize_t)size;
 }
@@ -445,8 +732,8 @@ const char* register_classes[] = {
 
 drc_t read_registers(int clsmask, regval_t* values)
 {
-    if (!g_host) return DRC_FAILED;
-    IDebugBackend* be = g_host->backend();
+    IDebugBackend* be = cur_backend();
+    if (!be) return DRC_FAILED;
 
     if (clsmask & RC_GENERAL) {
         M68kRegs r = be->getM68kRegs();
@@ -483,8 +770,8 @@ drc_t read_registers(int clsmask, regval_t* values)
 
 drc_t write_register(int regidx, const regval_t* value)
 {
-    if (!g_host) return DRC_FAILED;
-    IDebugBackend* be = g_host->backend();
+    IDebugBackend* be = cur_backend();
+    if (!be) return DRC_FAILED;
 
     if (regidx >= R_D0 && regidx <= R_SR) {
         M68kRegs r = be->getM68kRegs();
@@ -543,7 +830,7 @@ void add_one_bpt(uint8_t type, uint8_t vdp, uint32_t start, uint32_t end, ea_t i
         bp.condition = ibp.cndbody.c_str();
         bp.elang     = uint32_t(ibp.get_cnd_elang_idx());
     }
-    int id = g_host->backend()->addBreakpoint(bp);
+    int id = cur_backend()->addBreakpoint(bp);
     g_bpIds[BpKey{type, vdp, start, end}] = id;
 }
 
@@ -551,14 +838,14 @@ void del_one_bpt(uint8_t type, uint8_t vdp, uint32_t start, uint32_t end)
 {
     auto it = g_bpIds.find(BpKey{type, vdp, start, end});
     if (it != g_bpIds.end()) {
-        g_host->backend()->removeBreakpoint(it->second);
+        cur_backend()->removeBreakpoint(it->second);
         g_bpIds.erase(it);
     }
 }
 
 drc_t update_bpts(int* nbpts, update_bpt_info_t* bpts, int nadd, int ndel)
 {
-    if (!g_host) return DRC_FAILED;
+    if (!cur_backend()) return DRC_FAILED;
     int ok = 0;
     for (int i = 0; i < nadd; ++i) {
         if (bpts[i].code == BPT_SKIP) continue;
@@ -661,23 +948,57 @@ ssize_t idaapi debugger_callback(void*, int msgid, va_list va)
 
     case debugger_t::ev_get_processes: {
         procinfo_vec_t* procs = va_arg(va, procinfo_vec_t*);
-        process_info_t& pi = procs->push_back();   // VERIFY-9.3
-        pi.pid = 1;
-        pi.name = "GPGX";
+        // The Attach dialog lists every emulator on the scan range; the pid
+        // doubles as the port so ev_attach_process knows who was picked.
+        for (const auto& s : RemoteBackend::discover()) {
+            process_info_t& pi = procs->push_back();
+            pi.pid = s.port;
+            pi.name.sprnt("%s (port %u)", s.name.c_str(), (unsigned)s.port);
+        }
         retcode = DRC_OK;
+        break;
+    }
+
+    case debugger_t::ev_attach_process: {
+        pid_t pid = va_argi(va, pid_t);
+        retcode = attach68(std::to_string((unsigned)pid), true);
         break;
     }
 
     case debugger_t::ev_start_process: {
         const char* path      = va_arg(va, const char*);
-        const char* args      = va_arg(va, const char*);      (void)args;
+        const char* args      = va_arg(va, const char*);
         const char* startdir  = va_arg(va, const char*);      (void)startdir;
         uint32 flags          = va_arg(va, uint32);           (void)flags;
         const char* input     = va_arg(va, const char*);
         uint32 crc            = va_arg(va, uint32);           (void)crc;
+        // "attach" (or "attach:27043", "attach:sonic") in Process options ->
+        // Parameters drives a running emulator instead of starting one here.
+        std::string a = args ? args : "";
+        if (a.rfind("attach", 0) == 0) {
+            const size_t colon = a.find(':');
+            retcode = attach68(colon == std::string::npos ? "" : a.substr(colon + 1),
+                               /*as_attach=*/false);
+            break;
+        }
+        detach68();             // a leftover attach must not shadow a real run
         retcode = start_process(path, input);
         break;
     }
+
+    case debugger_t::ev_detach_process:
+        if (!g_remote68) { retcode = DRC_FAILED; break; }   // in-process: nothing to let go of
+        detach68();
+        {
+            // IDA keeps polling get_debug_event until exactly this event (idd.hpp).
+            debug_event_t ev;
+            ev.pid = 1; ev.tid = 1; ev.handled = true;
+            ev.set_eid(PROCESS_DETACHED);
+            ev.ea = BADADDR;
+            g_events.enqueue(ev);
+        }
+        retcode = DRC_OK;
+        break;
 
     case debugger_t::ev_get_debapp_attrs: {
         debapp_attrs_t* attrs = va_arg(va, debapp_attrs_t*);
@@ -690,11 +1011,23 @@ ssize_t idaapi debugger_callback(void*, int msgid, va_list va)
     }
 
     case debugger_t::ev_request_pause:
-        if (g_host) g_host->backend()->pause();
+        if (cur_backend()) cur_backend()->pause();
         retcode = DRC_OK;
         break;
 
     case debugger_t::ev_exit_process:
+        if (g_remote68) {
+            // The emulator is someone else's session: let go of it, do not
+            // stop it. detach68 resumes so the standalone stays playable.
+            detach68();
+            debug_event_t ev;
+            ev.pid = 1; ev.tid = 1; ev.handled = true;
+            ev.set_exit_code(PROCESS_EXITED, 0);
+            ev.ea = BADADDR;
+            g_events.enqueue(ev);
+            retcode = DRC_OK;
+            break;
+        }
         // Close the socket before the host: its handler holds an EmuHost*.
         delete g_bridge; g_bridge = nullptr;
         if (g_host) { g_host->stop(); }
@@ -718,9 +1051,10 @@ ssize_t idaapi debugger_callback(void*, int msgid, va_list va)
         dbg_notification_t req = get_running_notification();
         switch (event->eid()) {
         case STEP:
+        case PROCESS_ATTACHED:
         case PROCESS_SUSPENDED:
             if (req == dbg_null || req == dbg_run_to)
-                if (g_host) g_host->backend()->resume();
+                if (cur_backend()) cur_backend()->resume();
             break;
         case PROCESS_EXITED:
             break;
@@ -731,22 +1065,23 @@ ssize_t idaapi debugger_callback(void*, int msgid, va_list va)
     }
 
     case debugger_t::ev_thread_suspend:
-        if (g_host) g_host->backend()->pause();
+        if (cur_backend()) cur_backend()->pause();
         retcode = DRC_OK;
         break;
 
     case debugger_t::ev_thread_continue:
-        if (g_host) g_host->backend()->resume();
+        if (cur_backend()) cur_backend()->resume();
         retcode = DRC_OK;
         break;
 
     case debugger_t::ev_set_resume_mode: {
         thid_t tid = va_argi(va, thid_t);           (void)tid;
         resume_mode_t resmod = va_argi(va, resume_mode_t);
-        if (!g_host) { retcode = DRC_FAILED; break; }
+        IDebugBackend* be = cur_backend();
+        if (!be) { retcode = DRC_FAILED; break; }
         switch (resmod) {
-        case RESMOD_INTO: g_host->backend()->stepInto(Cpu::M68K); retcode = DRC_OK; break;
-        case RESMOD_OVER: g_host->backend()->stepOver(Cpu::M68K); retcode = DRC_OK; break;
+        case RESMOD_INTO: be->stepInto(Cpu::M68K); retcode = DRC_OK; break;
+        case RESMOD_OVER: be->stepOver(Cpu::M68K); retcode = DRC_OK; break;
         default:          retcode = DRC_FAILED; break;
         }
         break;
@@ -842,10 +1177,10 @@ ssize_t idaapi debugger_callback(void*, int msgid, va_list va)
     case debugger_t::ev_update_call_stack: {
         thid_t tid = va_argi(va, thid_t);   (void)tid;
         call_stack_t* trace = va_arg(va, call_stack_t*);
-        if (!g_host || !trace) { retcode = DRC_NONE; break; }
+        if (!cur_backend() || !trace) { retcode = DRC_NONE; break; }
         trace->clear();
         // Backend order is outermost-first, which is what IDA expects.
-        for (uint32_t ea : g_host->backend()->getCallstack(Cpu::M68K)) {
+        for (uint32_t ea : cur_backend()->getCallstack(Cpu::M68K)) {
             call_stack_info_t& f = trace->push_back();
             f.callea = ea;
             f.funcea = BADADDR;
@@ -874,11 +1209,14 @@ debugger_t debugger = {
     0x8000 + 1,
     "m68k",
 
-    DBG_FLAG_NOHOST | DBG_FLAG_CAN_CONT_BPT | DBG_FLAG_SAFE | DBG_FLAG_FAKE_ATTACH
-        | DBG_FLAG_NOPASSWORD | DBG_FLAG_NOSTARTDIR | DBG_FLAG_NOPARAMETERS
+    // No DBG_FLAG_NOPARAMETERS: Process options -> Parameters is the attach
+    // switch ("attach", "attach:27043", "attach:sonic"). Empty = run in-process.
+    DBG_FLAG_NOHOST | DBG_FLAG_CAN_CONT_BPT | DBG_FLAG_SAFE
+        | DBG_FLAG_NOPASSWORD | DBG_FLAG_NOSTARTDIR
         | DBG_FLAG_ANYSIZE_HWBPT | DBG_FLAG_DEBTHREAD | DBG_FLAG_PREFER_SWBPTS
         | DBG_HAS_GET_PROCESSES | DBG_HAS_REQUEST_PAUSE | DBG_HAS_SET_RESUME_MODE
-        | DBG_HAS_CHECK_BPT | DBG_HAS_THREAD_SUSPEND | DBG_HAS_THREAD_CONTINUE,
+        | DBG_HAS_CHECK_BPT | DBG_HAS_THREAD_SUSPEND | DBG_HAS_THREAD_CONTINUE
+        | DBG_HAS_ATTACH_PROCESS | DBG_HAS_DETACH_PROCESS,
 
     register_classes,
     RC_GENERAL,
@@ -959,6 +1297,8 @@ struct smd_dgx_plugmod_t : public plugmod_t, public event_listener_t {
         smd_dgx_unregister_patches();
         smd_dgx_unregister_asm();
         smd_dgx_unregister_z80_actions();
+        detach68();                     // attach mode: let the far emulator go
+        cancel_codemap68();
         delete g_bridge; g_bridge = nullptr;
         if (g_host) { g_host->stop(); delete g_host; g_host = nullptr; }
         stop_audio();

@@ -20,6 +20,9 @@ using socket_t = SOCKET;
 #  include <netinet/in.h>
 #  include <arpa/inet.h>
 #  include <unistd.h>
+#  include <fcntl.h>
+#  include <errno.h>
+#  include <sys/select.h>
 using socket_t = int;
 #  define CLOSESOCK ::close
 #  define BAD_SOCK  (-1)
@@ -65,6 +68,53 @@ inline bool netInit()
 #else
     return true;
 #endif
+}
+
+// Connect, giving up after `ms`. Windows does not fail a refused loopback
+// connection at once: it retries for about two seconds per closed port, so a
+// blocking scan of the port range takes half a minute. The socket is left
+// blocking again on return.
+inline bool connectWithin(socket_t fd, const sockaddr_in& addr, int ms)
+{
+#ifdef _WIN32
+    u_long nonblocking = 1;
+    ::ioctlsocket(fd, FIONBIO, &nonblocking);
+#else
+    const int flags = ::fcntl(fd, F_GETFL, 0);
+    ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+#endif
+
+    bool ok = ::connect(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof addr) == 0;
+    if (!ok) {
+#ifdef _WIN32
+        const bool pending = ::WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+        const bool pending = errno == EINPROGRESS;
+#endif
+        if (pending) {
+            fd_set writable, failed;
+            FD_ZERO(&writable);
+            FD_ZERO(&failed);
+            FD_SET(fd, &writable);
+            FD_SET(fd, &failed);
+            timeval tv{ ms / 1000, (ms % 1000) * 1000 };
+            if (::select(int(fd) + 1, nullptr, &writable, &failed, &tv) > 0 &&
+                FD_ISSET(fd, &writable)) {
+                int err = 0;
+                socklen_t len = sizeof err;
+                ::getsockopt(fd, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len);
+                ok = err == 0;
+            }
+        }
+    }
+
+#ifdef _WIN32
+    nonblocking = 0;
+    ::ioctlsocket(fd, FIONBIO, &nonblocking);
+#else
+    ::fcntl(fd, F_SETFL, flags);
+#endif
+    return ok;
 }
 
 // Send the whole buffer. Returns false if the peer went away.

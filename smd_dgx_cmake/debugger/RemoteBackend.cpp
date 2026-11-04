@@ -82,9 +82,9 @@ std::vector<SessionInfo> RemoteBackend::discover()
         addr.sin_port   = htons((unsigned short)p);
         ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
 
-        // Loopback: a refused connection comes back immediately, so scanning
-        // the whole range costs milliseconds and needs no timeout juggling.
-        if (::connect(fd, (sockaddr*)&addr, sizeof addr) != 0) { CLOSESOCK(fd); continue; }
+        // A listening loopback port completes in the kernel, without the
+        // emulator's help, so a short bound cannot miss a live session.
+        if (!sockcompat::connectWithin(fd, addr, 50)) { CLOSESOCK(fd); continue; }
 
         const char* req = "ping\n";
         std::string rx;
@@ -229,6 +229,7 @@ bool RemoteBackend::pollEvent(RemoteEvent& out)
 
     out.pc  = hexU32(f[2]);
     out.cpu = (f[3] == "z80") ? Cpu::Z80 : Cpu::M68K;
+    out.bpId = (f.size() > 4 && !f[4].empty()) ? (int)strtol(f[4].c_str(), nullptr, 10) : -1;
 
     // Keep the cached run state in step, and tell whoever is listening.
     if (out.type == DebugEvent::Type::Paused) {
@@ -241,6 +242,31 @@ bool RemoteBackend::pollEvent(RemoteEvent& out)
         running_.store(false);
     }
     return true;
+}
+
+bool RemoteBackend::fetchCodemap(std::map<uint32_t, uint32_t>& out)
+{
+    // "ok <n> more=0|1 trunc=0|1 pc:pred ..." — drain until the far side says
+    // it has no more. Bounded by the server's own cap, so this terminates.
+    bool any = false;
+    for (;;) {
+        const std::string r = call("codemap");
+        if (r.empty()) return any;
+
+        std::istringstream is(r);
+        int n = 0;
+        std::string more, trunc;
+        is >> n >> more >> trunc;
+        for (int i = 0; i < n; ++i) {
+            std::string pair;
+            if (!(is >> pair)) break;
+            const size_t c = pair.find(':');
+            if (c == std::string::npos) continue;
+            out[hexU32(pair.substr(0, c))] = hexU32(pair.substr(c + 1));
+            any = true;
+        }
+        if (more != "more=1") return any;
+    }
 }
 
 // ---------------------------------------------------------------------------
