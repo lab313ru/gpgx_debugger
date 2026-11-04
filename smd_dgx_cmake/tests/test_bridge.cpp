@@ -367,6 +367,27 @@ TEST(bridge_wait_reports_timeout_rather_than_hanging)
     CHECK_STR(raw.cmd("wait 400"), "ok timeout");
 }
 
+// A client parked in `wait` sits on a condition variable, not in recv, so closing
+// its socket does not wake it. Stopping then took as long as its timeout, which
+// when IDA closes reads as a hang.
+TEST(bridge_stop_does_not_wait_out_a_parked_client)
+{
+    Wired w(24);
+    REQUIRE(w.ok);
+    Raw raw;
+    REQUIRE(raw.connect(portFor(24)));
+
+    std::thread waiter([&] { raw.cmd("wait 20000"); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    const auto start = std::chrono::steady_clock::now();
+    w.bridge.stop();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    waiter.join();
+    CHECK(ms < 5000);
+}
+
 TEST(bridge_frame_advance_runs_exactly_that_many_frames)
 {
     Wired w(12);

@@ -140,14 +140,16 @@ void EmuHost::drainCommands()
 void EmuHost::drainTasks()
 {
     for (;;) {
-        Task* t = nullptr;
+        std::shared_ptr<Task> t;
         {
             std::lock_guard<std::mutex> lk(taskMx_);
             if (tasks_.empty()) return;
             t = tasks_.front();
             tasks_.pop_front();
+            if (t->abandoned) continue;   // its caller timed out and returned
+            t->started = true;
         }
-        (*t->fn)();
+        (t->fn)();
         {
             std::lock_guard<std::mutex> lk(taskMx_);
             t->done = true;
@@ -160,15 +162,26 @@ bool EmuHost::invoke(const std::function<void()>& fn)
 {
     if (!running_.load() || !thread_.joinable()) return false;
 
-    Task task{ &fn, false };
+    auto task = std::make_shared<Task>(Task{ fn, false, false, false });
     {
         std::lock_guard<std::mutex> lk(taskMx_);
-        tasks_.push_back(&task);
+        tasks_.push_back(task);
     }
     std::unique_lock<std::mutex> lk(taskMx_);
     // The emulation thread drains tasks between frames and while paused, so
     // this completes in either state; the timeout only guards a dying host.
-    return taskCv_.wait_for(lk, std::chrono::seconds(5), [&] { return task.done; });
+    if (taskCv_.wait_for(lk, std::chrono::seconds(5), [&] { return task->done; }))
+        return true;
+
+    // Timed out. fn's captures die the moment we return, so the task must
+    // never touch them after that: cancel it if it is still queued, and wait
+    // it out if the emulation thread is executing it at this very moment.
+    if (!task->started) {
+        task->abandoned = true;
+        return false;
+    }
+    taskCv_.wait(lk, [&] { return task->done; });
+    return true;
 }
 
 void EmuHost::dispatch(const DebugCommand& cmd)

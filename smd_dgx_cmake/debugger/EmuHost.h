@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -150,8 +151,17 @@ private:
     HostMutations     hostMut_;
 
     // Work handed to the emulation thread by invoke().
-    struct Task { const std::function<void()>* fn; bool done; };
+    //
+    // Shared ownership, not a pointer to the caller's stack: invoke() waits
+    // with a timeout, and on timeout the caller used to return while its Task
+    // was still queued — the emulation thread then executed a function object
+    // living in a dead stack frame (observed as a guard-page fault in a
+    // foreign thread's stack). The queue and the caller now co-own the task;
+    // `abandoned` cancels one the caller gave up on before it was picked up,
+    // and `started` makes the caller wait out one already executing, because
+    // fn's captures live on the caller's stack either way.
+    struct Task { std::function<void()> fn; bool done; bool started; bool abandoned; };
     std::mutex              taskMx_;
     std::condition_variable taskCv_;
-    std::deque<Task*>       tasks_;
+    std::deque<std::shared_ptr<Task>> tasks_;
 };

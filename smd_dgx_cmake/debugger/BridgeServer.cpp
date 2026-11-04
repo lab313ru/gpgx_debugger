@@ -220,6 +220,12 @@ void BridgeServer::stop()
         for (auto& c : clients_)
             if (c->fd >= 0) { CLOSESOCK(static_cast<socket_t>(c->fd)); c->fd = -1; }
     }
+    // A client parked inside handleWait() is not in recv(), so closing its
+    // socket does not wake it — only the condition variable does. Without this
+    // the joins below stall for the remainder of the client's `wait` timeout,
+    // which on IDA exit reads as a hang (and a killed IDA leaves the database
+    // unpacked).
+    eventCv_.notify_all();
     thread_.join();
     for (auto& t : clientThreads_) if (t.joinable()) t.join();
     clientThreads_.clear();
