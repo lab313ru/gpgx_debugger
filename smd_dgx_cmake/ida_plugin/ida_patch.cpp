@@ -148,8 +148,7 @@ void smd_dgx_register_patches()
 void smd_dgx_unregister_patches()
 {
     for (int i = 0; i < 3; ++i) {
-        unregister_action(kNames[i]);
-        delete g_handlers[i];
+        unregister_action(kNames[i]);   // deletes the handler itself
         g_handlers[i] = nullptr;
     }
 }

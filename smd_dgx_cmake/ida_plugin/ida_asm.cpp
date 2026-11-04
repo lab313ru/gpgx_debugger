@@ -308,7 +308,6 @@ void smd_dgx_unregister_asm()
 {
     unhook_event_listener(HT_IDP, &g_idp);
 
-    unregister_action(kName);
-    delete g_handler;
+    unregister_action(kName);   // deletes the handler itself
     g_handler = nullptr;
 }

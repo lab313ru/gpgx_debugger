@@ -250,23 +250,21 @@ void smd_dgx_unregister_views()
 {
     smd_dgx_view_detach_all();
 
+    // unregister_action deletes each handler itself.
     for (int i = 0; i < SMD_DGX_VIEW_COUNT; ++i) {
         unregister_action(g_view_names[i]);
-        delete g_view_handlers[i];
         g_view_handlers[i] = nullptr;
     }
     for (int i = 0; i < kPresetCount; ++i) {
         unregister_action(g_preset_names[i]);
-        delete g_preset_handlers[i];
         g_preset_handlers[i] = nullptr;
     }
     for (int i = 0; i < kSlotCount; ++i) {
         unregister_action(g_slot_names[i]);
-        delete g_slot_handlers[i];
         g_slot_handlers[i] = nullptr;
     }
     unregister_action("smd_dgx:savestate");
     unregister_action("smd_dgx:loadstate");
-    delete g_save_handler; g_save_handler = nullptr;
-    delete g_load_handler; g_load_handler = nullptr;
+    g_save_handler = nullptr;
+    g_load_handler = nullptr;
 }
