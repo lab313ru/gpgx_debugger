@@ -49,6 +49,7 @@ public:
     void resume() override;
     void stepInto(Cpu cpu) override;
     void stepOver(Cpu cpu) override;
+    void stepOut(Cpu cpu) override;
     bool isPaused() const override { return paused_.load(); }
 
     void onPaused(PauseCb cb)  override { pauseCb_  = std::move(cb); }
@@ -95,6 +96,7 @@ private:
     void     onZ80Exec(uint32_t pc);
     void     stepOverZ80();
     void     trackZ80Call(uint16_t pc);
+    bool     isZ80ReturnAt(uint16_t pc, uint8_t op) const;
     uint8_t  z80ByteAt(uint16_t pc) const;
 
     PauseCb  pauseCb_;
@@ -102,6 +104,7 @@ private:
     std::function<void()> pausePump_;
     SafeExec safeExec_;
 
+    std::string       romFile_;            // set before running_ goes true
     std::atomic<bool> running_  {false};
     std::atomic<bool> paused_   {false};
     std::atomic<bool> abandoned_{false};   // shutting down: never park again
@@ -112,6 +115,13 @@ private:
     // so a step meant for the 68000 would be consumed by the wrong CPU.
     std::atomic<bool> stepIntoZ80_ {false};
     std::atomic<int>  stepOverAddrZ80_ {-1};
+    // Step out: the SP it started from, or -1. The return flags say whether the
+    // instruction just executed was a return; only the emulation thread touches
+    // them, except while it is parked, when stepOut() primes them.
+    std::atomic<int64_t> stepOutSp_    {-1};
+    std::atomic<int64_t> stepOutSpZ80_ {-1};
+    bool lastWasReturn_    = false;
+    bool lastWasReturnZ80_ = false;
     // A HALT re-executes the same address forever, so a breakpoint there would
     // retrigger the instant it resumes. Skip one hit at the address we stopped.
     std::atomic<int>  z80ResumeSkip_ {-1};
@@ -130,7 +140,9 @@ private:
     ConditionEval condEval_;
     std::mutex            callstackMutex_;
     std::vector<uint32_t> callstack_;
+    std::vector<uint32_t> callstackSlot_;       // where each call's return address lives
     std::vector<uint32_t> callstackZ80_;
+    std::vector<uint16_t> callstackSlotZ80_;
     uint32_t              lastPcZ80_ = 0;
 };
 

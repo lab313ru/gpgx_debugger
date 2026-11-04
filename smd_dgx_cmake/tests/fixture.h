@@ -75,6 +75,13 @@ public:
         return waitPause(s, ms);
     }
 
+    bool stepOutAndWait(Cpu cpu, int ms = 5000)
+    {
+        const uint64_t s = pauseSeq();
+        backend()->stepOut(cpu);
+        return waitPause(s, ms);
+    }
+
     // Park the 68000 on a known instruction so a test does not depend on where
     // the free-running loop happened to be when it was interrupted.
     void parkM68kAt(uint32_t pc)

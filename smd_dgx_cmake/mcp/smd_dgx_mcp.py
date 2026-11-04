@@ -351,6 +351,18 @@ def step(over: bool = False, cpu: str = "m68k") -> str:
 
 
 @mcp.tool()
+def step_out(cpu: str = "m68k") -> str:
+    """Run until the current function returns, then stop. cpu: 'm68k' or 'z80'.
+
+    Returns at once; the stop arrives later, so follow with wait_for_stop. A
+    breakpoint hit on the way ends it early.
+    """
+    suffix = " z80" if cpu.lower().startswith("z") else ""
+    bridge.command("stepout" + suffix)
+    return status()
+
+
+@mcp.tool()
 def add_breakpoint(address: str, kind: str = "x", end: str | None = None,
                    cpu: str = "m68k", vdp: bool = False) -> str:
     """Add a breakpoint and return its id.

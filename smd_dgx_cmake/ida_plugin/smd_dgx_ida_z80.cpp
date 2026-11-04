@@ -166,6 +166,20 @@ void poll_loop()
             default:
                 break;      // Resumed/Started need no IDA event here
             }
+            if (ev.type == DebugEvent::Type::Stopped) return;
+        }
+        // The emulator's host went away: nothing else will ever tell IDA.
+        if (g_remote && !g_remote->isConnected()) {
+            // A suspended IDA does not read events until something resumes it.
+            msg(Z80_PLUGIN_NAME ": the emulator went away. If IDA still shows it stopped, press Stop.\n");
+            debug_event_t lost;
+            lost.pid = 1;
+            lost.tid = 1;
+            lost.handled = true;
+            lost.set_exit_code(PROCESS_EXITED, 0);
+            lost.ea = BADADDR;
+            g_zevents.enqueue(lost);
+            return;
         }
         if (!any)
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -479,6 +493,7 @@ ssize_t idaapi z80_debugger_callback(void*, int msgid, va_list va)
         switch (resmod) {
         case RESMOD_INTO: g_remote->stepInto(Cpu::Z80); retcode = DRC_OK; break;
         case RESMOD_OVER: g_remote->stepOver(Cpu::Z80); retcode = DRC_OK; break;
+        case RESMOD_OUT:  g_remote->stepOut(Cpu::Z80);  retcode = DRC_OK; break;
         default:          retcode = DRC_FAILED; break;
         }
         break;
@@ -572,13 +587,19 @@ ssize_t idaapi z80_debugger_callback(void*, int msgid, va_list va)
         call_stack_t* trace = va_arg(va, call_stack_t*);
         if (!g_remote || !trace) { retcode = DRC_NONE; break; }
         trace->clear();
-        for (uint32_t ea : g_remote->getCallstack(Cpu::Z80)) {
+        const auto add_frame = [trace](ea_t ea) {
             call_stack_info_t& f = trace->push_back();
             f.callea = ea;
             f.funcea = BADADDR;
             f.fp     = BADADDR;
             f.funcok = true;
-        }
+        };
+        // Frame 0 is where execution is now, then the callers from the innermost
+        // out (idd.hpp); the backend keeps them outermost first.
+        add_frame(g_remote->getZ80Regs().pc);
+        const std::vector<uint32_t> calls = g_remote->getCallstack(Cpu::Z80);
+        for (auto it = calls.rbegin(); it != calls.rend(); ++it)
+            add_frame(*it);
         retcode = DRC_OK;
         break;
     }
@@ -605,7 +626,8 @@ debugger_t z80_debugger = {
         | DBG_FLAG_NOPASSWORD | DBG_FLAG_NOSTARTDIR | DBG_FLAG_NOPARAMETERS
         | DBG_FLAG_ANYSIZE_HWBPT | DBG_FLAG_DEBTHREAD | DBG_FLAG_PREFER_SWBPTS
         | DBG_HAS_GET_PROCESSES | DBG_HAS_REQUEST_PAUSE | DBG_HAS_SET_RESUME_MODE
-        | DBG_HAS_CHECK_BPT | DBG_HAS_THREAD_SUSPEND | DBG_HAS_THREAD_CONTINUE,
+        | DBG_HAS_CHECK_BPT | DBG_HAS_THREAD_SUSPEND | DBG_HAS_THREAD_CONTINUE
+        | DBG_HAS_UPDATE_CALL_STACK,
 
     z80_register_classes,
     RCZ_GENERAL,
@@ -616,7 +638,7 @@ debugger_t z80_debugger = {
 
     nullptr, 0, 0,  // bpt bytes
 
-    DBG_RESMOD_STEP_INTO | DBG_RESMOD_STEP_OVER,
+    DBG_RESMOD_STEP_INTO | DBG_RESMOD_STEP_OVER | DBG_RESMOD_STEP_OUT,
 };
 
 // Called by the shared plugin entry point (smd_dgx_ida.cpp) when the database

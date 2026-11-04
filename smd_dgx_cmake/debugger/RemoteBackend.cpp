@@ -63,6 +63,7 @@ static SessionInfo parsePing(const std::string& reply, unsigned short port)
         else if (kv.first == "crc")    si.crc  = uint16_t(hexU32(kv.second));
         else if (kv.first == "serial") si.serial = kv.second;
         else if (kv.first == "name")   si.name   = kv.second;
+        else if (kv.first == "file")   si.file   = kv.second;
     }
     return si;
 }
@@ -536,6 +537,7 @@ void RemoteBackend::pause()  { call("pause");  paused_.store(true);  }
 void RemoteBackend::resume() { call("resume"); paused_.store(false); }
 void RemoteBackend::stepInto(Cpu cpu) { call(cpu == Cpu::Z80 ? "stepi z80" : "stepi"); }
 void RemoteBackend::stepOver(Cpu cpu) { call(cpu == Cpu::Z80 ? "stepo z80" : "stepo"); }
+void RemoteBackend::stepOut(Cpu cpu)  { call(cpu == Cpu::Z80 ? "stepout z80" : "stepout"); }
 
 bool RemoteBackend::loadRom(const char*)
 {

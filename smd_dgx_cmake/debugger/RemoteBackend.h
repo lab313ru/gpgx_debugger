@@ -87,6 +87,7 @@ public:
     void resume() override;
     void stepInto(Cpu cpu) override;
     void stepOver(Cpu cpu) override;
+    void stepOut(Cpu cpu) override;
     bool isPaused() const override { return paused_.load(); }
 
     void onPaused(PauseCb cb)  override { pauseCb_  = std::move(cb); }

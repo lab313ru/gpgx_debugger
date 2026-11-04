@@ -399,7 +399,8 @@ std::string BridgeServer::handle(const std::string& line, Client& client)
           << " port=" << port_
           << " crc=" << std::hex << si.crc
           << " serial=" << (si.serial.empty() ? "-" : sanitise(si.serial))
-          << " name=" << (si.name.empty() ? "-" : sanitise(si.name));
+          << " name=" << (si.name.empty() ? "-" : sanitise(si.name))
+          << " file=" << (si.file.empty() ? "-" : sanitise(si.file));
         return o.str();
     }
 
@@ -812,9 +813,11 @@ std::string BridgeServer::handle(const std::string& line, Client& client)
         return out;
     }
     // optional trailing "z80" selects the sound CPU
-    if (cmd == "stepi" || cmd == "stepo") {
+    if (cmd == "stepi" || cmd == "stepo" || cmd == "stepout") {
         const Cpu cpu = (arg() == "z80") ? Cpu::Z80 : Cpu::M68K;
-        if (cmd == "stepi") be->stepInto(cpu); else be->stepOver(cpu);
+        if      (cmd == "stepi") be->stepInto(cpu);
+        else if (cmd == "stepo") be->stepOver(cpu);
+        else                     be->stepOut(cpu);
         return "ok";
     }
 

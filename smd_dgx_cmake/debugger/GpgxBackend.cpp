@@ -59,6 +59,7 @@ SessionInfo GpgxBackend::sessionInfo() const
     };
     s.serial = trimmed(rominfo.product, sizeof rominfo.product);
     s.name   = trimmed(rominfo.domestic, sizeof rominfo.domestic);
+    s.file   = romFile_;
     return s;
 }
 
@@ -410,13 +411,44 @@ std::vector<Breakpoint> GpgxBackend::getBreakpoints() { std::lock_guard<std::mut
 // ---------------------------------------------------------------------------
 // Control
 // ---------------------------------------------------------------------------
-void GpgxBackend::pause()   { stepInto_.store(true); }
+// Pausing is a one-instruction step, so on a machine already parked the flag would
+// sit there and stop the next resume after a single instruction.
+void GpgxBackend::pause()   { if (!paused_.load()) stepInto_.store(true); }
 void GpgxBackend::resume()  { paused_.store(false); if (resumeCb_) resumeCb_(); }
 void GpgxBackend::stepInto(Cpu cpu)
 {
-    paused_.store(false);
     if (cpu == Cpu::Z80) stepIntoZ80_.store(true);
     else                 stepInto_.store(true);
+    paused_.store(false);
+}
+
+namespace {
+bool isM68kReturn(uint16_t opc)
+{
+    return opc == 0x4E75 || opc == 0x4E77 || opc == 0x4E73;     // rts, rtr, rte
+}
+constexpr uint32_t kM68kAddrMask = 0xFFFFFF;
+}
+
+// Runs until a return lifts SP above where it stands now. Comparing SP rather than
+// counting calls means nested calls and interrupts take care of themselves: their
+// returns never get above the starting SP. It also makes this work from inside an
+// interrupt handler, where rte is the return, and needs no call history at all.
+void GpgxBackend::stepOut(Cpu cpu)
+{
+    if (cpu == Cpu::Z80) {
+        const uint16_t pc = Z80.pc.w.l;
+        const uint8_t  op = z80ByteAt(pc);
+        // The hook has already run for the instruction we are parked on, so if
+        // that instruction is itself the return it has to be noted here.
+        lastWasReturnZ80_ = isZ80ReturnAt(pc, op);
+        stepOutSpZ80_.store(Z80.sp.w.l);
+    } else {
+        lastWasReturn_ = isM68kReturn(opcodeAt(m68k_get_reg(M68K_REG_PC)));
+        stepOutSp_.store(m68k_get_reg(M68K_REG_A7) & kM68kAddrMask);
+    }
+    paused_.store(false);
+    if (resumeCb_) resumeCb_();
 }
 
 void GpgxBackend::stepOver(Cpu cpu)
@@ -469,7 +501,7 @@ void GpgxBackend::stepOver(Cpu cpu)
     } else if ((opc & 0xFF00) == 0x6100) {
         int off = (opc & 0xFF) == 0 ? 2 : (opc & 0xFF) == 0xFF ? 3 : 1;
         stepOverAddr_.store(static_cast<int>(pc + off * 2));
-    } else { stepInto_.store(true); return; }
+    } else { stepInto(Cpu::M68K); return; }             // nothing to step over
     paused_.store(false); if (resumeCb_) resumeCb_();
 }
 
@@ -485,11 +517,24 @@ bool GpgxBackend::loadRom(const char* path)
     static std::vector<uint8_t> framebuffer(720 * 576 * 4, 0);
     gx::bitmap_data() = framebuffer.data();
 
-    { std::lock_guard<std::mutex> lk(callstackMutex_); callstack_.clear(); callstackZ80_.clear(); }
+    {
+        std::lock_guard<std::mutex> lk(callstackMutex_);
+        callstack_.clear();
+        callstackSlot_.clear();
+        callstackZ80_.clear();
+        callstackSlotZ80_.clear();
+    }
     abandoned_.store(false);        // a previous shutdown must not mute this run
 
     bool ok = gx::load_rom(path);
-    if (ok) running_.store(true);
+    if (ok) {
+        romFile_ = path;
+        const size_t slash = romFile_.find_last_of("/\\");
+        if (slash != std::string::npos) romFile_.erase(0, slash + 1);
+        const size_t dot = romFile_.rfind('.');
+        if (dot != std::string::npos && dot > 0) romFile_.resize(dot);
+        running_.store(true);
+    }
     return ok;
 }
 
@@ -508,6 +553,13 @@ void GpgxBackend::onCpuHook(int type, int width, uint32_t addr, uint32_t /*value
         trackCall(addr);
         bool brk = stepInto_.exchange(false);
         if (!brk) { int so = stepOverAddr_.load(); if (so >= 0 && (uint32_t)so == addr) { stepOverAddr_.store(-1); brk = true; } }
+        if (!brk) {
+            const int64_t out = stepOutSp_.load();
+            if (out >= 0) {
+                brk = lastWasReturn_ && int64_t(m68k_get_reg(M68K_REG_A7) & kM68kAddrMask) > out;
+                lastWasReturn_ = isM68kReturn(opcodeAt(addr));
+            }
+        }
         int hit = -1;
         if (!brk) { hit = matchBreakpoint(type, addr, 2); brk = hit >= 0; }  // opcode word
         if (brk) firePause(addr, Cpu::M68K, hit);
@@ -555,6 +607,15 @@ void GpgxBackend::abortRunControl()
 void GpgxBackend::firePause(uint32_t pc, Cpu cpu, int bpId)
 {
     if (abandoned_.load()) return;      // shutting down: do not park the thread
+    // Any stop ends whatever step was in flight. F8 over a call that hits a
+    // breakpoint inside would otherwise leave its target armed, and a later F9
+    // would stop there for no reason the user can see.
+    stepInto_.store(false);
+    stepOverAddr_.store(-1);
+    stepOutSp_.store(-1);
+    stepIntoZ80_.store(false);
+    stepOverAddrZ80_.store(-1);
+    stepOutSpZ80_.store(-1);
     lastBpId_.store(bpId);
     paused_.store(true);
     if (pauseCb_) pauseCb_(pc, cpu);
@@ -690,9 +751,33 @@ void GpgxBackend::trackZ80Call(uint16_t pc)
     }
     if (!call && !ret) return;
 
+    const uint16_t sp = Z80.sp.w.l;
     std::lock_guard<std::mutex> lk(callstackMutex_);
-    if (call) { if (callstackZ80_.size() < 256) callstackZ80_.push_back(pc); }
-    else if (!callstackZ80_.empty()) callstackZ80_.pop_back();
+    while (!callstackZ80_.empty() &&
+           (call ? callstackSlotZ80_.back() < sp : callstackSlotZ80_.back() <= sp)) {
+        callstackZ80_.pop_back();
+        callstackSlotZ80_.pop_back();
+    }
+    if (call && callstackZ80_.size() < 256) {
+        callstackZ80_.push_back(pc);
+        callstackSlotZ80_.push_back(uint16_t(sp - 2));
+    }
+}
+
+bool GpgxBackend::isZ80ReturnAt(uint16_t pc, uint8_t op) const
+{
+    switch (op) {
+    case 0xC9:                                          // RET
+    case 0xD8: case 0xF8: case 0xD0: case 0xC0:         // RET cc: not taken leaves
+    case 0xF0: case 0xE8: case 0xE0: case 0xC8:         // SP where it was
+        return true;
+    case 0xED: {                                        // reti / retn
+        const uint8_t next = z80ByteAt(uint16_t(pc + 1));
+        return next == 0x4D || next == 0x45;
+    }
+    default:
+        return false;
+    }
 }
 
 void GpgxBackend::stepOverZ80()
@@ -737,6 +822,13 @@ void GpgxBackend::onZ80Exec(uint32_t pc)
         const int so = stepOverAddrZ80_.load();
         if (so >= 0 && uint32_t(so) == pc) { stepOverAddrZ80_.store(-1); brk = true; }
     }
+    if (!brk) {
+        const int64_t out = stepOutSpZ80_.load();
+        if (out >= 0) {
+            brk = lastWasReturnZ80_ && int64_t(Z80.sp.w.l) > out;
+            lastWasReturnZ80_ = isZ80ReturnAt(uint16_t(pc), z80ByteAt(uint16_t(pc)));
+        }
+    }
     int hit = -1;
     if (!brk) { hit = matchBreakpoint(HOOK_Z80_E, pc); brk = hit >= 0; }
     if (brk) {
@@ -746,9 +838,13 @@ void GpgxBackend::onZ80Exec(uint32_t pc)
 }
 
 // ---------------------------------------------------------------------------
-// Callstack — the same heuristic the original Gens used: push the address of
-// each jsr/bsr, pop on rts/rte. Conditional returns are popped unconditionally,
-// so it can drift; it is a navigation aid, not ground truth.
+// Callstack — pushes the address of each call, like the original Gens, but keeps
+// where each call stored its return address and unwinds by SP instead of popping
+// blindly. Gens popped on rte too, though nothing is pushed when an interrupt is
+// taken, so every VBlank ate a real frame. Here an interrupt handler's frames sit
+// below the interrupted code's and its rte touches nothing, and frames a game
+// abandoned by adjusting SP by hand go away at the next call or return. A return
+// address pushed by hand and "returned" to is below every frame and pops nothing.
 // ---------------------------------------------------------------------------
 uint16_t GpgxBackend::opcodeAt(uint32_t pc) const
 {
@@ -763,14 +859,21 @@ void GpgxBackend::trackCall(uint32_t pc)
     const uint16_t opc = opcodeAt(pc);
     const bool isCall   = ((opc & 0xFFC0) == 0x4E80)      // jsr
                        || ((opc & 0xFF00) == 0x6100);     // bsr
-    const bool isReturn = (opc == 0x4E75) || (opc == 0x4E73);  // rts / rte
+    const bool isReturn = (opc == 0x4E75) || (opc == 0x4E77);  // rts / rtr
     if (!isCall && !isReturn) return;
 
+    const uint32_t sp = m68k_get_reg(M68K_REG_A7) & kM68kAddrMask;
     std::lock_guard<std::mutex> lk(callstackMutex_);
-    if (isCall) {
-        if (callstack_.size() < 256) callstack_.push_back(pc);   // runaway guard
-    } else if (!callstack_.empty()) {
+    // This hook runs before the instruction: a call has yet to store its return
+    // address at sp-4, and a return is about to consume the one at sp.
+    while (!callstack_.empty() &&
+           (isCall ? callstackSlot_.back() < sp : callstackSlot_.back() <= sp)) {
         callstack_.pop_back();
+        callstackSlot_.pop_back();
+    }
+    if (isCall && callstack_.size() < 256) {                     // runaway guard
+        callstack_.push_back(pc);
+        callstackSlot_.push_back(sp - 4);
     }
 }
 

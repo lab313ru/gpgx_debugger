@@ -3,6 +3,8 @@
 
 #include "fixture.h"
 
+#include <initializer_list>
+#include <vector>
 #include <algorithm>
 #include <cstring>
 #include <condition_variable>
@@ -144,6 +146,165 @@ TEST(m68k_step_over_skips_the_jsr)
     // jsr <abs.l> is six bytes: getting the operand size wrong lands the resume
     // address inside the operand and the step never returns.
     CHECK_EQ(e.backend()->getM68kRegs().pc, kAfterJsr);
+}
+
+// Most instructions are not calls, so this is what F8 does nearly every time. It
+// used to arm the step and leave the emulator parked: IDA showed "running" over a
+// machine that never moved.
+TEST(m68k_step_over_an_ordinary_instruction_advances)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+
+    e.parkM68kAt(kAfterJsr);                   // a nop
+    REQUIRE(e.stepOverAndWait(Cpu::M68K, 2000));
+    CHECK_EQ(e.backend()->getM68kRegs().pc, kAfterJsr + 2);
+}
+
+namespace {
+
+// Routines the synthetic ROM does not have, placed in work RAM.
+constexpr uint32_t kRamCaller    = 0xFF0F00;    // jsr kRamOuter; nop; bra self
+constexpr uint32_t kRamAfterCall = kRamCaller + 6;
+constexpr uint32_t kRamOuter     = 0xFF1000;    // jsr kRamInner; rts
+constexpr uint32_t kRamOuterRts  = kRamOuter + 6;
+constexpr uint32_t kRamInner     = 0xFF1010;    // nop; rts
+
+// A routine's code is big-endian words, whatever the host.
+void putWords(t::Emu& e, uint32_t addr, std::initializer_list<uint16_t> words)
+{
+    std::vector<uint8_t> b;
+    for (uint16_t w : words) { b.push_back(uint8_t(w >> 8)); b.push_back(uint8_t(w)); }
+    REQUIRE(e.backend()->writeMemory(addr, b.data(), uint32_t(b.size())));
+}
+
+void putNestedCalls(t::Emu& e)
+{
+    putWords(e, kRamCaller, { 0x4EB9, uint16_t(kRamOuter >> 16), uint16_t(kRamOuter),
+                              0x4E71, 0x60FE });
+    putWords(e, kRamOuter,  { 0x4EB9, uint16_t(kRamInner >> 16), uint16_t(kRamInner), 0x4E75 });
+    putWords(e, kRamInner,  { 0x4E71, 0x4E75 });
+}
+
+} // namespace
+
+TEST(m68k_step_out_returns_to_the_caller)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+
+    e.parkM68kAt(kJsr);
+    REQUIRE(e.stepAndWait(Cpu::M68K));
+    REQUIRE(e.backend()->getM68kRegs().pc == kSubEntry);
+    REQUIRE(e.stepOutAndWait(Cpu::M68K));
+    CHECK_EQ(e.backend()->getM68kRegs().pc, kAfterJsr);
+}
+
+// Standing on the rts already: its hook has run, so it must be noted at arming.
+TEST(m68k_step_out_from_the_rts_itself)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+
+    e.parkM68kAt(kJsr);
+    REQUIRE(e.stepAndWait(Cpu::M68K));
+    REQUIRE(e.stepAndWait(Cpu::M68K));
+    REQUIRE(e.backend()->getM68kRegs().pc == kSubRts);
+    REQUIRE(e.stepOutAndWait(Cpu::M68K));
+    CHECK_EQ(e.backend()->getM68kRegs().pc, kAfterJsr);
+}
+
+// The inner rts is the first return it sees, and it must not count.
+TEST(m68k_step_out_is_not_fooled_by_a_nested_return)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+    putNestedCalls(e);
+
+    e.parkM68kAt(kRamCaller);
+    REQUIRE(e.stepAndWait(Cpu::M68K));
+    REQUIRE(e.backend()->getM68kRegs().pc == kRamOuter);
+    REQUIRE(e.stepOutAndWait(Cpu::M68K));
+    CHECK_EQ(e.backend()->getM68kRegs().pc, kRamAfterCall);
+}
+
+TEST(m68k_step_over_a_call_that_hits_a_breakpoint_forgets_its_target)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+
+    Breakpoint bp;
+    bp.type = BpType::PC; bp.cpu = Cpu::M68K; bp.is_vdp = false;
+    bp.start = kSubEntry; bp.end = kSubEntry;
+    const int id = e.backend()->addBreakpoint(bp);
+
+    e.parkM68kAt(kJsr);
+    REQUIRE(e.stepOverAndWait(Cpu::M68K));
+    REQUIRE(e.backend()->getM68kRegs().pc == kSubEntry);
+    e.backend()->removeBreakpoint(id);
+
+    // Free-running loop now: a target left armed would stop it at kAfterJsr.
+    const uint64_t s = e.pauseSeq();
+    e.backend()->resume();
+    CHECK(!e.waitPause(s, 400));
+    REQUIRE(e.pauseAndWait());
+}
+
+// Pausing is a one-instruction step underneath, so a pause aimed at a machine
+// already parked used to stop the next resume one instruction in.
+TEST(m68k_pause_on_a_parked_machine_does_not_stop_the_next_resume)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+
+    e.backend()->pause();
+    const uint64_t s = e.pauseSeq();
+    e.backend()->resume();
+    CHECK(!e.waitPause(s, 400));
+    REQUIRE(e.pauseAndWait());
+}
+
+// Nothing is pushed when an interrupt is taken, so rte must not pop. This fakes
+// one's return with the frame an interrupt would have built, from inside a call:
+//   pea target.l ; move.w sr,-(sp) ; rte ; target: nop ; rts
+TEST(m68k_callstack_survives_an_interrupt_return)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+
+    // Parking skips the hook of the instruction parked on, and that hook is what
+    // records a call, so the jsr has to be arrived at: hence the nop before it.
+    constexpr uint32_t kTarget = kRamOuter + 10;
+    constexpr uint32_t kCall   = kRamCaller + 2;
+    putWords(e, kRamCaller, { 0x4E71, 0x4EB9, uint16_t(kRamOuter >> 16), uint16_t(kRamOuter),
+                              0x4E71, 0x60FE });
+    putWords(e, kRamOuter,  { 0x4879, uint16_t(kTarget >> 16), uint16_t(kTarget),
+                              0x40E7, 0x4E73 });
+    putWords(e, kTarget,    { 0x4E71, 0x4E75 });    // nop first: the hook of the rts
+                                                    // would already have popped
+
+    Breakpoint bp;
+    bp.type = BpType::PC; bp.cpu = Cpu::M68K; bp.is_vdp = false;
+    bp.start = kTarget; bp.end = kTarget;
+    e.backend()->addBreakpoint(bp);
+
+    e.parkM68kAt(kRamCaller);
+    const uint64_t s = e.pauseSeq();
+    e.backend()->resume();
+    REQUIRE(e.waitPause(s));
+    REQUIRE(e.backend()->getM68kRegs().pc == kTarget);
+
+    const auto frames = e.backend()->getCallstack(Cpu::M68K);
+    REQUIRE(!frames.empty());
+    CHECK_EQ(frames.back(), kCall);
+    e.backend()->clearBreakpoints();
 }
 
 // The exec hook runs BEFORE the instruction it reports, and the callstack is
@@ -353,6 +514,27 @@ TEST(z80_steps_one_instruction)
     REQUIRE(e.stepAndWait(Cpu::Z80));                     // xor a
     CHECK_EQ(e.backend()->getZ80Regs().pc, kZ80CallNotTaken);
     CHECK_EQ(e.backend()->getZ80Regs().af & 0x40, 0x40u); // Z set by xor a
+}
+
+TEST(z80_step_out_returns_to_the_caller)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+    REQUIRE(armZ80(e));
+
+    Breakpoint bp;
+    bp.type = BpType::PC; bp.cpu = Cpu::Z80; bp.is_vdp = false;
+    bp.start = kZ80Sub; bp.end = kZ80Sub;
+    e.backend()->addBreakpoint(bp);
+    const uint64_t s = e.pauseSeq();
+    e.backend()->resume();
+    REQUIRE(e.waitPause(s));
+    REQUIRE(e.backend()->getZ80Regs().pc == kZ80Sub);
+    e.backend()->clearBreakpoints();
+
+    REQUIRE(e.stepOutAndWait(Cpu::Z80));
+    CHECK_EQ(e.backend()->getZ80Regs().pc, kZ80Loop);
 }
 
 TEST(breakpoint_on_the_other_cpu_does_not_fire)

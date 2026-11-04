@@ -334,6 +334,21 @@ void poll_loop68()
             default:
                 break;          // Resumed/Started need no IDA event here
             }
+            if (ev.type == DebugEvent::Type::Stopped) return;
+        }
+        // The window closed or the emulator crashed: nothing else will ever tell
+        // IDA, and it would sit "running", then "Suspending..." on any request.
+        if (g_remote68 && !g_remote68->isConnected()) {
+            // A suspended IDA does not read events until something resumes it.
+            msg(PLUGIN_NAME ": the emulator went away. If IDA still shows it stopped, press Stop.\n");
+            debug_event_t lost;
+            lost.pid = 1;
+            lost.tid = 1;
+            lost.handled = true;
+            lost.set_exit_code(PROCESS_EXITED, 0);
+            lost.ea = BADADDR;
+            g_events.enqueue(lost);
+            return;
         }
         if (!any)
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -398,9 +413,11 @@ drc_t attach68(const std::string& target, bool as_attach)
             std::string seen;
             int hits = 0;
             for (const auto& s : RemoteBackend::discover()) {
+                const std::string label = s.displayName();
                 if (!seen.empty()) seen += ", ";
-                seen += s.name;
-                if (lower(s.name).find(want) != std::string::npos) {
+                seen += label;
+                if (lower(label).find(want) != std::string::npos ||
+                    lower(s.name).find(want) != std::string::npos) {
                     port = s.port;
                     ++hits;
                 }
@@ -477,7 +494,7 @@ drc_t attach68(const std::string& target, bool as_attach)
 
     start_polling68();
     msg(PLUGIN_NAME ": attached to \"%s\" on 127.0.0.1:%u\n",
-        g_remote68->session().name.c_str(), g_remote68->session().port);
+        g_remote68->session().displayName().c_str(), g_remote68->session().port);
     return DRC_OK;
 }
 
@@ -953,7 +970,7 @@ ssize_t idaapi debugger_callback(void*, int msgid, va_list va)
         for (const auto& s : RemoteBackend::discover()) {
             process_info_t& pi = procs->push_back();
             pi.pid = s.port;
-            pi.name.sprnt("%s (port %u)", s.name.c_str(), (unsigned)s.port);
+            pi.name = s.displayName().c_str();
         }
         retcode = DRC_OK;
         break;
@@ -1050,6 +1067,10 @@ ssize_t idaapi debugger_callback(void*, int msgid, va_list va)
         debug_event_t* event = va_arg(va, debug_event_t*);
         dbg_notification_t req = get_running_notification();
         switch (event->eid()) {
+        // NO_EVENT: IDA's last event can be blank while stopped (a script calling
+        // get_processes clears it). Ignoring it leaves IDA "running" over a
+        // parked emulator, with nothing to say why.
+        case NO_EVENT:
         case STEP:
         case PROCESS_ATTACHED:
         case PROCESS_SUSPENDED:
@@ -1082,6 +1103,7 @@ ssize_t idaapi debugger_callback(void*, int msgid, va_list va)
         switch (resmod) {
         case RESMOD_INTO: be->stepInto(Cpu::M68K); retcode = DRC_OK; break;
         case RESMOD_OVER: be->stepOver(Cpu::M68K); retcode = DRC_OK; break;
+        case RESMOD_OUT:  be->stepOut(Cpu::M68K);  retcode = DRC_OK; break;
         default:          retcode = DRC_FAILED; break;
         }
         break;
@@ -1172,21 +1194,25 @@ ssize_t idaapi debugger_callback(void*, int msgid, va_list va)
         break;
     }
 
-    // Callstack: deferred (backend does not track it yet) — DRC_NONE keeps
-    // IDA's default behavior.
     case debugger_t::ev_update_call_stack: {
         thid_t tid = va_argi(va, thid_t);   (void)tid;
         call_stack_t* trace = va_arg(va, call_stack_t*);
-        if (!cur_backend() || !trace) { retcode = DRC_NONE; break; }
+        IDebugBackend* be = cur_backend();
+        if (!be || !trace) { retcode = DRC_NONE; break; }
         trace->clear();
-        // Backend order is outermost-first, which is what IDA expects.
-        for (uint32_t ea : cur_backend()->getCallstack(Cpu::M68K)) {
+        const auto add_frame = [trace](ea_t ea) {
             call_stack_info_t& f = trace->push_back();
             f.callea = ea;
             f.funcea = BADADDR;
             f.fp     = BADADDR;
             f.funcok = true;
-        }
+        };
+        // Frame 0 is where execution is now, then the callers from the innermost
+        // out (idd.hpp); the backend keeps them outermost first.
+        add_frame(be->getM68kRegs().pc & 0xFFFFFF);
+        const std::vector<uint32_t> calls = be->getCallstack(Cpu::M68K);
+        for (auto it = calls.rbegin(); it != calls.rend(); ++it)
+            add_frame(*it);
         retcode = DRC_OK;
         break;
     }
@@ -1216,7 +1242,7 @@ debugger_t debugger = {
         | DBG_FLAG_ANYSIZE_HWBPT | DBG_FLAG_DEBTHREAD | DBG_FLAG_PREFER_SWBPTS
         | DBG_HAS_GET_PROCESSES | DBG_HAS_REQUEST_PAUSE | DBG_HAS_SET_RESUME_MODE
         | DBG_HAS_CHECK_BPT | DBG_HAS_THREAD_SUSPEND | DBG_HAS_THREAD_CONTINUE
-        | DBG_HAS_ATTACH_PROCESS | DBG_HAS_DETACH_PROCESS,
+        | DBG_HAS_ATTACH_PROCESS | DBG_HAS_DETACH_PROCESS | DBG_HAS_UPDATE_CALL_STACK,
 
     register_classes,
     RC_GENERAL,
@@ -1227,7 +1253,7 @@ debugger_t debugger = {
 
     nullptr, 0, 0, // bpt bytes
 
-    DBG_RESMOD_STEP_INTO | DBG_RESMOD_STEP_OVER,
+    DBG_RESMOD_STEP_INTO | DBG_RESMOD_STEP_OVER | DBG_RESMOD_STEP_OUT,
 };
 
 // ---------------------------------------------------------------------------

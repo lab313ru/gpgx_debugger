@@ -72,6 +72,7 @@ public:
     virtual void resume() = 0;
     virtual void stepInto(Cpu cpu) = 0;
     virtual void stepOver(Cpu cpu) = 0;
+    virtual void stepOut(Cpu cpu) = 0;      // run until the current function returns
     virtual bool isPaused() const = 0;
 
     using PauseCb  = std::function<void(uint32_t pc, Cpu cpu)>;

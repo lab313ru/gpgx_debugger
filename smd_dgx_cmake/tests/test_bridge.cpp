@@ -432,6 +432,41 @@ TEST(bridge_diff_reports_what_changed_since_the_snapshot)
 // unable to say whose game it had reached. The server now takes the first free
 // port in its range and says who it is; the client scans and picks.
 // ---------------------------------------------------------------------------
+// Every step an attached IDA can ask for, over the wire, each landing where it must.
+TEST(bridge_runs_every_step)
+{
+    Wired w(23);
+    REQUIRE(w.ok);
+
+    const auto stepped = [&](auto&& go) {
+        RemoteBackend::RemoteEvent ev;
+        while (w.remote.pollEvent(ev)) {}
+        go();
+        for (int i = 0; i < 100; ++i) {
+            while (w.remote.pollEvent(ev))
+                if (ev.type == DebugEvent::Type::Paused) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return false;
+    };
+
+    w.emu.parkM68kAt(kJsr);
+    REQUIRE(stepped([&] { w.remote.stepInto(Cpu::M68K); }));
+    CHECK_EQ(w.remote.getM68kRegs().pc, kSubEntry);
+
+    REQUIRE(stepped([&] { w.remote.stepOut(Cpu::M68K); }));
+    CHECK_EQ(w.remote.getM68kRegs().pc, kAfterJsr);
+
+    // F8 on an ordinary instruction: the nop right there.
+    REQUIRE(stepped([&] { w.remote.stepOver(Cpu::M68K); }));
+    CHECK_EQ(w.remote.getM68kRegs().pc, kAfterJsr + 2);
+
+    // F8 over a real call.
+    w.emu.parkM68kAt(kJsr);
+    REQUIRE(stepped([&] { w.remote.stepOver(Cpu::M68K); }));
+    CHECK_EQ(w.remote.getM68kRegs().pc, kAfterJsr);
+}
+
 // IDA's Attach dialog and every "find the emulator" path block on this. Blocking
 // connects measured 2 s per closed port on Windows: 32 s for the empty range.
 TEST(bridge_discovery_does_not_wait_out_closed_ports)
@@ -489,6 +524,26 @@ TEST(bridge_session_identifies_the_game)
     // the calculated checksum is what actually distinguishes two games.
     const SessionInfo direct = w.emu.host()->gpgx()->sessionInfo();
     CHECK_EQ(s.crc, direct.crc);
+    // The name a person sees comes from the ROM file and must survive the wire.
+    CHECK(!direct.file.empty());
+    CHECK(direct.file.find_first_of("/\\") == std::string::npos);
+    CHECK(s.displayName() == direct.displayName());
+}
+
+TEST(session_is_named_after_its_file_then_its_header)
+{
+    SessionInfo s;
+    CHECK(s.displayName() == "unnamed");
+    s.name = "-";
+    s.file = "-";
+    CHECK(s.displayName() == "unnamed");
+    s.name = "Dumped_By_TSD";
+    CHECK(s.displayName() == "Dumped By TSD");
+    // A Cyrillic file name reaches a client as nothing but underscores.
+    s.file = "____";
+    CHECK(s.displayName() == "Dumped By TSD");
+    s.file = "Pirates_of_Dark_Water,_The_(UE)_[f1]";
+    CHECK(s.displayName() == "Pirates of Dark Water, The (UE) [f1]");
 }
 
 TEST(bridge_client_stops_claiming_health_after_the_server_goes)

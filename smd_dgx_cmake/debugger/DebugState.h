@@ -66,6 +66,22 @@ struct SessionInfo {
     unsigned short crc  = 0;      // rominfo.realchecksum
     std::string serial;           // rominfo.product
     std::string name;             // rominfo.domestic, trimmed
+    std::string file;             // ROM file name, no directory or extension
+
+    // What to call this session to a person. The file comes first: a dump's or
+    // hack's header can say anything ("Dumped By TSD"). The wire carries both
+    // with spaces as underscores and any non-ASCII byte flattened to one too,
+    // so a name can arrive as nothing but underscores; "-" means absent.
+    std::string displayName() const
+    {
+        const auto readable = [](std::string v) {
+            for (char& c : v) if (c == '_') c = ' ';
+            return v.find_first_not_of(" -") == std::string::npos ? std::string() : v;
+        };
+        std::string v = readable(file);
+        if (v.empty()) v = readable(name);
+        return v.empty() ? "unnamed" : v;
+    }
 };
 
 // A viewable/editable memory region (parity with the Gens hex editor).

@@ -69,9 +69,10 @@ runs inside IDA, so IDA's own windows operate on the live machine:
   side-effect free; they never touch an IO handler.
 - **Breakpoints** — execute, read, write and read+write, ranged, on **both**
   CPUs.
-- **Stepping**, and a code map that marks everything the emulator actually
-  executed as code — the old Gensida trick for ROMs static analysis cannot
-  untangle.
+- **Stepping** — `F7` into, `F8` over, `Ctrl+F7` until return (out of an interrupt
+  handler too), `F4` to the cursor, and the **Stack trace** window.
+- A code map that marks everything the emulator actually executed as code — the
+  old Gensida trick for ROMs static analysis cannot untangle.
 - Eleven of the views above, dockable inside IDA, plus five layout presets.
 - **ROM patching** — push IDA's patched bytes into the running emulator, revert
   them, or export the current ROM image.
@@ -110,10 +111,10 @@ The 68000 debugger can also drive an emulator running somewhere else: the
 standalone app, or another IDA. The game keeps its own window, sound and views,
 and IDA can come and go.
 
-- **Debugger → Attach to process...** lists every running emulator by game and
-  port.
+- **Debugger → Attach to process...** lists every running emulator by its ROM's
+  file name, with the port as its ID.
 - Or **Debugger → Process options → Parameters**, then `F9`: `attach`,
-  `attach:27043` for a port, or `attach:sonic` for part of the game's name. Empty
+  `attach:27043` for a port, or `attach:sonic` for part of the file or game name. Empty
   Parameters means the usual run inside IDA. A name that matches two emulators
   is refused rather than guessed.
 
@@ -243,13 +244,15 @@ byte-order and region contracts; CRAM packing; save states; the whole bridge
 protocol; multi-session port allocation; and every standalone view listed above.
 
 **Verified by a scripted run inside real IDA 9.3, not by hand:** attaching the
-68000 debugger through both routes above, with stepping, breakpoints, memory and
-register writes, the code map and detach, against a running game.
+68000 debugger through both routes above, with breakpoints, memory and register
+writes, the code map and detach, against a running game; and on the 68000, attached
+and in-process, `F7`, `F8`, `Ctrl+F7`, `F4` and the Stack trace, pressed through
+IDA's own actions, with the trace checked against the machine's stack memory.
 
 **Built but never driven by hand:**
 
-- The Z80 chain end to end through IDA's own interface. The bridge-level
-  behaviour is tested; the IDA UI path is not.
+- The Z80 chain end to end through IDA's own interface, including its steps. The
+  bridge-level behaviour is tested; the IDA UI path is not.
 - Any build on Linux or macOS. The reasons it definitely failed there are gone
   — real audio, portable sockets, per-platform IDA module suffixes — but
   nothing has ever been configured there. On Linux the IDA plugin additionally
@@ -257,9 +260,7 @@ register writes, the code map and detach, against a running game.
 - In IDA: VDP-space breakpoints, breakpoint conditions, layout presets, save
   states, ROM patching, the `J` decoder, A/F-line decoding.
 
-**Known broken:** the call-stack window is unreachable (the handler exists, but
-the debugger does not advertise `DBG_HAS_UPDATE_CALL_STACK`); `stepOver` does
-not check that the emulator is paused; `J` overwrites an existing comment;
+**Known broken:** `J` overwrites an existing comment;
 `RemoteBackend` reports success unconditionally on some writes; CRAM/VSRAM
 breakpoint addresses are not masked the way the core masks them.
 
