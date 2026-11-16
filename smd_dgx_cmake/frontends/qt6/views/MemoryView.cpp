@@ -336,7 +336,17 @@ bool MemoryView::hitTest(QPoint pos, int64_t& off, Area& area, bool clampInside)
 void MemoryView::paintEvent(QPaintEvent*)
 {
     QPainter p(viewport());
-    p.fillRect(viewport()->rect(), Qt::white);
+    // Text, addresses and rules follow the palette, so the editor matches a dark
+    // or a light theme; the bytes are printed as text, not shown as colours.
+    const QPalette& pal = palette();
+    const QColor ink    = pal.color(QPalette::Text);
+    const QColor base   = pal.color(QPalette::Base);
+    const QColor accent = pal.color(QPalette::Link);
+    const QColor dim    = pal.color(QPalette::PlaceholderText);
+    const QColor rule   = QColor::fromRgbF(base.redF()   + (ink.redF()   - base.redF())   * 0.3f,
+                                           base.greenF() + (ink.greenF() - base.greenF()) * 0.3f,
+                                           base.blueF()  + (ink.blueF()  - base.blueF())  * 0.3f);
+    p.fillRect(viewport()->rect(), base);
     p.setFont(font());
 
     const Metrics m = metrics();
@@ -346,12 +356,12 @@ void MemoryView::paintEvent(QPaintEvent*)
     p.translate(-horizontalScrollBar()->value(), 0);
 
     // column header
-    p.setPen(QColor(0x60, 0x60, 0xAA));
+    p.setPen(accent);
     for (int col = 0; col < 16; ++col)
         p.drawText(cellX(m, col), asc, QStringLiteral("%1").arg(col, 2, 16).toUpper());
 
     if (!backend_ || !hasRegion_ || cur_.size == 0) {
-        p.setPen(QColor(0xA0, 0xA0, 0xA0));
+        p.setPen(dim);
         p.drawText(m.hexL, m.top + asc, QStringLiteral("(no data)"));
         return;
     }
@@ -365,7 +375,7 @@ void MemoryView::paintEvent(QPaintEvent*)
         if (rowAddr >= static_cast<int64_t>(cur_.size)) break;
         const int y = m.top + line * m.rh;
 
-        p.setPen(QColor(0x60, 0x60, 0xAA));
+        p.setPen(accent);
         p.drawText(m.cw / 2, y + asc, displayAddr(rowAddr) + QLatin1Char(':'));
 
         for (int col = 0; col < 16; ++col) {
@@ -376,8 +386,8 @@ void MemoryView::paintEvent(QPaintEvent*)
             const bool sel = hasSel_ && addr >= s0 && addr <= s1;
 
             const int cx = cellX(m, col);
-            if (sel) p.fillRect(QRect(cx - m.cw / 2, y, m.cw * 5 / 2, m.rh), Qt::black);
-            p.setPen(sel ? Qt::white : Qt::black);
+            if (sel) p.fillRect(QRect(cx - m.cw / 2, y, m.cw * 5 / 2, m.rh), pal.highlight());
+            p.setPen(sel ? pal.color(QPalette::HighlightedText) : ink);
             QString t;
             if (pendingSecond_ && addr == s0)
                 t = QStringLiteral("%1.").arg(pendingNibble_, 1, 16).toUpper();
@@ -389,8 +399,8 @@ void MemoryView::paintEvent(QPaintEvent*)
 
             if (showText) {
                 const int tx = textX(m, col);
-                if (sel) p.fillRect(QRect(tx, y, m.cw, m.rh), Qt::black);
-                p.setPen(sel ? Qt::white : Qt::black);
+                if (sel) p.fillRect(QRect(tx, y, m.cw, m.rh), pal.highlight());
+                p.setPen(sel ? pal.color(QPalette::HighlightedText) : ink);
                 const char c = (ok && b >= 0x20 && b <= 0x7E) ? static_cast<char>(b) : '.';
                 p.drawText(tx, y + asc, QString(QLatin1Char(c)));
             }
@@ -398,7 +408,7 @@ void MemoryView::paintEvent(QPaintEvent*)
     }
 
     if (linesChk_->isChecked()) {
-        p.setPen(QColor(0xB0, 0xB0, 0xB0));
+        p.setPen(rule);
         const int w = showText ? m.textR : m.hexR;
         const int h = viewport()->height();
         p.drawLine(0, m.top - 1, w, m.top - 1);

@@ -43,15 +43,23 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
 
     statusLabel_ = new QLabel(QStringLiteral("No ROM loaded"), this);
     statusBar()->addWidget(statusLabel_);
+    attachLabel_ = new QLabel(this);
+    attachLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    statusBar()->addPermanentWidget(attachLabel_);
 
     buildMenus();
     buildDocks();
 
-    backend_->onPaused([this](uint32_t pc, Cpu) {
-        QMetaObject::invokeMethod(this, [this, pc]{ onPaused(pc); }, Qt::QueuedConnection);
-    });
-    backend_->onResumed([this]() {
-        QMetaObject::invokeMethod(this, [this]{ onResumed(); }, Qt::QueuedConnection);
+    // The backend has a single pause callback and EmuHost::start takes it, so
+    // the window listens to the host's events, as the bridge and IDA do.
+    eventSink_ = emuHost_->addEventSink([this](const DebugEvent& ev) {
+        if (ev.type == DebugEvent::Type::Paused) {
+            const uint32_t pc = ev.pc;
+            const Cpu cpu = ev.cpu;
+            QMetaObject::invokeMethod(this, [this, pc, cpu]{ onPaused(pc, cpu); }, Qt::QueuedConnection);
+        } else if (ev.type == DebugEvent::Type::Resumed) {
+            QMetaObject::invokeMethod(this, [this]{ onResumed(); }, Qt::QueuedConnection);
+        }
     });
 
     // Live views: Gens updated its tool windows every frame; 10 Hz is enough
@@ -71,6 +79,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
 
 MainWindow::~MainWindow()
 {
+    if (emuHost_) emuHost_->removeEventSink(eventSink_);
     stopEmulator();
     delete emuHost_; emuHost_ = nullptr;
     backend_ = nullptr;
@@ -87,6 +96,8 @@ void MainWindow::stopEmulator()
     if (emuHost_) emuHost_->stop();
     delete audio_; audio_ = nullptr;      // outlives the host: the sink writes to it
     refreshTimer_.stop();
+    attachLabel_->setText(QStringLiteral("IDA attach: open a ROM first"));
+    attachLabel_->setToolTip(QString());
 }
 
 void MainWindow::closeEvent(QCloseEvent* e)
@@ -113,11 +124,14 @@ void MainWindow::buildMenus()
     actResume_   = debug->addAction(QStringLiteral("&Resume"),    this, &MainWindow::debugResume,   Qt::Key_F9);
     actStepInto_ = debug->addAction(QStringLiteral("Step &Into"), this, &MainWindow::debugStepInto, Qt::Key_F7);
     actStepOver_ = debug->addAction(QStringLiteral("Step &Over"), this, &MainWindow::debugStepOver, Qt::Key_F8);
+    actStepOut_  = debug->addAction(QStringLiteral("Step O&ut"),  this, &MainWindow::debugStepOut,
+                                    QKeySequence(Qt::CTRL | Qt::Key_F7));
 
     actPause_->setEnabled(false);
     actResume_->setEnabled(false);
     actStepInto_->setEnabled(false);
     actStepOver_->setEnabled(false);
+    actStepOut_->setEnabled(false);
 }
 
 void MainWindow::buildDocks()
@@ -235,8 +249,27 @@ void MainWindow::openRomFile(const QString& path)
     // Same control socket the IDA plugin serves, so the MCP tools work against
     // the standalone app too.
     bridge_ = new BridgeServer(emuHost_);
-    if (!bridge_->start())
+    if (bridge_->start()) {
+        const unsigned port = bridge_->port();
+        // IDA's Attach dialog scans only this range; a port set by SMD_DGX_PORT
+        // outside it has to be named in Parameters instead.
+        const bool listed = port >= BridgeServer::kBasePort
+                         && port < BridgeServer::kBasePort + BridgeServer::kPortRange;
+        attachLabel_->setText(listed
+            ? QStringLiteral("IDA: Debugger → Attach to process…  (port %1)").arg(port)
+            : QStringLiteral("IDA: Process options → Parameters: attach:%1").arg(port));
+        attachLabel_->setToolTip(QStringLiteral(
+            "To debug this game in IDA: open its 68000 database, choose SMD DGX as the debugger, "
+            "then Debugger → Attach to process… and pick \"%1\" (ID %2).\n"
+            "Or set Process options → Parameters to attach:%2 and press F9.\n"
+            "The MCP tools use the same port.").arg(fi.completeBaseName()).arg(port));
+    } else {
         qWarning("SMD DGX: control socket unavailable (port busy?)");
+        attachLabel_->setText(QStringLiteral("IDA attach unavailable: no free control port"));
+        attachLabel_->setToolTip(QStringLiteral(
+            "Ports 27042-27057 are all taken, or SMD_DGX_PORT names a busy one."));
+    }
+    setWindowTitle(fi.completeBaseName() + QStringLiteral(" — Genesis Plus GX Debugger"));
 
     refreshTimer_.start();
     statusLabel_->setText(QStringLiteral("Running: ") + path);
@@ -261,7 +294,7 @@ void MainWindow::refreshViews()
     refreshIfVisible(ramWatchView_);
 }
 
-void MainWindow::onPaused(uint32_t pc)
+void MainWindow::onPaused(uint32_t pc, Cpu cpu)
 {
     // On pause refresh everything, visible or not, so states are consistent
     vdpRamView_->refresh();
@@ -280,7 +313,11 @@ void MainWindow::onPaused(uint32_t pc)
     actResume_->setEnabled(true);
     actStepInto_->setEnabled(true);
     actStepOver_->setEnabled(true);
-    statusLabel_->setText(QStringLiteral("Paused at %1").arg(pc, 6, 16, QLatin1Char('0')).toUpper());
+    actStepOut_->setEnabled(true);
+    const bool z80 = cpu == Cpu::Z80;
+    const QString hex = QStringLiteral("%1").arg(z80 ? pc & 0xFFFF : pc & 0xFFFFFF,
+                                                 z80 ? 4 : 6, 16, QLatin1Char('0')).toUpper();
+    statusLabel_->setText((z80 ? QStringLiteral("Paused at Z80 $") : QStringLiteral("Paused at $")) + hex);
 }
 
 void MainWindow::onResumed()
@@ -290,6 +327,7 @@ void MainWindow::onResumed()
     actResume_->setEnabled(false);
     actStepInto_->setEnabled(false);
     actStepOver_->setEnabled(false);
+    actStepOut_->setEnabled(false);
     statusLabel_->setText(QStringLiteral("Running"));
 }
 
@@ -297,3 +335,4 @@ void MainWindow::debugPause()   { if (emuHost_ && emuHost_->isRunning()) backend
 void MainWindow::debugResume()  { backend_->resume(); }
 void MainWindow::debugStepInto(){ backend_->stepInto(Cpu::M68K); }
 void MainWindow::debugStepOver(){ backend_->stepOver(Cpu::M68K); }
+void MainWindow::debugStepOut() { backend_->stepOut(Cpu::M68K); }
