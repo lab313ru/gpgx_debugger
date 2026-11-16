@@ -38,6 +38,8 @@ unset QT_PLUGIN_PATH QT_QPA_PLATFORM_PLUGIN_PATH
 LOG=$(mktemp)
 APP=
 fail=0
+EXTRACT_DIR=${TMPDIR:-/tmp}
+extracted_before=" $(echo "$EXTRACT_DIR"/appimage_extracted_*) "
 
 "${launch[@]}" > "$LOG" 2>&1 &
 LAUNCHER=$!
@@ -48,12 +50,21 @@ running() {     # running PID: alive and not a zombie waiting to be reaped
     [ "${s%% *}" != Z ]
 }
 stop() {
-    # The app first: an AppImage runtime that sees it exit removes its /tmp copy.
+    # The app first, so an AppImage runtime outlives it and can clean up.
     kill ${APP:-$LAUNCHER} 2>/dev/null || true
     for _ in $(seq 50); do running "$LAUNCHER" || break; sleep 0.1; done
     for p in $APP $LAUNCHER; do running "$p" && kill "$p" 2>/dev/null && sleep 0.5 || true; done
     for p in $APP $LAUNCHER; do kill -9 "$p" 2>/dev/null || true; done
     wait "$LAUNCHER" 2>/dev/null || true
+    # The runtime still leaves its unpacked copy behind when the app does not
+    # exit cleanly (a crash, or the kill above), so remove the one this run made.
+    if [ ! -d "$PKG" ]; then
+        for d in "$EXTRACT_DIR"/appimage_extracted_*; do
+            [ -x "$d/usr/bin/smd_dgx_qt6" ] || continue
+            case $extracted_before in *" $d "*) continue ;; esac
+            rm -rf "$d"
+        done
+    fi
     if [ "$fail" != 0 ]; then echo "--- app output:"; head -40 "$LOG"; fi
     rm -f "$LOG"
 }
@@ -83,8 +94,17 @@ def ask(f, s, line):
     s.sendall((line + "\n").encode())
     return f.readline().rstrip("\r\n")
 
+def running(pid):
+    try:
+        return open("/proc/%d/stat" % pid).read().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+
 deadline = time.time() + 40
 while time.time() < deadline:
+    if not running(launcher):
+        print("FAIL the app exited before its control socket answered")
+        sys.exit(1)
     for port in range(27042, 27042 + 16):
         try:
             s = socket.create_connection(("127.0.0.1", port), timeout=0.3)
