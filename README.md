@@ -180,8 +180,8 @@ SDL2 is required on every platform. Qt6 is optional, but without it the
 debugger app is silently skipped. ImGui and OpenGL are optional. zlib is
 vendored and built in-tree.
 
-**Windows** — the only path that has actually been run. From an x64 Native
-Tools prompt:
+**Windows** — the platform everything is used on. From an x64 Native Tools
+prompt:
 
 ```
 cd smd_dgx_cmake

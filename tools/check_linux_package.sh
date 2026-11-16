@@ -41,11 +41,17 @@ fail=0
 
 "${launch[@]}" > "$LOG" 2>&1 &
 LAUNCHER=$!
+running() {     # running PID: alive and not a zombie waiting to be reaped
+    local s
+    s=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+    s=${s##*) }
+    [ "${s%% *}" != Z ]
+}
 stop() {
     # The app first: an AppImage runtime that sees it exit removes its /tmp copy.
     kill ${APP:-$LAUNCHER} 2>/dev/null || true
-    for _ in $(seq 50); do kill -0 "$LAUNCHER" 2>/dev/null || break; sleep 0.1; done
-    for p in $APP $LAUNCHER; do kill "$p" 2>/dev/null && sleep 0.5 || true; done
+    for _ in $(seq 50); do running "$LAUNCHER" || break; sleep 0.1; done
+    for p in $APP $LAUNCHER; do running "$p" && kill "$p" 2>/dev/null && sleep 0.5 || true; done
     for p in $APP $LAUNCHER; do kill -9 "$p" 2>/dev/null || true; done
     wait "$LAUNCHER" 2>/dev/null || true
     if [ "$fail" != 0 ]; then echo "--- app output:"; head -40 "$LOG"; fi
