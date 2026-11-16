@@ -49,6 +49,23 @@ if (GX_ENABLE_CHD)
   target_link_libraries(gx_core PUBLIC gx_libchdr)
 endif()
 
+# ---- 68000 disassembler (NO Qt) ----
+#
+# Upstream Musashi's m68kdasm.c, MIT (third_party/musashi_dasm/README.md), not
+# the Musashi in core/m68k. Its m68k.h has the same name as core/m68k/m68k.h,
+# which reaches every target that links gx_core, so its directory is never put
+# on an include path anyone else inherits: m68kdasm.c finds its headers beside
+# itself, and the wrapper includes "musashi_dasm/m68k.h" through a PRIVATE dir.
+add_library(musashi_dasm STATIC
+  "${CMAKE_CURRENT_LIST_DIR}/third_party/musashi_dasm/m68kdasm.c")
+target_compile_definitions(musashi_dasm PRIVATE _CRT_SECURE_NO_WARNINGS)   # sprintf
+
+add_library(smd_dgx_disasm STATIC "${CMAKE_CURRENT_LIST_DIR}/debugger/Disasm68k.cpp")
+target_include_directories(smd_dgx_disasm PUBLIC "${CMAKE_CURRENT_LIST_DIR}")
+target_include_directories(smd_dgx_disasm PRIVATE "${CMAKE_CURRENT_LIST_DIR}/third_party")
+target_link_libraries(smd_dgx_disasm PRIVATE musashi_dasm)
+set_target_properties(smd_dgx_disasm PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES)
+
 # Shared frontend code (config, error, fileio, save_state, unzip) - reused by SDL and Qt6
 set(GX_FRONTEND_CORE "${CMAKE_CURRENT_LIST_DIR}/frontends/core")
 add_library(frontend_common STATIC
@@ -70,7 +87,8 @@ endif()
 # ---- Headless debugger core (NO Qt) ----
 # Emulator + debug backend + transport + host, statically linkable into any
 # frontend: the standalone Qt app, and (phase 2) the IDA 9.2+ plugin.
-# Depends only on the emulator core and frontend_common; zero UI/toolkit deps.
+# Depends only on the emulator core, frontend_common and the disassembler;
+# zero UI/toolkit deps.
 add_library(smd_dgx_emu STATIC
   "${CMAKE_CURRENT_LIST_DIR}/debugger/GpgxBackend.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/debugger/InProcTransport.cpp"
@@ -82,7 +100,7 @@ if (WIN32)
   target_link_libraries(smd_dgx_emu PUBLIC ws2_32)   # BridgeServer sockets
 endif()
 target_include_directories(smd_dgx_emu PUBLIC "${CMAKE_CURRENT_LIST_DIR}")
-target_link_libraries(smd_dgx_emu PUBLIC gx_core frontend_common)
+target_link_libraries(smd_dgx_emu PUBLIC gx_core frontend_common smd_dgx_disasm)
 set_target_properties(smd_dgx_emu PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES)
 
 find_package(SDL2 CONFIG REQUIRED)
