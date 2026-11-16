@@ -2,36 +2,67 @@
 # Prove a Linux package of the standalone app runs on its own, away from the
 # build tree:
 #
-#   tools/check_linux_package.sh <unpacked standalone dir | AppImage> <rom> [build dir]
+#   tools/check_linux_package.sh <tarball | unpacked dir | AppImage> <rom> [build dir]
 #
-# Starts the app on the current display with an empty LD_LIBRARY_PATH and
-# DGX_NO_AUDIO=1, waits for its control socket and asks it ping, status and
-# frame. Then it checks where the libraries come from, two ways:
+# A tarball is unpacked into a fresh directory first. Starts the app on the
+# current display with an empty LD_LIBRARY_PATH and DGX_NO_AUDIO=1, waits for
+# its control socket and asks it ping, status and frame. Then it checks where
+# the libraries come from, two ways:
 #
 #   ldd over every ELF file of the package as the app runs it, and
 #   /proc/<pid>/maps of the running app: what was actually loaded.
 #
-# Any library ldd cannot find, any Qt library from outside the package, or
-# anything at all from the build directory (default <repo>/builds/linux-release)
-# fails the check. An AppImage runs with APPIMAGE_EXTRACT_AND_RUN=1, so FUSE is
-# not needed, and is checked in the directory it unpacked itself into.
+# Any library ldd cannot find, any Qt library from outside the package, a
+# libSDL2 that is not the package's own, or anything at all from the build
+# directory (default <repo>/builds/linux-release) fails the check. The app
+# loads SDL even when silenced, without opening a device, so a silent run
+# still shows which one it would play through. An AppImage runs with
+# APPIMAGE_EXTRACT_AND_RUN=1, so FUSE is not needed, and is checked in the
+# directory it unpacked itself into.
+#
+# Everything printed also goes to check_<package name>.log next to the
+# package, with the package's sha256, so a PASS can be shown later.
 set -euo pipefail
 
 die() { printf 'check_linux_package: %s\n' "$*" >&2; exit 1; }
-[ $# -ge 2 ] || die "usage: $0 <unpacked dir | AppImage> <rom> [build dir]"
+[ $# -ge 2 ] || die "usage: $0 <tarball | unpacked dir | AppImage> <rom> [build dir]"
 PKG=$(realpath "$1")
 ROM=$(realpath "$2")
 BUILD=$(realpath -m "${3:-$(dirname "${BASH_SOURCE[0]}")/../builds/linux-release}")
+[ -e "$PKG" ] || die "no package at $PKG"
 [ -f "$ROM" ] || die "no ROM at $ROM"
 [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || die "no display: set DISPLAY"
 command -v python3 >/dev/null || die "needs python3"
 
-if [ -d "$PKG" ]; then
-    [ -x "$PKG/AppRun" ] || die "$PKG has no AppRun"
-    launch=("$PKG/AppRun" "$ROM")
-else
-    launch=(env APPIMAGE_EXTRACT_AND_RUN=1 "$PKG" "$ROM")
-fi
+name=${PKG##*/}
+name=${name%.tar.gz}
+name=${name%.AppImage}
+REPORT=$(dirname "$PKG")/check_$name.log
+exec > >(tee "$REPORT") 2>&1
+TEE=$!
+echo "== check_linux_package $(date -u +%Y-%m-%dT%H:%MZ)"
+echo "   package: $PKG"
+[ -d "$PKG" ] || echo "   sha256:  $(sha256sum "$PKG" | cut -d' ' -f1)"
+echo "   host:    $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME"), $(uname -sr)"
+
+UNPACK=
+case $PKG in
+    *.tar.gz)
+        UNPACK=$(mktemp -d)
+        tar -xzf "$PKG" -C "$UNPACK"
+        top=("$UNPACK"/*)
+        [ ${#top[@]} = 1 ] && [ -x "${top[0]}/AppRun" ] \
+            || die "$PKG does not unpack to one folder with an AppRun"
+        launch=("${top[0]}/AppRun" "$ROM")
+        echo "   unpacked into $UNPACK" ;;
+    *)
+        if [ -d "$PKG" ]; then
+            [ -x "$PKG/AppRun" ] || die "$PKG has no AppRun"
+            launch=("$PKG/AppRun" "$ROM")
+        else
+            launch=(env APPIMAGE_EXTRACT_AND_RUN=1 "$PKG" "$ROM")
+        fi ;;
+esac
 
 export LD_LIBRARY_PATH= DGX_NO_AUDIO=1
 unset QT_PLUGIN_PATH QT_QPA_PLATFORM_PLUGIN_PATH
@@ -58,15 +89,19 @@ stop() {
     wait "$LAUNCHER" 2>/dev/null || true
     # The runtime still leaves its unpacked copy behind when the app does not
     # exit cleanly (a crash, or the kill above), so remove the one this run made.
-    if [ ! -d "$PKG" ]; then
+    if [ ! -d "$PKG" ] && [ -z "$UNPACK" ]; then
         for d in "$EXTRACT_DIR"/appimage_extracted_*; do
             [ -x "$d/usr/bin/smd_dgx_qt6" ] || continue
             case $extracted_before in *" $d "*) continue ;; esac
             rm -rf "$d"
         done
     fi
+    [ -z "$UNPACK" ] || rm -rf "$UNPACK"
     if [ "$fail" != 0 ]; then echo "--- app output:"; head -40 "$LOG"; fi
     rm -f "$LOG"
+    echo "   report: $REPORT"
+    exec >&- 2>&-               # let tee see the end and finish the file
+    wait "$TEE" 2>/dev/null || true
 }
 trap stop EXIT
 
@@ -167,12 +202,17 @@ echo "== loaded by the running app (/proc/$APP/maps)"
 maps=$(awk '$6 ~ /\.so/ { print $6 }' "/proc/$APP/maps" | sort -u)
 qt_in=$(printf '%s\n' "$maps" | grep '/libQt6' | grep -c "^$ROOT/" || true)
 qt_out=$(printf '%s\n' "$maps" | grep '/libQt6' | grep -v "^$ROOT/" || true)
+sdl=$(printf '%s\n' "$maps" | grep '/libSDL2' || true)
 from_build=$(printf '%s\n' "$maps" | grep "^$BUILD/" || true)
 echo "   $(printf '%s\n' "$maps" | wc -l) shared objects; Qt from the package: $qt_in"
 printf '%s\n' "$maps" | grep -E '/libQt6|/platforms/|/libSDL2' | sed 's/^/     /'
 if [ -n "$qt_out" ];      then fail=1; echo "FAIL Qt from outside the package:"; echo "$qt_out"; fi
 if [ -n "$from_build" ];  then fail=1; echo "FAIL loaded from the build tree:";  echo "$from_build"; fi
 [ "$qt_in" -gt 0 ] || { fail=1; echo "FAIL no Qt library loaded from the package"; }
+if [ "$sdl" != "$ROOT/usr/lib/libSDL2-2.0.so.0" ]; then
+    fail=1
+    echo "FAIL SDL2 is not the package's own $ROOT/usr/lib/libSDL2-2.0.so.0: ${sdl:-none loaded}"
+fi
 
 if [ "$fail" = 0 ]; then echo "== PASS"; else echo "== FAIL"; fi
 exit "$fail"
