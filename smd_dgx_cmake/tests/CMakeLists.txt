@@ -10,6 +10,7 @@ add_executable(smd_dgx_tests
   test_backend.cpp
   test_bridge.cpp
   test_disasm.cpp
+  test_listing.cpp
   test_input.c          # headless osd_input_update, as every other host has
   test_harness.h
   synth_rom.h
