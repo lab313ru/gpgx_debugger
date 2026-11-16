@@ -503,6 +503,14 @@ void MainWindow::buildDocks()
     ramSearchView_->setBackend(backend_);
     ramWatchView_->setBackend(backend_);
     debuggerView_->setBackend(backend_);
+    // The menu's steps act on the CPU of the Debugger dock's tab in front and
+    // say so when it is the Z80; the keys stay the menu's alone.
+    connect(debuggerView_, &CpuDebugView::currentCpuChanged, this, [this](Cpu cpu) {
+        const QString who = cpu == Cpu::Z80 ? QStringLiteral(" (Z80)") : QString();
+        actStepInto_->setText(QStringLiteral("Step &Into") + who);
+        actStepOver_->setText(QStringLiteral("Step &Over") + who);
+        actStepOut_->setText(QStringLiteral("Step O&ut") + who);
+    });
 
     connect(ramSearchView_, &RamSearchView::addWatchRequested,
             ramWatchView_,  &RamWatchView::addWatch);
@@ -658,6 +666,9 @@ void MainWindow::onPaused(uint32_t pc, Cpu cpu)
     hexView_->refresh();
     ramSearchView_->refresh();
     ramWatchView_->refresh();
+    // A Z80 stop brings its tab forward; a 68000 stop leaves whichever tab
+    // is in front.
+    if (cpu == Cpu::Z80) debuggerView_->showCpu(Cpu::Z80);
     debuggerView_->followPc();
 
     if (audio_) audio_->pause(true);     // nothing refills it while stopped
@@ -686,6 +697,6 @@ void MainWindow::onResumed()
 
 void MainWindow::debugPause()   { if (emuHost_ && emuHost_->isRunning()) backend_->pause(); }
 void MainWindow::debugResume()  { backend_->resume(); }
-void MainWindow::debugStepInto(){ backend_->stepInto(Cpu::M68K); }
-void MainWindow::debugStepOver(){ backend_->stepOver(Cpu::M68K); }
-void MainWindow::debugStepOut() { backend_->stepOut(Cpu::M68K); }
+void MainWindow::debugStepInto(){ backend_->stepInto(debuggerView_->currentCpu()); }
+void MainWindow::debugStepOver(){ backend_->stepOver(debuggerView_->currentCpu()); }
+void MainWindow::debugStepOut() { backend_->stepOut(debuggerView_->currentCpu()); }
