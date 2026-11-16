@@ -56,6 +56,7 @@ set_target_properties(smd_dgx_ida PROPERTIES
   PREFIX ""                       # IDA scans for the bare name, not libsmd_...
   SUFFIX "${IDA_MODULE_SUFFIX}"
 )
+ida_module_exports(smd_dgx_ida PLUGIN)
 
 # Views embedding (phase 3).
 #
@@ -135,6 +136,10 @@ if (Qt6_FOUND AND IDA_QT_READY)
     if (APPLE)
       target_link_options(smd_dgx_ida PRIVATE "-Wl,-undefined,dynamic_lookup")
     endif()
+    # The headers here are the system Qt's, not IDA's. Version tagging would
+    # leave a hard reference to qt_version_tag_QT, a symbol only IDA's own
+    # QtCore could provide and which nothing here can check it exports.
+    target_compile_definitions(smd_dgx_ida PRIVATE QT_NO_VERSION_TAGGING)
   endif()
   set_target_properties(smd_dgx_ida PROPERTIES AUTOMOC ON)
 else()
