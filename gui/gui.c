@@ -3,7 +3,7 @@
 #include "vdp_ram_debug.h"
 #include "hex_editor.h"
 #include "disassembler.h"
-#include "debug.h"
+#include "debug_core.h"
 
 HWND dbg_window = NULL;
 HINSTANCE dbg_wnd_hinst = NULL;
