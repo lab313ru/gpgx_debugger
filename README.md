@@ -66,6 +66,11 @@ Views, all dockable and toggled from the **View** menu:
 Zoom levels, the pinned tile, dock layout, window geometry and the watch list
 all survive a restart.
 
+The **Options** menu holds the Genesis Plus GX core options (region, console
+model, TMSS, lock-on cartridges, FM chip, filters, overscan and the rest), kept
+across restarts. Most apply at once; the few that cannot say in their tooltip
+whether they wait for **File → Hard Reset** or **File → Reload ROM**.
+
 ## The IDA plugin
 
 Open a Mega Drive ROM, choose **SMD DGX** as the debugger, `F9`. The emulator
@@ -198,6 +203,11 @@ cd smd_dgx_cmake
 cmake --preset x64-release
 cmake --build ../builds/x64-release
 ```
+
+`python tools/package_windows.py --build builds/x64-release --version <tag> --out <dir>`
+makes the two release archives, the standalone app and the IDA modules, from
+that build; `--previous <dir> --previous-version <tag>` lists every file added
+or removed since an earlier release.
 
 **Linux** — built, packaged and run on Ubuntu 24.04 under WSL2; see
 [Linux](#linux) below.

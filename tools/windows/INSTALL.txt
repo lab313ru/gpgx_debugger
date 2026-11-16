@@ -1,0 +1,166 @@
+SMD DGX — IDA modules
+=====================
+
+Sega Mega Drive / Genesis debugger for IDA, built on Genesis Plus GX.
+Windows x64, IDA 9.2+ (built and tested against 9.3).
+
+  @VERSION@ / @DATE@
+  https://github.com/lab313ru/gpgx_debugger  (branch debugging)
+
+
+INSTALL
+-------
+
+Close IDA first — it holds these files open while running.
+
+  plugins\smd_dgx_ida.dll        ->  <IDA>\plugins\
+  loaders\smd_dgx_ldr.dll        ->  <IDA>\loaders\
+  loaders\smd_dgx_z80_ldr.dll    ->  <IDA>\loaders\
+
+e.g. C:\Program Files\IDA Professional 9.3\plugins\
+
+Nothing else is needed. The emulator is linked into the plugin, and it uses
+the Qt that IDA has already loaded — do not copy any Qt DLLs next to it.
+
+
+USE
+---
+
+1. Open a Mega Drive ROM. The loader offers
+   "Sega Genesis/MegaDrive ROM (SMD DGX)" and builds the segments, header
+   fields and vector table.
+
+2. Debugger -> Select debugger -> SMD DGX, then F9 to start. The emulator
+   runs inside IDA and stops at the entry point.
+
+   Registers, Hex View and breakpoints (execute / read / write, on both CPUs)
+   all work through IDA's own windows. VDP memory appears as pseudo-segments:
+   $D00000 VRAM, $D10000 CRAM, $D20000 VSRAM.
+
+   Stepping: F7 into, F8 over, Ctrl+F7 until return (out of an interrupt
+   handler too), F4 to the cursor, and Debugger windows -> Stack trace.
+
+3. Debugger -> Debugger windows -> SMD ... for the emulator screen and the
+   VDP / memory / sound views. Debugger -> SMD layouts for ready-made
+   arrangements.
+
+4. Press J on an instruction to decode Mega Drive magic numbers into a
+   comment (VDP access modes, register writes, Z80 bus control, SR masks).
+
+
+ATTACHING TO AN EMULATOR THAT IS ALREADY RUNNING
+------------------------------------------------
+
+The same debugger can drive the standalone app or another IDA, so the game
+keeps its own window, sound and views while IDA comes and goes.
+
+- Debugger -> Attach to process... lists every running emulator by ROM file
+  name, with the port as its ID.
+- Or Debugger -> Process options -> Parameters, then F9: "attach",
+  "attach:27043" for a port, or "attach:sonic" for part of the name. A name
+  matching two emulators is refused. Clear the field to run inside IDA again.
+
+Attaching stops the game on its current instruction. Registers, memory,
+breakpoints, all the steps and the code map work as they do in-process.
+Detaching, or closing IDA, removes this database's breakpoints and lets the
+game run on. If the emulator goes away the session ends by itself; if IDA was
+stopped at the time, it ends on your next Stop, F7 or F9.
+
+Not available while attached: breakpoint conditions (a conditional breakpoint
+always stops), the SMD windows, layouts, save states and ROM patching. Use the
+standalone app's own windows for those.
+
+NOTE: verified by a script driving real IDA 9.3 on a real game, not by hand.
+
+
+DEBUGGING A Z80 SOUND DRIVER
+----------------------------
+
+An IDA database holds one processor module, so the game and its sound
+driver need two — sharing one emulator:
+
+1. In the 68000 database, start the game and let it reach sound init.
+2. Debugger -> SMD patches -> Dump Z80 driver...  writes the live 8 KB of
+   sound RAM. (The copy in the ROM is usually compressed or relocated, so
+   it is not what the Z80 actually executes.)
+3. Open that dump in a SECOND IDA. The Z80 loader offers
+   "Sega Mega Drive Z80 driver" and preselects the z80 processor.
+4. Debugger -> Select debugger -> SMD DGX Z80, then start. It attaches to
+   the emulator already running in the first IDA instead of launching one.
+
+Any stop — including a 68000 breakpoint in the other database — is
+reported here at the Z80's own PC. Detaching leaves the game running.
+
+NOTE: this chain is built and unit-tested at the protocol level but has
+never been driven by hand through IDA's UI. Expect rough edges.
+
+
+DRIVING IT FROM AN AGENT (optional)
+-----------------------------------
+
+mcp\smd_dgx_mcp.py is an MCP server over the emulator's control socket, so
+an agent works on the same session you have open.
+
+  pip install mcp
+  python smd_dgx_mcp.py          (stdio server, name "smd-dgx")
+
+The socket opens automatically when the debugger starts; the port is
+printed to IDA's Output window. Several emulators can run at once — each
+takes a free port from 27042 upward and identifies its game, so the
+list_sessions tool tells you which is which.
+
+
+SEVERAL IDAS AT ONCE (optional)
+-------------------------------
+
+If your agents also use ida-pro-mcp (the IDA analysis MCP by mrexodia),
+mcp\ida_hub\ makes several IDA instances usable at once:
+
+  python mcp\ida_hub\install.py
+
+installs two things into %APPDATA%\Hex-Rays\IDA Pro\plugins\:
+
+  - mcp_autostart.py — starts ida-pro-mcp's server the moment a database
+    opens, so nobody presses Ctrl-Alt-M per instance;
+  - a one-line fix to mcp-plugin.py (SO_REUSEADDR -> SO_EXCLUSIVEADDRUSE
+    on Windows). Without it every IDA binds the SAME port and reports
+    13337 while only one is reachable. If ida-pro-mcp is not installed,
+    the vendored, already-fixed copy (mcp\ida_hub\mcp-plugin.py, MIT) is
+    installed whole; it still needs `pip install ida-pro-mcp`.
+
+Then point your MCP client at the hub instead of the plugin:
+
+  python mcp\ida_hub\ida_hub.py    (stdio server, name "ida-hub")
+
+It scans ports 13337-13346, asks each IDA which file it has open, and
+forwards every plugin tool to the selected instance. Its own tools:
+list_ida_sessions, use_ida_session (by port, file name, or a unique
+substring — use_ida_session("sonic")), current_ida_session. With two IDAs
+and no selection it refuses rather than guessing.
+
+
+KNOWN ROUGH EDGES
+-----------------
+
+- Ctrl-Alt-S / Ctrl-Alt-P collide with IDA's own shortcuts; use the menu.
+- VDP-space breakpoints, breakpoint conditions, layout presets, save
+  states and ROM patching are implemented but have not been exercised by
+  hand.
+- Breakpoints on CRAM/VSRAM addresses may not fire (the address is not
+  masked the way the core masks it).
+
+Full status, including what is verified and what is not, is in README.md
+and smd_dgx_cmake/ARCHITECTURE.md in the repository.
+
+
+LICENCE
+-------
+
+Genesis Plus GX licence (non-commercial) — see LICENSE.txt in the repo.
+smd_dgx_z80_ldr is derived from smd_ida_tools2 and is GPL-2-or-later.
+mcp\ida_hub\mcp-plugin.py is ida-pro-mcp by Duncan Ogilvie (mrexodia),
+MIT — see LICENSE-ida-pro-mcp next to it.
+The IDA SDK is not redistributed here.
+
+Genesis Plus GX by Charles MacDonald and Eke-Eke.
+Gens debug tooling and IDA integration by DrMefistO (lab313ru).
