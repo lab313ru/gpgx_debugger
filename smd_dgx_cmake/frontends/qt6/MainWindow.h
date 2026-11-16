@@ -6,6 +6,8 @@
 #include <vector>
 #include <cstdint>
 
+#include "debugger/DebugState.h"
+
 class EmulatorScreen;
 class EmuHost;
 class AudioOutput;
@@ -37,12 +39,13 @@ public slots:
     void openRomFile(const QString& path);
 
 private slots:
-    void onPaused(uint32_t pc);
+    void onPaused(uint32_t pc, Cpu cpu);
     void onResumed();
     void debugPause();
     void debugResume();
     void debugStepInto();
     void debugStepOver();
+    void debugStepOut();
     void refreshViews();
 
 private:
@@ -61,6 +64,7 @@ private:
     AudioOutput*      audio_   = nullptr;
     BridgeServer*     bridge_  = nullptr;
     QTimer            refreshTimer_;
+    int               eventSink_ = -1;        // our registration on emuHost_
 
     VdpRamView*        vdpRamView_    = nullptr;
     VdpRegView*        vdpRegView_    = nullptr;
@@ -74,9 +78,11 @@ private:
     RamWatchView*      ramWatchView_  = nullptr;
 
     QLabel* statusLabel_ = nullptr;
+    QLabel* attachLabel_ = nullptr;           // how IDA reaches this session
 
     QAction* actPause_    = nullptr;
     QAction* actResume_   = nullptr;
     QAction* actStepInto_ = nullptr;
     QAction* actStepOver_ = nullptr;
+    QAction* actStepOut_  = nullptr;
 };
