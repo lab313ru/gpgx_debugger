@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include <unistd.h>
 #endif
+#include <string.h>
 
 #include "debug_wrap.h"
 
@@ -35,10 +36,17 @@ dbg_request_t* create_shared_mem()
         return NULL;
     }
 #else
-    request = shm_open(SHARED_MEM_NAME, O_CREAT | O_RDWR, 0777);
+    shm = shm_open(SHARED_MEM_NAME, O_CREAT | O_RDWR, 0777);
 
     if (shm == -1)
         return NULL;
+
+    /* A new object is empty: mapping it without a size faults on first touch. */
+    if (ftruncate(shm, sizeof(dbg_request_t)) != 0) {
+        close(shm);
+        shm_unlink(SHARED_MEM_NAME);
+        return NULL;
+    }
 
     request = mmap(NULL, sizeof(dbg_request_t), PROT_READ | PROT_WRITE, MAP_SHARED, shm, 0);
 

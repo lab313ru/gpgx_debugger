@@ -7,7 +7,7 @@
 #include <unistd.h>
 #endif
 
-#include "debug.h"
+#include "debug_core.h"
 
 #include "shared.h"
 

@@ -14,7 +14,7 @@
 #endif /* M68K_EMULATE_ADDRESS_ERROR */
 
 #include "m68k.h"
-#include "debug.h"
+#include "debug_core.h"
 
 
 /* ======================================================================== */
