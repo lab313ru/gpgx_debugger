@@ -49,5 +49,8 @@ function(gx_add_libchdr target GX_ROOT)
     $<$<AND:$<BOOL:${GX_ENABLE_CHD}>,$<PLATFORM_ID:Windows>>:HAVE_FSEEKO>
   )
 
-  target_compile_definitions(${target} PRIVATE INLINE=static inline)
+  target_compile_definitions(${target} PRIVATE "INLINE=static inline")   # quoted, see gx_core.cmake
+  # zstd picks its x86-64 assembly decoder on GCC/Clang, and that lives in a .S
+  # file not built here; the emulator's own makefiles disable it the same way.
+  target_compile_definitions(${target} PRIVATE ZSTD_DISABLE_ASM)
 endfunction()

@@ -42,7 +42,7 @@
 #include "shared.h"
 #include "hvc.h"
 
-#include "debug.h"
+#include "debug_core.h"
 /* Mark a pattern as modified */
 #define MARK_BG_DIRTY(addr)                         \
 {                                                   \

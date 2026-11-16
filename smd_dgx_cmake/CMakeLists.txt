@@ -21,6 +21,10 @@ project ("smd_dgx" LANGUAGES C CXX)
 
 set(GX_ROOT "${CMAKE_CURRENT_LIST_DIR}/..")
 
+# The static libraries below also end up inside the shared IDA modules, which
+# on ELF platforms cannot take non-PIC objects.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 include(cmake/gx_options.cmake)
 include(cmake/gx_core.cmake)
 include(cmake/gx_libchdr.cmake)
@@ -40,12 +44,18 @@ file(GLOB GX_ZLIB_SOURCES "${GX_ROOT}/core/cd_hw/libchdr/deps/zlib-1.3.1/*.c")
 add_library(gx_zlib STATIC ${GX_ZLIB_SOURCES})
 target_include_directories(gx_zlib PUBLIC "${GX_ROOT}/core/cd_hw/libchdr/deps/zlib-1.3.1")
 target_compile_definitions(gx_zlib PRIVATE _CRT_SECURE_NO_WARNINGS)
+if (NOT WIN32)
+  # gz*.c call read/write/lseek/close, which zconf.h declares through
+  # <unistd.h> only when told to; zlib's own configure step normally does.
+  target_compile_definitions(gx_zlib PUBLIC Z_HAVE_UNISTD_H)
+endif()
 add_library(ZLIB::ZLIB ALIAS gx_zlib)
 
 target_link_libraries(gx_core PRIVATE gx_zlib)
 
 if (GX_ENABLE_CHD)
   gx_add_libchdr(gx_libchdr "${GX_ROOT}")
+  target_link_libraries(gx_libchdr PRIVATE gx_zlib)   # inflate for CHD hunks
   target_link_libraries(gx_core PUBLIC gx_libchdr)
 endif()
 
@@ -82,6 +92,10 @@ add_library(frontend_common STATIC
 )
 target_include_directories(frontend_common PUBLIC "${GX_FRONTEND_CORE}")
 target_link_libraries(frontend_common PRIVATE gx_core gx_zlib)
+# ...and the core calls back into it (load_archive). A single-pass linker such
+# as GNU ld needs that edge to keep the frontend after the core; the two form a
+# cycle of static libraries, which CMake repeats on the link line.
+target_link_libraries(gx_core PRIVATE frontend_common)
 set_target_properties(frontend_common PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES)
 # std::filesystem may require explicit link on some toolchains (e.g. GCC with libstdc++)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_SIMULATE_ID STREQUAL ""))
@@ -105,6 +119,9 @@ add_library(smd_dgx_emu STATIC
 if (WIN32)
   target_link_libraries(smd_dgx_emu PUBLIC ws2_32)   # BridgeServer sockets
 endif()
+# std::thread in the host and the bridge, and in everything that links them.
+find_package(Threads REQUIRED)
+target_link_libraries(smd_dgx_emu PUBLIC Threads::Threads)
 target_include_directories(smd_dgx_emu PUBLIC "${CMAKE_CURRENT_LIST_DIR}")
 target_link_libraries(smd_dgx_emu PUBLIC gx_core frontend_common smd_dgx_disasm)
 set_target_properties(smd_dgx_emu PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES)
@@ -121,7 +138,11 @@ target_include_directories(gx_audio PUBLIC "${CMAKE_CURRENT_LIST_DIR}/platform")
 if (WIN32)
   target_link_libraries(gx_audio PRIVATE winmm)          # waveOut
 else()
-  target_link_libraries(gx_audio PRIVATE SDL2::SDL2)
+  # SDL headers only: the library is dlopen()ed at run time, because the IDA
+  # plugin links this too and IDA does not ship SDL.
+  target_include_directories(gx_audio PRIVATE
+    $<TARGET_PROPERTY:SDL2::SDL2,INTERFACE_INCLUDE_DIRECTORIES>)
+  target_link_libraries(gx_audio PRIVATE ${CMAKE_DL_LIBS})
 endif()
 set_target_properties(gx_audio PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES
                                           POSITION_INDEPENDENT_CODE ON)
@@ -156,7 +177,9 @@ find_package(Qt6 COMPONENTS Widgets Gui Core QUIET)
 if (Qt6_FOUND)
   set(GX_PLATFORM_QT6 "${CMAKE_CURRENT_LIST_DIR}/frontends/qt6")
 
-  add_library(gx_platform_qt6 STATIC "${GX_PLATFORM_QT6}/qt_input.c")
+  # OBJECT, not STATIC: it defines the input hook the core calls, and nothing
+  # in the app does, so a single-pass linker would never pull it from an archive.
+  add_library(gx_platform_qt6 OBJECT "${GX_PLATFORM_QT6}/qt_input.c")
   target_include_directories(gx_platform_qt6 PUBLIC "${GX_PLATFORM_QT6}" "${GX_FRONTEND_CORE}")
   target_link_libraries(gx_platform_qt6 PRIVATE gx_core frontend_common)
 

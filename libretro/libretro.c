@@ -48,7 +48,7 @@
 
 #include "gui.h"
 
-#include "debug.h"
+#include "debug_core.h"
 #include "debug_wrap.h"
 jmp_buf jmp_env;
 

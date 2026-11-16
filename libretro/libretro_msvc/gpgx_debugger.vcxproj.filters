@@ -693,7 +693,7 @@
     <ClInclude Include="..\..\core\shared.h">
       <Filter>core</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\core\debug\debug.h">
+    <ClInclude Include="..\..\core\debug\debug_core.h">
       <Filter>core\debug</Filter>
     </ClInclude>
     <ClInclude Include="..\..\gui\gui.h">

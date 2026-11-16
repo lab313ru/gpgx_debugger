@@ -117,6 +117,18 @@ inline bool connectWithin(socket_t fd, const sockaddr_in& addr, int ms)
     return ok;
 }
 
+// Wake a thread blocked in accept() or recv() on this socket, ahead of closing
+// it. Closing alone does that on Windows but not on Linux, where the blocked
+// call keeps its own reference to the socket and sleeps on.
+inline void wakeBlocked(socket_t fd)
+{
+#ifdef _WIN32
+    (void)fd;
+#else
+    ::shutdown(fd, SHUT_RDWR);
+#endif
+}
+
 // Send the whole buffer. Returns false if the peer went away.
 inline bool sendAll(socket_t fd, const char* data, size_t len)
 {

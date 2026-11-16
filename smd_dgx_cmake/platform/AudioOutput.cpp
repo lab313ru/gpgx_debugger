@@ -109,13 +109,13 @@ void AudioOutput::pause(bool p)
 }
 
 // ===========================================================================
-// Everywhere else: SDL2
+// Everywhere else: SDL2, loaded at run time
 //
-// SDL2 is already a hard dependency of this build and the SDL frontend already
-// opens a device at the same rate, so this adds no dependency — it only stops
-// Linux and macOS being silent, which is the first thing a user notices and
-// the least defensible gap in a project whose first requirement was to be
-// cross-platform.
+// The library is dlopen()ed rather than linked. The IDA plugin links this
+// file, and IDA does not ship SDL: a hard dependency would stop the plugin
+// loading at all on a machine without it. Without the library the hosts run
+// silently, exactly as when no device can be opened. Only the headers are
+// needed to build.
 //
 // SDL pulls from a callback on its own thread while the emulation thread
 // pushes, so the two meet in a ring buffer. write() drops the oldest audio
@@ -126,15 +126,85 @@ void AudioOutput::pause(bool p)
 #else
 
 #include <SDL.h>
+#include <dlfcn.h>
+#include <cstdio>
 #include <mutex>
+#include <string>
+#include <type_traits>
 
 namespace {
 // Four frames at 60 Hz. Enough to ride out scheduling jitter, short enough
 // that resuming from a breakpoint does not replay a stale half-second.
 constexpr int kRingFrames = 8192;
+
+// The SDL entry points this file uses. decltype keeps each pointer's type tied
+// to the header's declaration without referencing the symbol itself.
+struct SdlApi {
+    decltype(&SDL_WasInit)          WasInit          = nullptr;
+    decltype(&SDL_InitSubSystem)    InitSubSystem    = nullptr;
+    decltype(&SDL_QuitSubSystem)    QuitSubSystem    = nullptr;
+    decltype(&SDL_OpenAudioDevice)  OpenAudioDevice  = nullptr;
+    decltype(&SDL_PauseAudioDevice) PauseAudioDevice = nullptr;
+    decltype(&SDL_CloseAudioDevice) CloseAudioDevice = nullptr;
+    decltype(&SDL_SetHint)          SetHint          = nullptr;   // optional
+
+    bool ok() const
+    {
+        return WasInit && InitSubSystem && QuitSubSystem && OpenAudioDevice
+            && PauseAudioDevice && CloseAudioDevice;
+    }
+};
+
+// Loaded once and never unloaded: SDL keeps an audio thread alive until its
+// subsystem quits, and an unmapped library under a live thread is a crash.
+//
+// A failure is said once on stderr. Silence alone does not tell a missing SDL
+// from an SDL that is there but cannot load because a library it needs
+// (libgbm, libdrm, libwayland-client...) is not, and only the dynamic
+// linker's message names which.
+const SdlApi* loadSdl()
+{
+    static const SdlApi api = [] {
+        SdlApi a;
+        static const char* const names[] = {
+#ifdef __APPLE__
+            "libSDL2-2.0.0.dylib", "libSDL2.dylib",
+#else
+            "libSDL2-2.0.so.0", "libSDL2.so",
+#endif
+        };
+        void* lib = nullptr;
+        std::string why;                    // about the first name: the real one
+        for (const char* n : names) {
+            if ((lib = dlopen(n, RTLD_NOW | RTLD_LOCAL)) != nullptr) break;
+            if (why.empty())
+                if (const char* e = dlerror()) why = e;
+        }
+        if (!lib) {
+            std::fprintf(stderr, "smd_dgx: no sound, SDL2 did not load: %s\n", why.c_str());
+            return a;
+        }
+
+        auto bind = [lib](auto& fn, const char* sym) {
+            fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(dlsym(lib, sym));
+        };
+        bind(a.WasInit,          "SDL_WasInit");
+        bind(a.InitSubSystem,    "SDL_InitSubSystem");
+        bind(a.QuitSubSystem,    "SDL_QuitSubSystem");
+        bind(a.OpenAudioDevice,  "SDL_OpenAudioDevice");
+        bind(a.PauseAudioDevice, "SDL_PauseAudioDevice");
+        bind(a.CloseAudioDevice, "SDL_CloseAudioDevice");
+        bind(a.SetHint,          "SDL_SetHint");
+        if (!a.ok())
+            std::fprintf(stderr, "smd_dgx: no sound, %s lacks SDL2 audio functions\n", names[0]);
+        return a;
+    }();
+    return api.ok() ? &api : nullptr;
+}
 } // namespace
 
 struct AudioOutput::Impl {
+    const SdlApi* sdl = nullptr;   // null: no library, or audio disabled
     SDL_AudioDeviceID dev = 0;
     bool ownsSdl = false;
 
@@ -168,12 +238,31 @@ struct AudioOutput::Impl {
 
 AudioOutput::AudioOutput() : impl_(new Impl)
 {
+    // The library is loaded even for a silenced run: loading opens no device,
+    // and it keeps two things true when DGX_NO_AUDIO is set. A run still says
+    // on stderr why SDL would not load, and a package check, which runs
+    // silent, can see in the process's maps which libSDL2 was picked up.
+    const SdlApi* sdl = loadSdl();
+
+    // Same switch as the waveOut path: a scripted run stays off the mixer.
+    if (!sdl || std::getenv("DGX_NO_AUDIO") != nullptr)
+        return;
+
     // The host may already have initialised SDL for video; init the subsystem
     // we need and only quit the part we started.
-    if (SDL_WasInit(SDL_INIT_AUDIO) == 0) {
-        if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) return;
+    if (sdl->WasInit(SDL_INIT_AUDIO) == 0) {
+        // SDL2 brings the events subsystem up with audio, and that first init
+        // hooks SIGINT and SIGTERM wherever they were left at the default,
+        // turning them into an SDL_QUIT event. Nothing here reads events, so
+        // the standalone app would ignore kill and Ctrl+C for as long as the
+        // device is open, and the IDA plugin would rewire its host's signals.
+        // If the host already runs SDL events, its handlers are its own choice.
+        if (sdl->SetHint && sdl->WasInit(SDL_INIT_EVENTS) == 0)
+            sdl->SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+        if (sdl->InitSubSystem(SDL_INIT_AUDIO) != 0) return;
         impl_->ownsSdl = true;
     }
+    impl_->sdl = sdl;
 
     SDL_AudioSpec want{}, have{};
     want.freq     = kSampleRate;
@@ -183,14 +272,15 @@ AudioOutput::AudioOutput() : impl_(new Impl)
     want.callback = &Impl::feed;
     want.userdata = impl_.get();
 
-    impl_->dev = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
-    if (impl_->dev != 0) SDL_PauseAudioDevice(impl_->dev, 0);
+    impl_->dev = sdl->OpenAudioDevice(nullptr, 0, &want, &have, 0);
+    if (impl_->dev != 0) sdl->PauseAudioDevice(impl_->dev, 0);
 }
 
 AudioOutput::~AudioOutput()
 {
-    if (impl_->dev != 0) SDL_CloseAudioDevice(impl_->dev);
-    if (impl_->ownsSdl) SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    if (!impl_->sdl) return;
+    if (impl_->dev != 0) impl_->sdl->CloseAudioDevice(impl_->dev);
+    if (impl_->ownsSdl) impl_->sdl->QuitSubSystem(SDL_INIT_AUDIO);
 }
 
 bool AudioOutput::isOpen() const { return impl_->dev != 0; }
@@ -215,7 +305,7 @@ void AudioOutput::write(const int16_t* stereo, int frameCount)
 void AudioOutput::pause(bool p)
 {
     if (impl_->dev == 0) return;
-    SDL_PauseAudioDevice(impl_->dev, p ? 1 : 0);
+    impl_->sdl->PauseAudioDevice(impl_->dev, p ? 1 : 0);
     if (p) {                                          // drop what was queued
         std::lock_guard<std::mutex> lk(impl_->mx);
         impl_->head = impl_->tail = impl_->fill = 0;

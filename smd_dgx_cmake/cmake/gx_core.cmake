@@ -53,7 +53,9 @@ function(gx_add_core target GX_ROOT)
     $<$<BOOL:${DEBUG_68K}>:DEBUG_68K>
   )
 
-  target_compile_definitions(${target} PRIVATE INLINE=static inline)
+  # Quoted: unquoted, CMake splits it into INLINE=static and a bare -Dinline,
+  # which defines the keyword inline as 1.
+  target_compile_definitions(${target} PRIVATE "INLINE=static inline")
 
   target_include_directories(${target} PUBLIC ${GENPLUS_SRC_DIR})
   target_include_directories(${target} PRIVATE "${GX_ROOT}/core/sound/minimp3")

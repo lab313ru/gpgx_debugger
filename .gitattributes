@@ -1,0 +1,6 @@
+tools/*.sh text eol=lf
+# Files the Linux packaging copies into the packages as they are: a CR in
+# the .desktop file ends up inside Exec= and Icon=.
+tools/linux/*.desktop text eol=lf
+tools/linux/*.txt text eol=lf
+tools/linux/*.sha256 text eol=lf

@@ -30,6 +30,7 @@ set_target_properties(smd_dgx_ldr PROPERTIES
   PREFIX ""
   SUFFIX "${IDA_MODULE_SUFFIX}"
 )
+ida_module_exports(smd_dgx_ldr LDSC)
 
 if (IDA_INSTALL_DIR)
   add_custom_command(TARGET smd_dgx_ldr POST_BUILD
@@ -61,6 +62,7 @@ set_target_properties(smd_dgx_z80_ldr PROPERTIES
   PREFIX ""
   SUFFIX "${IDA_MODULE_SUFFIX}"
 )
+ida_module_exports(smd_dgx_z80_ldr LDSC)
 
 if (IDA_INSTALL_DIR)
   add_custom_command(TARGET smd_dgx_z80_ldr POST_BUILD

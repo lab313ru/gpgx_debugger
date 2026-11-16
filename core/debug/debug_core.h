@@ -1,6 +1,9 @@
 #ifndef _DEBUG_H_
 #define _DEBUG_H_
 
+/* Not "debug.h": core/ is on the include path of every C++ host, and
+   libstdc++ includes its own <debug/debug.h>, which would resolve here. */
+
 #ifdef __cplusplus
 extern "C" {
 #endif

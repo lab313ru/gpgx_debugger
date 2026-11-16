@@ -180,8 +180,8 @@ SDL2 is required on every platform. Qt6 is optional, but without it the
 debugger app is silently skipped. ImGui and OpenGL are optional. zlib is
 vendored and built in-tree.
 
-**Windows** — the only path that has actually been run. From an x64 Native
-Tools prompt:
+**Windows** — the platform everything is used on. From an x64 Native Tools
+prompt:
 
 ```
 cd smd_dgx_cmake
@@ -189,12 +189,10 @@ cmake --preset x64-release
 cmake --build ../builds/x64-release
 ```
 
-**Linux / macOS** — expected to work, never run:
+**Linux** — built, packaged and run on Ubuntu 24.04 under WSL2; see
+[Linux](#linux) below.
 
-```
-cmake -S smd_dgx_cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-```
+**macOS** — never configured.
 
 Set `VCPKG_ROOT` and the vcpkg toolchain is picked up automatically; leave it
 unset and dependencies resolve from the system.
@@ -220,6 +218,69 @@ failing the build.
 **Build the plugin in Release.** Nothing enforces it, but the SDK ships only
 release Qt import libraries and IDA is a release binary — a debug-CRT plugin
 sharing Qt objects with a release host is a crash waiting to happen.
+
+### Linux
+
+Built and run on Ubuntu 24.04 under WSL2 (GCC 13.3, Qt 6.4.2, CMake 3.28,
+Ninja). Build from a clone on the Linux file system: a checkout under `/mnt/c`
+or `/mnt/f` builds slowly, and a Windows checkout has CRLF line endings.
+
+```
+sudo apt install build-essential cmake ninja-build qt6-base-dev libsdl2-dev
+export IDA_SDK_DIR=<sdk>/src      # optional: the IDA modules
+cd smd_dgx_cmake
+cmake --preset linux-release
+cmake --build ../builds/linux-release
+```
+
+Sound goes through SDL2, loaded at run time: building needs only its headers,
+and without `libSDL2-2.0.so.0` the app runs silently. That is what lets the IDA
+plugin load in an IDA that ships no SDL.
+
+**Packages.** `tools/package_linux.sh`, run on Linux from a clone, configures
+and builds the `linux-release` preset, runs the tests and writes to
+`builds/linux-package/`:
+
+| File | What |
+|---|---|
+| `smd_dgx-linux-x86_64.AppImage` | the standalone app as one file |
+| `smd_dgx_standalone_linux_x86_64.tar.gz` | the same files unpacked, started by `AppRun`, for machines without FUSE |
+| `smd_dgx_ida_linux_x86_64.tar.gz` | `plugins/smd_dgx_ida.so`, `loaders/*.so` and `mcp/`, with an `INSTALL.txt` for `~/.idapro` |
+
+The IDA modules have **never been loaded into a real Linux IDA** — there was
+none to load them into. What was checked instead is under Status below.
+
+Qt, SDL2 and most of what they need travel inside the standalone packages.
+What they take from the system instead (the desktop's X11, OpenGL/EGL and font
+libraries, and for sound ALSA, libdrm, libgbm and libwayland-client) the script
+works out from the deployed files and writes into the package's `README.txt`,
+with the Debian/Ubuntu packages that provide it. `BUNDLED.txt` beside it names
+each bundled library's distribution package, version and source package, and
+the tools the package was made with. `LICENSE.txt` is in both packages and
+next to the AppImage.
+
+The script downloads nothing. linuxdeploy and its Qt plugin go into
+`~/.cache/smd_dgx/tools` (or `LINUXDEPLOY` and `LINUXDEPLOY_PLUGIN_QT` name
+them), and they must be the copies `tools/linux/linuxdeploy.sha256` pins: they
+decide which libraries go in, and the AppImage runtime is cut out of linuxdeploy
+itself, where appimagetool would download another. The pinned ones are GitHub
+"continuous" builds, which that page has since replaced or will; a new copy
+needs `SMD_DGX_ANY_LINUXDEPLOY=1` or a new pin.
+
+`tools/check_linux_package.sh <tarball | unpacked dir | AppImage> <rom>` starts
+a package on the current display, checks that it answers on the control socket,
+and fails if anything loads from the build tree, any Qt library from outside the
+package, or an SDL2 other than the bundled one. It writes what it saw to
+`check_<package>.log` next to the package. Under WSL with systemd,
+`/tmp/.X11-unix` can be empty while WSLg's socket is in `/mnt/wslg/.X11-unix`;
+Qt's xcb plugin then aborts before the app starts.
+
+**The floor: glibc 2.38 and GLIBCXX 3.4.31**, the highest versions any ELF file
+in either archive imports (`objdump -T`, undefined symbols only). Ubuntu
+24.04's headers turn `strtoul` and `sscanf` into glibc 2.38's `__isoc23_*`, and
+the Ubuntu libraries bundled with Qt need 2.38 too: the packages run on Ubuntu
+24.04 and newer, not on 22.04 (glibc 2.35) or Debian 12 (2.36). A lower floor
+means building the whole package on an older distribution, not only the app.
 
 ### Tests
 
@@ -249,14 +310,28 @@ writes, the code map and detach, against a running game; and on the 68000, attac
 and in-process, `F7`, `F8`, `Ctrl+F7`, `F4` and the Stack trace, pressed through
 IDA's own actions, with the trace checked against the machine's stack memory.
 
+**Verified on Linux by a scripted run (Ubuntu 24.04 under WSL2):** the whole
+test suite, and the standalone app loading a game in WSLg and answering the
+bridge's `ping`, `status`, `pause` and `frame`. Both standalone packages pass
+`tools/check_linux_package.sh` away from the build tree and with an empty
+`LD_LIBRARY_PATH` — the tarball unpacked into a fresh directory, the AppImage
+with `APPIMAGE_EXTRACT_AND_RUN=1`: each ran a game in WSLg and drew it over the
+bridge, and `ldd` and the running app's memory map showed Qt and SDL2 loaded
+from the package and nothing from the build tree. The check keeps that, with
+the package's sha256, in `check_<package>.log` beside the package. Every run
+was silent (`DGX_NO_AUDIO=1`): SDL2 was loaded but no device opened, so no
+sound has been heard from a Linux build. No other distribution or desktop has
+run the packages; the glibc 2.38 floor is measured, not tried.
+
 **Built but never driven by hand:**
 
 - The Z80 chain end to end through IDA's own interface, including its steps. The
   bridge-level behaviour is tested; the IDA UI path is not.
-- Any build on Linux or macOS. The reasons it definitely failed there are gone
-  — real audio, portable sockets, per-platform IDA module suffixes — but
-  nothing has ever been configured there. On Linux the IDA plugin additionally
-  needs its static dependencies rebuilt as position-independent code.
+- The IDA modules on Linux. They build, export only `PLUGIN` or `LDSC`, and
+  every import resolves against the SDK's `libida.so` and the C/C++ runtime —
+  except Qt, which binds to IDA's own namespaced Qt at load time and was checked
+  only by name. There was no Linux IDA to load them into.
+- Any build on macOS.
 - In IDA: VDP-space breakpoints, breakpoint conditions, layout presets, save
   states, ROM patching, the `J` decoder, A/F-line decoding.
 

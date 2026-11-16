@@ -264,7 +264,7 @@
     <ClInclude Include="..\..\core\cd_hw\pcm.h" />
     <ClInclude Include="..\..\core\cd_hw\scd.h" />
     <ClInclude Include="..\..\core\debug\cpuhook.h" />
-    <ClInclude Include="..\..\core\debug\debug.h" />
+    <ClInclude Include="..\..\core\debug\debug_core.h" />
     <ClInclude Include="..\..\core\debug\debug_wrap.h" />
     <ClInclude Include="..\..\core\genesis.h" />
     <ClInclude Include="..\..\core\input_hw\activator.h" />
