@@ -939,15 +939,21 @@ std::string BridgeServer::handle(const std::string& line, Client& client)
         // side turns it into a PNG so this stays dependency-free. Borders,
         // the NTSC filter and double-field interlace change w and h; the
         // pixels are stored as drawn, not stretched to the TV shape.
+        //   ok <w> <h> <ax> <ay> <aw> <ah> <vw> <vh> <base64>
+        // The game's display, vw x vh VDP pixels, fills the aw x ah area at
+        // (ax, ay): VDP pixel (x, y) lands at (ax + x*aw/vw, ay + y*ah/vh).
         const VdpState v = be->getVdpState();
         (void)v;
-        int w = 0, h = 0;
+        coreopt::Picture pic;
         std::vector<uint8_t> rgb;
-        if (!host_->invoke([&] { host_->copyPicture(rgb, w, h); }))
+        if (!host_->invoke([&] { pic = host_->copyPicture(rgb); }))
             return "err emulator not running";
         if (rgb.empty()) return "err no frame";
         std::ostringstream o;
-        o << "ok " << w << " " << h << " " << base64(rgb.data(), rgb.size());
+        o << "ok " << pic.width << " " << pic.height << " "
+          << pic.areaX << " " << pic.areaY << " " << pic.areaW << " " << pic.areaH << " "
+          << pic.displayW << " " << pic.displayH << " "
+          << base64(rgb.data(), rgb.size());
         return o.str();
     }
 

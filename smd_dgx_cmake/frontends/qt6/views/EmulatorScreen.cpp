@@ -123,7 +123,8 @@ void EmulatorScreen::paintEvent(QPaintEvent*)
 }
 
 // Where the frame lands inside the widget. The aspect it keeps is the one the
-// frame came with — the TV's — or square pixels when it came with none.
+// frame came with — square pixels or the TV's — or square pixels when it came
+// with none.
 //   integer scale : the largest picture, centred, in which every emulated line
 //                   is N rows and every pixel M columns, both whole numbers, so
 //                   nothing is resampled. M is the one that comes closest to
@@ -142,8 +143,9 @@ QRectF EmulatorScreen::targetRect() const
     };
 
     if (integerScale_) {
-        // A pixel's width over its height: about 0.9 for a plain H40 frame,
-        // 0.46 for the NTSC filter's doubled lines, 1.8 for a double field.
+        // A pixel's width over its height: 1 for square pixels; at the TV's
+        // aspect about 0.9 for a plain H40 frame, 0.46 for the NTSC filter's
+        // doubled lines, 1.8 for a double field.
         const double pixelAspect = aspect * sh / sw;
         for (int n = int(height() / sh); n >= 1; --n) {
             const int m = qMax(1, qRound(n * pixelAspect));
@@ -153,6 +155,13 @@ QRectF EmulatorScreen::targetRect() const
             if (std::abs(m / (n * pixelAspect) - 1.0) > 0.15) continue;
             if (sw * m <= width()) return centred(sw * m, sh * n);
         }
+        // No whole-number shape near the aspect fits: PAL H32 has 1.39-wide
+        // pixels, so 1x is 28% off, and 2x needs two frames of height. Square
+        // pixels still beat resampling unless they are far off — a 1x
+        // NTSC-filtered frame is twice too wide.
+        const int n = qMin(int(width() / sw), int(height() / sh));
+        if (n >= 1 && std::abs(1.0 / pixelAspect - 1.0) <= 0.35)
+            return centred(sw * n, sh * n);
         // too small for 1x — fall through to a fitted, aspect-correct image
     }
 

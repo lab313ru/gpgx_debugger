@@ -5,6 +5,7 @@
 #include "CoreOptions.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -161,6 +162,10 @@ void applyAtLoad(const CoreOptions& o)
     setNtsc(o.ntscFilter);
     config.lcd    = lcdFactor(o.lcdGhosting);
     config.render = (uint8)o.doubleField;
+
+    // vdp_reset picks the background renderer by this one.
+    config.enhanced_vscroll       = (uint8)o.enhancedVscroll;
+    config.enhanced_vscroll_limit = (uint8)o.enhancedVscrollLimit;
 }
 
 bool applyLive(const CoreOptions& from, const CoreOptions& to)
@@ -225,6 +230,16 @@ bool applyLive(const CoreOptions& from, const CoreOptions& to)
         viewport = true;
     }
 
+    if (from.enhancedVscrollLimit != to.enhancedVscrollLimit)
+        config.enhanced_vscroll_limit = (uint8)to.enhancedVscrollLimit;
+    if (from.enhancedVscroll != to.enhancedVscroll) {
+        config.enhanced_vscroll = (uint8)to.enhancedVscroll;
+        // The VDP picks its renderer only when register 11 or the mode is
+        // written; libretro waits for that. Swapped here, it shows at once.
+        if (render_bg == render_bg_m5_vs || render_bg == render_bg_m5_vs_enhanced)
+            render_bg = config.enhanced_vscroll ? render_bg_m5_vs_enhanced : render_bg_m5_vs;
+    }
+
     if (viewport && system_hw) refreshViewport();
     return reinit;
 }
@@ -270,6 +285,25 @@ void softReset()
     gen_reset(0);
 }
 
+int runningFmCore()
+{
+    switch (config.ym3438) {
+    case 1: return FmNukedYm2612;
+    case 2: return FmNukedYm3438;
+    }
+    switch (config.ym2612) {
+    case YM2612_INTEGRATED: return FmMameAsicYm3438;
+    case YM2612_ENHANCED:   return FmMameEnhancedYm3438;
+    default:                return FmMameYm2612;
+    }
+}
+
+double frameRate()
+{
+    if (system_clock == 0 || lines_per_frame == 0) return vdp_pal ? 50.0 : 60.0;
+    return double(system_clock) / (double(lines_per_frame) * MCYCLES_PER_LINE);
+}
+
 Picture picture(const CoreOptions& o)
 {
     // remap_line draws every line from x = 0, border included, and puts the
@@ -279,11 +313,14 @@ Picture picture(const CoreOptions& o)
     Picture p;
     if (w <= 0 || h <= 0) return p;
 
-    // calculate_display_aspect_ratio, from the picture before the filter and
-    // the second field change its size. The sample rates cut a line into
+    // The shape is taken from the picture before the filter and the second
+    // field change its size. Square pixels are the console's own; the TV's is
+    // calculate_display_aspect_ratio, where the sample rates cut a line into
     // square pixels of a 480- or 576-line frame, and one console line is a
     // field line, two frame lines tall.
-    if (o.aspect == AspectAuto && (system_hw == SYSTEM_GG || system_hw == SYSTEM_GGMS)
+    if (o.aspect == AspectSquare) {
+        p.aspect = double(w) / h;
+    } else if (o.aspect == AspectAuto && (system_hw == SYSTEM_GG || system_hw == SYSTEM_GGMS)
         && config.overscan == 0 && config.gg_extra == 0) {
         p.aspect = (6.0 / 5.0) * w / h;
     } else {
@@ -299,8 +336,20 @@ Picture picture(const CoreOptions& o)
     // The same choice of filter remap_line makes for the line.
     p.width  = !config.ntsc ? w : (reg[12] & 1) ? MD_NTSC_OUT_WIDTH(w) : SMS_NTSC_OUT_WIDTH(w);
     p.height = (config.render && interlaced) ? h * 2 : h;
+
+    const double sx = double(p.width) / w;
+    const int    sy = p.height / h;
+    p.areaX = (int)std::lround(bitmap.viewport.x * sx);
+    p.areaW = (int)std::lround(bitmap.viewport.w * sx);
+    p.areaY = bitmap.viewport.y * sy;
+    p.areaH = bitmap.viewport.h * sy;
+    p.displayW = bitmap.viewport.w;
+    p.displayH = bitmap.viewport.h;
+
     p.width  = std::min(p.width, (int)bitmap.width);
     p.height = std::min(p.height, (int)bitmap.height);
+    p.areaW  = std::min(p.areaW, p.width - p.areaX);
+    p.areaH  = std::min(p.areaH, p.height - p.areaY);
     return p;
 }
 

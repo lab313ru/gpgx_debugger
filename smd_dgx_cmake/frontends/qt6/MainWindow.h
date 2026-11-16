@@ -4,6 +4,7 @@
 #include <QString>
 #include <QTimer>
 #include <vector>
+#include <utility>
 #include <cstdint>
 
 #include "debugger/DebugState.h"
@@ -25,6 +26,7 @@ class MemoryView;
 class RamSearchView;
 class RamWatchView;
 class QToolButton;
+class QActionGroup;
 
 class MainWindow : public QMainWindow
 {
@@ -53,6 +55,7 @@ private slots:
     void resetHard();
     void reloadRom();
     void updateApplyHint();
+    void watchHost();
 
 private:
     void buildMenus();
@@ -61,7 +64,8 @@ private:
     void buildOptionsMenu();
     void setCoreOption(const coreopt::OptionDef& def, int stored);
     void saveCoreOptions();
-    void reportQueued(const QString& what);
+    void adoptHostOptions();
+    void reportQueued(const QString& what, bool wasPaused);
 
     // The host owns the backend, and there must be exactly one: the CPU hook is
     // a single global that the most recently constructed GpgxBackend claims, so
@@ -104,4 +108,6 @@ private:
     QAction*     actReload_    = nullptr;
     QLabel*      applyLabel_   = nullptr;   // options waiting for a reset or reload
     QToolButton* applyButton_  = nullptr;   // ... and the one click that applies them
+    // Each option's menu, to check the choice the host switched to itself.
+    std::vector<std::pair<const coreopt::OptionDef*, QActionGroup*>> optionGroups_;
 };

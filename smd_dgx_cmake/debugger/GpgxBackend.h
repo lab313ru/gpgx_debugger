@@ -63,9 +63,17 @@ public:
     // own settings reach the load and are not wiped by it.
     void setBeforeLoad(std::function<void()> fn) { beforeLoad_ = std::move(fn); }
 
+    // Runs after loadState() has restored a state, on the thread that loaded
+    // it: a state can bring back core settings of its own.
+    void setAfterStateLoad(std::function<void()> fn) { afterStateLoad_ = std::move(fn); }
+
     // The console was reset underneath the backend: the call stacks describe
     // a run that no longer exists.
     void onSystemReset();
+
+    // While held, nothing parks the emulation thread: breakpoints and steps
+    // pass through. For a request that must reach the end of the frame.
+    void holdStops(bool on) { held_.store(on); }
 
     void onCpuHook(int type, int width, uint32_t addr, uint32_t value);
 
@@ -112,12 +120,14 @@ private:
     ResumeCb resumeCb_;
     std::function<void()> pausePump_;
     std::function<void()> beforeLoad_;
+    std::function<void()> afterStateLoad_;
     SafeExec safeExec_;
 
     std::string       romFile_;            // set before running_ goes true
     std::atomic<bool> running_  {false};
     std::atomic<bool> paused_   {false};
     std::atomic<bool> abandoned_{false};   // shutting down: never park again
+    std::atomic<bool> held_     {false};   // holdStops()
     std::atomic<int>  lastBpId_ {-1};      // reason for the current stop
     std::atomic<bool> stepInto_ {false};
     std::atomic<int>  stepOverAddr_ {-1};

@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <chrono>
 #include <map>
+#include <sstream>
 #include <thread>
 
 using namespace synth;
@@ -778,4 +779,43 @@ TEST(bridge_rejects_absurd_sizes_instead_of_allocating)
     CHECK(huge.empty());
     const auto zero = w.remote.readMemory(0, 0);
     CHECK(zero.empty());
+}
+
+// The picture can be wider and taller than the game's display: with borders
+// on, VDP pixel (0, 0) is not image pixel (0, 0). The frame reply says where
+// the display lies, and its size in VDP pixels.
+TEST(bridge_frame_reports_the_display_area)
+{
+    Wired w(25);
+    REQUIRE(w.ok);
+    Raw raw;
+    REQUIRE(raw.connect(portFor(25)));
+
+    // ok w h ax ay aw ah vw vh base64: the numbers, or nothing.
+    auto numbers = [](const std::string& reply) {
+        std::istringstream is(reply);
+        std::string ok, b64;
+        std::vector<int> n(8);
+        is >> ok;
+        for (int& v : n) is >> v;
+        is >> b64;
+        return ok == "ok" && is && !b64.empty() ? n : std::vector<int>{};
+    };
+
+    std::vector<int> f = numbers(raw.cmd("frame"));
+    REQUIRE(f.size() == 8);
+    CHECK(f[2] == 0 && f[3] == 0 && f[4] == f[0] && f[5] == f[1]);
+    CHECK(f[6] == f[0] && f[7] == f[1]);
+
+    coreopt::CoreOptions o;
+    o.overscan = coreopt::OverscanFull;
+    w.emu.host()->setCoreOptions(o);
+    REQUIRE(raw.cmd("stepframe 2").rfind("ok", 0) == 0);
+    f = numbers(raw.cmd("frame"));
+    REQUIRE(f.size() == 8);
+    CHECK_EQ(f[2], 14);
+    CHECK(f[3] > 0);
+    CHECK_EQ(f[0], f[4] + 2 * f[2]);
+    CHECK_EQ(f[1], f[5] + 2 * f[3]);
+    CHECK(f[4] == f[6] && f[5] == f[7]);
 }

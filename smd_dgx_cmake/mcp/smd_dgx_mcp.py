@@ -576,13 +576,23 @@ def set_buttons(buttons: list[str]) -> str:
     return f"pad = {sorted(b.lower() for b in buttons) or 'released'}"
 
 
-@mcp.tool()
-def screenshot() -> Image:
-    """Capture what is on screen right now, as a PNG."""
+@mcp.tool(structured_output=False)
+def screenshot() -> list[Image | str]:
+    """Capture what is on screen right now, as a PNG.
+
+    One image pixel is one VDP pixel unless the Borders, Blargg NTSC Filter or
+    Interlaced Mode 2 Output options are on in the standalone app. Then a
+    line of text follows the image saying where the game's display lies in
+    it; map VDP coordinates through that, not straight onto the image.
+    """
     reply = bridge.command("frame")
-    w_s, h_s, b64 = reply.split(" ", 2)
-    w, h = int(w_s), int(h_s)
-    return Image(data=_png(base64.b64decode(b64), w, h), format="png")
+    *nums, b64 = reply.split(" ", 8)
+    w, h, ax, ay, aw, ah, vw, vh = (int(n) for n in nums)
+    out: list[Image | str] = [Image(data=_png(base64.b64decode(b64), w, h), format="png")]
+    if (ax, ay, aw, ah) != (0, 0, w, h) or (aw, ah) != (vw, vh):
+        out.append(f"image {w}x{h}: the game's {vw}x{vh} display fills the {aw}x{ah} area "
+                   f"at ({ax},{ay}); VDP pixel (x,y) is at ({ax} + x*{aw}/{vw}, {ay} + y*{ah}/{vh})")
+    return out
 
 
 # ---------------------------------------------------------------------------

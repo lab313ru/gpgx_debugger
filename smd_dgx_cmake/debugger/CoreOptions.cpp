@@ -18,13 +18,13 @@ namespace coreopt {
 
 namespace {
 
-// Every numeric option is a percentage.
-std::vector<Choice> percents(int from, int to, int step)
+// A numeric range, each value labelled with its unit.
+std::vector<Choice> range(int from, int to, int step, const char* unit)
 {
     std::vector<Choice> v;
     for (int n = from; n <= to; n += step) {
         const std::string s = std::to_string(n);
-        v.push_back({ s, s + "%", n });
+        v.push_back({ s, s + unit, n });
     }
     return v;
 }
@@ -34,64 +34,45 @@ std::vector<Choice> onOff()
     return { { "disabled", "Disabled", 0 }, { "enabled", "Enabled", 1 } };
 }
 
+// Labels and order are libretro_core_options.h's, so the menu reads like the
+// list a RetroArch user knows. The exceptions are noted where they are.
 std::vector<OptionDef> buildTable()
 {
     using C = Category;
     using A = Apply;
     return {
         // ---- System ----
-        { "genesis_plus_gx_system_hw", "Hardware", C::System, A::Reload, &CoreOptions::hardware, {
+        { "genesis_plus_gx_system_hw", "System Hardware", C::System, A::Reload, &CoreOptions::hardware, {
             { "auto",                 "Auto",               HardwareAuto },
             { "mega drive / genesis", "Mega Drive/Genesis", HardwareMegaDrive } } },
-        { "genesis_plus_gx_region_detect", "Region", C::System, A::Live, &CoreOptions::region, {
+        { "genesis_plus_gx_region_detect", "System Region", C::System, A::Live, &CoreOptions::region, {
             { "auto",      "Auto",           RegionAuto },
             { "ntsc-u",    "USA (NTSC-U)",   RegionUsa },
             { "pal",       "Europe (PAL)",   RegionEurope },
             { "ntsc-j",    "Japan (NTSC-J)", RegionJapanNtsc },
             // Not a libretro value: the core has the region, libretro does not offer it.
             { "japan pal", "Japan (PAL)",    RegionJapanPal } } },
-        { "genesis_plus_gx_vdp_mode", "VDP Mode", C::System, A::Live, &CoreOptions::vdpMode, {
-            { "auto",  "Auto",        VdpModeAuto },
+        { "genesis_plus_gx_vdp_mode", "Force VDP Mode", C::System, A::Live, &CoreOptions::vdpMode, {
+            { "auto",  "Disabled",    VdpModeAuto },
             { "60hz",  "NTSC (60Hz)", VdpMode60Hz },
             { "50hz",  "PAL (50Hz)",  VdpMode50Hz } } },
-        // Values are libretro's, the meaning is the Wii GUI's: see CoreOptions::lockups.
-        { "genesis_plus_gx_force_dtack", "System Lockups", C::System, A::Live, &CoreOptions::lockups, onOff() },
-        { "genesis_plus_gx_addr_error", "68K Address Error", C::System, A::Live, &CoreOptions::addrError, onOff() },
-        { "genesis_plus_gx_bios", "System Bootrom", C::System, A::Reset, &CoreOptions::bootRom, onOff() },
+        { "genesis_plus_gx_bios", "System Boot ROM", C::System, A::Reset, &CoreOptions::bootRom, onOff() },
         { "genesis_plus_gx_lock_on", "Cartridge Lock-On", C::System, A::Reset, &CoreOptions::lockOn, {
             { "disabled",            "Disabled",            LockOnOff },
             { "game genie",          "Game Genie",          LockOnGameGenie },
             { "action replay (pro)", "Action Replay (Pro)", LockOnActionReplay },
             { "sonic & knuckles",    "Sonic & Knuckles",    LockOnSonicKnuckles } } },
 
-        // ---- Audio ----
-        { "genesis_plus_gx_ym2612", "YM2612 Core", C::Audio, A::Live, &CoreOptions::fmCore, {
-            { "mame (ym2612)",          "MAME (YM2612)",          FmMameYm2612 },
-            { "mame (asic ym3438)",     "MAME (ASIC YM3438)",     FmMameAsicYm3438 },
-            { "mame (enhanced ym3438)", "MAME (Enhanced YM3438)", FmMameEnhancedYm3438 },
-            { "nuked (ym2612)",         "Nuked (YM2612)",         FmNukedYm2612 },
-            { "nuked (ym3438)",         "Nuked (YM3438)",         FmNukedYm3438 } } },
-        { "genesis_plus_gx_sound_output", "Audio Output", C::Audio, A::Live, &CoreOptions::mono, {
-            { "stereo", "Stereo", 0 },
-            { "mono",   "Mono",   1 } } },
-        { "genesis_plus_gx_audio_filter", "Audio Filter", C::Audio, A::Live, &CoreOptions::filter, {
-            { "disabled", "Disabled", FilterOff },
-            { "low-pass", "Low-Pass", FilterLowPass },
-            { "EQ",       "3-Band EQ", FilterEq } } },
-        { "genesis_plus_gx_lowpass_range", "Low-Pass Range", C::Audio, A::Live, &CoreOptions::lowPassRange,
-            percents(5, 95, 5), { 20, 40, 60, 80 } },
-        { "genesis_plus_gx_psg_preamp", "PSG Preamp", C::Audio, A::Live, &CoreOptions::psgPreamp,
-            percents(0, 200, 5), { 0, 50, 100, 150, 200 } },
-        { "genesis_plus_gx_fm_preamp", "FM Preamp", C::Audio, A::Live, &CoreOptions::fmPreamp,
-            percents(0, 200, 5), { 0, 50, 100, 150, 200 } },
-        { "genesis_plus_gx_audio_eq_low", "EQ Low", C::Audio, A::Live, &CoreOptions::eqLow,
-            percents(0, 100, 5), { 0, 25, 50, 75, 100 } },
-        { "genesis_plus_gx_audio_eq_mid", "EQ Mid", C::Audio, A::Live, &CoreOptions::eqMid,
-            percents(0, 100, 5), { 0, 25, 50, 75, 100 } },
-        { "genesis_plus_gx_audio_eq_high", "EQ High", C::Audio, A::Live, &CoreOptions::eqHigh,
-            percents(0, 100, 5), { 0, 25, 50, 75, 100 } },
-
         // ---- Video ----
+        // "Core-Provided Aspect Ratio" there: RetroArch may ignore it. Here it
+        // is the shape the screen shows.
+        { "genesis_plus_gx_aspect_ratio", "Aspect Ratio", C::Video, A::Live, &CoreOptions::aspect, {
+            { "auto",     "Auto",          AspectAuto },
+            { "NTSC PAR", "NTSC PAR",      AspectNtscPar },
+            { "PAL PAR",  "PAL PAR",       AspectPalPar },
+            // Not a libretro value: RetroArch shows square pixels through its
+            // own aspect setting, and this screen has no other.
+            { "square",   "Square Pixels", AspectSquare } } },
         { "genesis_plus_gx_overscan", "Borders", C::Video, A::Live, &CoreOptions::overscan, {
             { "disabled",   "Disabled",   OverscanOff },
             { "top/bottom", "Top/Bottom", OverscanTopBottom },
@@ -107,10 +88,42 @@ std::vector<OptionDef> buildTable()
         { "genesis_plus_gx_render", "Interlaced Mode 2 Output", C::Video, A::Live, &CoreOptions::doubleField, {
             { "single field", "Single Field", 0 },
             { "double field", "Double Field", 1 } } },
-        { "genesis_plus_gx_aspect_ratio", "Aspect Ratio", C::Video, A::Live, &CoreOptions::aspect, {
-            { "auto",     "Auto",     AspectAuto },
-            { "NTSC PAR", "NTSC PAR", AspectNtscPar },
-            { "PAL PAR",  "PAL PAR",  AspectPalPar } } },
+
+        // ---- Audio ----
+        { "genesis_plus_gx_ym2612", "Mega Drive / Genesis FM", C::Audio, A::Live, &CoreOptions::fmCore, {
+            { "mame (ym2612)",          "MAME (YM2612)",          FmMameYm2612 },
+            { "mame (asic ym3438)",     "MAME (ASIC YM3438)",     FmMameAsicYm3438 },
+            { "mame (enhanced ym3438)", "MAME (Enhanced YM3438)", FmMameEnhancedYm3438 },
+            { "nuked (ym2612)",         "Nuked (YM2612)",         FmNukedYm2612 },
+            { "nuked (ym3438)",         "Nuked (YM3438)",         FmNukedYm3438 } } },
+        { "genesis_plus_gx_sound_output", "Sound Output", C::Audio, A::Live, &CoreOptions::mono, {
+            { "stereo", "Stereo", 0 },
+            { "mono",   "Mono",   1 } } },
+        { "genesis_plus_gx_audio_filter", "Audio Filter", C::Audio, A::Live, &CoreOptions::filter, {
+            { "disabled", "Disabled", FilterOff },
+            { "low-pass", "Low-Pass", FilterLowPass },
+            { "EQ",       "EQ",       FilterEq } } },
+        { "genesis_plus_gx_lowpass_range", "Low-Pass Filter %", C::Audio, A::Live, &CoreOptions::lowPassRange,
+            range(5, 95, 5, "%") },
+        { "genesis_plus_gx_psg_preamp", "PSG Preamp Level", C::Audio, A::Live, &CoreOptions::psgPreamp,
+            range(0, 200, 5, "%") },
+        { "genesis_plus_gx_fm_preamp", "FM Preamp Level", C::Audio, A::Live, &CoreOptions::fmPreamp,
+            range(0, 200, 5, "%") },
+        { "genesis_plus_gx_audio_eq_low", "EQ Low", C::Audio, A::Live, &CoreOptions::eqLow,
+            range(0, 100, 5, "%") },
+        { "genesis_plus_gx_audio_eq_mid", "EQ Mid", C::Audio, A::Live, &CoreOptions::eqMid,
+            range(0, 100, 5, "%") },
+        { "genesis_plus_gx_audio_eq_high", "EQ High", C::Audio, A::Live, &CoreOptions::eqHigh,
+            range(0, 100, 5, "%") },
+
+        // ---- Emulation Hacks ----
+        { "genesis_plus_gx_enhanced_vscroll", "Enhanced per-tile vertical scroll", C::Hacks, A::Live,
+            &CoreOptions::enhancedVscroll, onOff() },
+        { "genesis_plus_gx_enhanced_vscroll_limit", "Enhanced per-tile vertical scroll limit", C::Hacks, A::Live,
+            &CoreOptions::enhancedVscrollLimit, range(2, 16, 1, "") },
+        // Values are libretro's, the meaning is the Wii GUI's: see CoreOptions::lockups.
+        { "genesis_plus_gx_force_dtack", "System Lock-Ups", C::Hacks, A::Live, &CoreOptions::lockups, onOff() },
+        { "genesis_plus_gx_addr_error", "68K Address Error", C::Hacks, A::Live, &CoreOptions::addrError, onOff() },
     };
 }
 

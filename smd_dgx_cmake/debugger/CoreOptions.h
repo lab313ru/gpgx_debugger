@@ -12,7 +12,8 @@
 //
 // Defaults are this program's behaviour before the options existed — what
 // set_config_defaults() gives the core — not libretro's defaults where the two
-// differ: the audio filter is low-pass here and off there.
+// differ: the audio filter is low-pass here and off there, and the screen
+// shows square pixels here where libretro asks for the TV's shape.
 //
 // This header has no core dependency, so a UI can build its menus from it.
 // The core-side functions at the bottom touch emulator globals and must run on
@@ -30,7 +31,9 @@ enum class Apply {
     Reload,   // read while the ROM is loaded: takes loading it again
 };
 
-enum class Category { System, Audio, Video };
+// libretro's categories in libretro's order. Its Input category has nothing
+// this build offers, so a menu adds it on its own.
+enum class Category { System, Video, Audio, Hacks };
 
 // Each enum's value is the option's index in its value list. Where a core
 // field exists with the same numbering, the comment names it.
@@ -42,7 +45,7 @@ enum FmCore      { FmMameYm2612, FmMameAsicYm3438, FmMameEnhancedYm3438, FmNuked
 enum AudioFilter { FilterOff, FilterLowPass, FilterEq };                                     // config.filter
 enum Overscan    { OverscanOff, OverscanTopBottom, OverscanLeftRight, OverscanFull };        // config.overscan
 enum NtscFilter  { NtscOff, NtscMonochrome, NtscComposite, NtscSVideo, NtscRgb };
-enum AspectRatio { AspectAuto, AspectNtscPar, AspectPalPar };
+enum AspectRatio { AspectAuto, AspectNtscPar, AspectPalPar, AspectSquare };
 
 // Every field is an int so one table (options()) can read and write any of
 // them through a member pointer. Switches are 0/1.
@@ -50,15 +53,19 @@ struct CoreOptions {
     // System
     int region    = RegionAuto;
     int vdpMode   = VdpModeAuto;
+    int bootRom   = 0;           // TMSS, with bios_MD.bin when it can be found
+    int lockOn    = LockOnOff;
+    int hardware  = HardwareAuto;
+
+    // Emulation hacks
     // In the Wii GUI's sense: 1 = the console locks up on an access real
     // hardware never acknowledges, i.e. config.force_dtack == 0. libretro's
     // "System Lock-Ups: enabled" sets force_dtack = 1, which turns them OFF;
     // the key is libretro's, the meaning is not.
     int lockups   = 1;
     int addrError = 1;
-    int bootRom   = 0;           // TMSS, with bios_MD.bin when it can be found
-    int lockOn    = LockOnOff;
-    int hardware  = HardwareAuto;
+    int enhancedVscroll      = 0;
+    int enhancedVscrollLimit = 8;   // pixels
 
     // Audio
     int fmCore       = FmMameYm2612;
@@ -76,7 +83,7 @@ struct CoreOptions {
     int ntscFilter  = NtscOff;
     int lcdGhosting = 0;
     int doubleField = 0;         // interlaced mode 2: 0 single field, 1 double field
-    int aspect      = AspectAuto;   // the front end's business: no core field
+    int aspect      = AspectSquare;   // the front end's business: no core field
 
     bool operator==(const CoreOptions&) const = default;
 };
@@ -94,9 +101,6 @@ struct OptionDef {
     Apply               apply;
     int CoreOptions::*  field;
     std::vector<Choice> choices;
-    // The stored values a menu offers, for a long numeric range; empty offers
-    // every choice. Any listed value is still accepted from the settings file.
-    std::vector<int>    presets = {};
 };
 
 // All options, in menu order within each category.
@@ -171,14 +175,29 @@ void reinitMachine();
 // The console's reset button.
 void softReset();
 
+// The YM2612 core the console runs now, as an FmCore. A save state brings
+// back the MAME or Nuked chip it was saved with (sound_context_load), so after
+// one this can differ from what was asked for.
+int runningFmCore();
+
+// Frames per second the console runs at: its master clock over the cycles of
+// a frame, libretro's timing.fps. Not simply 50 or 60: an NTSC console forced
+// to 50 Hz runs at 50.16.
+double frameRate();
+
 // The picture the core has drawn, as libretro hands it to its front end
 // (update_viewport): it starts at the top left of bitmap.data and takes in the
 // borders when they are on, the NTSC filter's wider lines and both fields of a
-// double-field interlaced frame. The active area alone is bitmap.viewport.
+// double-field interlaced frame.
 struct Picture {
     int    width  = 0;
     int    height = 0;
-    double aspect = 0;       // width / height on a TV, per o.aspect
+    double aspect = 0;       // width / height to show it at, per o.aspect
+    // The game's own display, displayW x displayH VDP pixels, fills the
+    // areaW x areaH rectangle at (areaX, areaY) of it; everything around is
+    // border. Rounded where the NTSC filter's widening is not a whole number.
+    int    areaX = 0, areaY = 0, areaW = 0, areaH = 0;
+    int    displayW = 0, displayH = 0;
 };
 Picture picture(const CoreOptions& o);
 

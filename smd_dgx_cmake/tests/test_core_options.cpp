@@ -74,13 +74,6 @@ TEST(core_options_table_round_trips)
         CoreOptions keep;
         CHECK(!coreopt::setValue(keep, def, "no such value"));
         CHECK(keep == CoreOptions{});
-        // A menu preset that is not one of the values would be refused on the
-        // next start.
-        for (int p : def.presets)
-            if (std::none_of(def.choices.begin(), def.choices.end(),
-                             [p](const coreopt::Choice& c) { return c.stored == p; }))
-                t::fail(__FILE__, __LINE__, std::string(def.key) + ": preset " + std::to_string(p)
-                                            + " is not one of its values");
     }
 
     // The defaults are this program's behaviour before options existed.
@@ -88,6 +81,8 @@ TEST(core_options_table_round_trips)
     CHECK_STR(coreopt::valueOf(d, *coreopt::findOption("genesis_plus_gx_audio_filter")), "low-pass");
     CHECK_STR(coreopt::valueOf(d, *coreopt::findOption("genesis_plus_gx_lowpass_range")), "60");
     CHECK_STR(coreopt::valueOf(d, *coreopt::findOption("genesis_plus_gx_psg_preamp")), "150");
+    CHECK_STR(coreopt::valueOf(d, *coreopt::findOption("genesis_plus_gx_aspect_ratio")), "square");
+    CHECK_STR(coreopt::valueOf(d, *coreopt::findOption("genesis_plus_gx_enhanced_vscroll_limit")), "8");
 
     CoreOptions o;
     o.overscan = coreopt::OverscanFull;
@@ -146,53 +141,51 @@ TEST(core_options_survive_rom_load)
 }
 
 // ---------------------------------------------------------------------------
-// A pause stops mid-frame and mid-instruction. A reset asked for there must
-// wait: nothing changes while paused, and after resume the paused frame runs
-// to its end before the console is rebuilt.
+// A pause stops mid-frame and mid-instruction, where the console cannot be
+// rebuilt; a reset asked for there happens at the end of that frame. Not
+// whenever the user next resumes and the frame gets that far: the paused
+// frame runs on at once, through the breakpoint the loop hits on every
+// iteration, and the emulator stops at the first instruction after the reset.
 // ---------------------------------------------------------------------------
-TEST(reset_while_paused_waits_for_the_frame_boundary)
+TEST(reset_while_paused_runs_to_the_frame_boundary)
 {
     t::Emu e;
     e.host()->setCoreOptions(CoreOptions{});
     REQUIRE(e.start());
     REQUIRE(e.pauseAndWait());
 
-    const int atJsr = addPcBreakpoint(e, kJsr);
+    addPcBreakpoint(e, kJsr);
     uint64_t s = e.pauseSeq();
     e.backend()->resume();
     REQUIRE(e.waitPause(s));
     REQUIRE(e.pausePc() == kJsr);
 
-    // A hard reset clears work RAM, so this is what a premature one destroys.
-    const uint8_t mark[4] = { 0xC0, 0xFF, 0xEE, 0x42 };
+    const uint8_t mark[4] = { 0xC0, 0xFF, 0xEE, 0x42 };      // a hard reset clears work RAM
     REQUIRE(e.backend()->writeMemory(0xFF1000, mark, 4));
     const uint64_t frame  = e.host()->frameCount();
     const uint64_t resets = e.host()->resetCount();
 
-    REQUIRE(e.host()->reset(true));
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
-
-    CHECK_EQ(e.host()->resetCount(), resets);
-    CHECK(e.backend()->isPaused());
-    CHECK_EQ(e.backend()->getM68kRegs().pc, kJsr);
-    const auto still = e.backend()->readMemory(0xFF1000, 4);
-    CHECK(still.size() == 4 && std::equal(mark, mark + 4, still.begin()));
-
-    // The loop never returns to the reset entry on its own: stopping there
-    // means the reset happened, and the frame count says when.
-    e.backend()->removeBreakpoint(atJsr);
-    addPcBreakpoint(e, kEntry);
     s = e.pauseSeq();
-    e.backend()->resume();
+    REQUIRE(e.host()->reset(true));
     REQUIRE(e.waitPause(s));
 
+    // The loop never returns to the reset entry on its own: stopping there
+    // means the reset happened.
     CHECK_EQ(e.pausePc(), kEntry);
+    CHECK(e.backend()->isPaused());
     CHECK_EQ(e.host()->resetCount(), resets + 1);
-    // One more frame than when the reset was asked for: the paused one
-    // finished first. A reset inside the pause would stop in that same frame.
+    // One more frame than when the reset was asked for: the paused one ran to
+    // its end first, past the breakpoint. A reset inside the pause would stop
+    // in that same frame.
     CHECK_EQ(e.host()->frameCount(), frame + 1);
     const auto cleared = e.backend()->readMemory(0xFF1000, 4);
     CHECK(cleared == std::vector<uint8_t>(4, 0));
+
+    // The breakpoint works again after it.
+    s = e.pauseSeq();
+    e.backend()->resume();
+    REQUIRE(e.waitPause(s));
+    CHECK_EQ(e.pausePc(), kJsr);
 }
 
 // ---------------------------------------------------------------------------
@@ -212,9 +205,10 @@ TEST(region_change_is_in_the_core_after_reset)
     o.region = coreopt::RegionEurope;
     const uint64_t resets = e.host()->resetCount();
     e.host()->setCoreOptions(o);
+    const uint64_t s = e.pauseSeq();
     REQUIRE(e.host()->reset(true));
-    e.backend()->resume();
-    REQUIRE(waitFor([&] { return e.host()->resetCount() > resets; }));
+    REQUIRE(e.waitPause(s));
+    CHECK_EQ(e.host()->resetCount(), resets + 1);
     REQUIRE(runFrames(e, 2));
 
     CHECK_EQ(region_code, REGION_EUROPE);
@@ -254,33 +248,31 @@ TEST(reset_and_reload_classes_wait_for_their_event)
     // Soft: the 68000 restarts at the entry point, RAM survives.
     const uint8_t mark[2] = { 0x5A, 0xA5 };
     REQUIRE(e.backend()->writeMemory(0xFF1000, mark, 2));
-    const int atEntry = addPcBreakpoint(e, kEntry);
     uint64_t r = e.host()->resetCount();
-    REQUIRE(e.host()->reset(false));
     uint64_t s = e.pauseSeq();
-    e.backend()->resume();
+    REQUIRE(e.host()->reset(false));
     REQUIRE(e.waitPause(s));
     CHECK_EQ(e.pausePc(), kEntry);
     CHECK_EQ(e.host()->resetCount(), r + 1);
     CHECK(e.backend()->readMemory(0xFF1000, 2) == std::vector<uint8_t>(mark, mark + 2));
     CHECK_EQ(config.lock_on, 0);
-    e.backend()->removeBreakpoint(atEntry);
 
     r = e.host()->resetCount();
+    s = e.pauseSeq();
     REQUIRE(e.host()->reset(true));
-    e.backend()->resume();
-    REQUIRE(waitFor([&] { return e.host()->resetCount() > r; }));
-    REQUIRE(e.pauseAndWait());
+    REQUIRE(e.waitPause(s));
+    CHECK_EQ(e.host()->resetCount(), r + 1);
     CHECK_EQ(config.lock_on, TYPE_GG);
     CHECK_EQ(config.system, 0);
     CHECK_EQ(e.host()->coreOptionsRunning().lockOn, coreopt::LockOnGameGenie);
     CHECK_EQ(e.host()->coreOptionsRunning().hardware, coreopt::HardwareAuto);
 
     r = e.host()->resetCount();
+    s = e.pauseSeq();
     REQUIRE(e.host()->reload());
-    e.backend()->resume();
-    REQUIRE(waitFor([&] { return e.host()->resetCount() > r; }));
-    REQUIRE(e.pauseAndWait());
+    REQUIRE(e.waitPause(s));
+    CHECK_EQ(e.host()->resetCount(), r + 1);
+    CHECK_EQ(e.pausePc(), kEntry);
     CHECK_EQ(config.system, SYSTEM_MD);
     CHECK_EQ(config.lock_on, TYPE_GG);
     CHECK(e.host()->coreOptionsRunning() == o);
@@ -458,13 +450,18 @@ bool drawnAreaIs(t::Emu& e, int w, int h)
 
 struct Shown { int w = 0, h = 0; double aspect = 0; };
 
-Shown copied(t::Emu& e)
+coreopt::Picture copied(t::Emu& e)
 {
-    Shown s;
+    coreopt::Picture pic;
     std::vector<uint8_t> rgb;
-    if (!e.host()->invoke([&] { e.host()->copyPicture(rgb, s.w, s.h); })) return {};
-    if (rgb.size() != size_t(s.w) * s.h * 2) return {};
-    return s;
+    if (!e.host()->invoke([&] { pic = e.host()->copyPicture(rgb); })) return {};
+    if (rgb.size() != size_t(pic.width) * pic.height * 2) return {};
+    return pic;
+}
+
+bool areaIs(const coreopt::Picture& p, int x, int y, int w, int h)
+{
+    return p.areaX == x && p.areaY == y && p.areaW == w && p.areaH == h;
 }
 
 bool approx(double a, double b) { return std::abs(a - b) < 1e-3; }
@@ -483,14 +480,18 @@ TEST(picture_takes_in_borders_ntsc_width_and_double_field)
     auto lastSunk = [&] { std::lock_guard<std::mutex> lk(mx); return sunk; };
 
     CoreOptions o;
+    o.aspect = coreopt::AspectAuto;
     e.host()->setCoreOptions(o);
     REQUIRE(e.start());
     REQUIRE(e.pauseAndWait());
     REQUIRE(setVdpMode(e, 0x81));             // H40
 
-    Shown s = copied(e);
-    CHECK_EQ(s.w, 320);
-    CHECK_EQ(s.h, 224);
+    coreopt::Picture s = copied(e);
+    CHECK_EQ(s.width, 320);
+    CHECK_EQ(s.height, 224);
+    CHECK(areaIs(s, 0, 0, 320, 224));
+    CHECK_EQ(s.displayW, 320);
+    CHECK_EQ(s.displayH, 224);
     CHECK(drawnAreaIs(e, 320, 224));
     // libretro's 1.306: the 135/11 MHz sample rate over the H40 dot clock
     // (master / 8), times 320 over 2 x 224.
@@ -502,8 +503,9 @@ TEST(picture_takes_in_borders_ntsc_width_and_double_field)
     e.host()->setCoreOptions(o);
     REQUIRE(runFrames(e, 2));
     s = copied(e);
-    CHECK_EQ(s.w, 320 + 2 * 14);
-    CHECK_EQ(s.h, 224 + 2 * 8);
+    CHECK_EQ(s.width, 320 + 2 * 14);
+    CHECK_EQ(s.height, 224 + 2 * 8);
+    CHECK(areaIs(s, 14, 8, 320, 224));
     CHECK(drawnAreaIs(e, 348, 240));
     CHECK_EQ(lastSunk().w, 348);
     CHECK_EQ(lastSunk().h, 240);
@@ -514,9 +516,15 @@ TEST(picture_takes_in_borders_ntsc_width_and_double_field)
     e.host()->setCoreOptions(o);
     REQUIRE(runFrames(e, 2));
     s = copied(e);
-    CHECK_EQ(s.w, (348 - 3) / 4 * 8 + 8);     // MD_NTSC_OUT_WIDTH
-    CHECK_EQ(s.h, 240);
-    CHECK(drawnAreaIs(e, s.w, 240));
+    CHECK_EQ(s.width, (348 - 3) / 4 * 8 + 8);     // MD_NTSC_OUT_WIDTH
+    CHECK_EQ(s.height, 240);
+    // The filter roughly doubles the width, borders and display alike.
+    CHECK_EQ(s.areaY, 8);
+    CHECK_EQ(s.areaH, 224);
+    CHECK(std::abs(s.areaX - 28) <= 1);
+    CHECK(std::abs(s.areaW - 640) <= 2);
+    CHECK_EQ(s.displayW, 320);
+    CHECK(drawnAreaIs(e, s.width, 240));
     CHECK(approx(lastSunk().aspect, ntsc * (348.0 / 240.0) / (320.0 / 224.0)));
 
     // PAR forced either way; auto is the NTSC one on an NTSC console.
@@ -531,19 +539,33 @@ TEST(picture_takes_in_borders_ntsc_width_and_double_field)
     REQUIRE(runFrames(e, 2));
     CHECK(approx(lastSunk().aspect, ntsc));
 
+    // Square pixels: the console's own shape, whatever the TV would do.
+    o.aspect = coreopt::AspectSquare;
+    e.host()->setCoreOptions(o);
+    REQUIRE(runFrames(e, 2));
+    CHECK(approx(lastSunk().aspect, 320.0 / 224.0));
+
     // Interlace mode 2: one field per frame unless both are asked for.
+    o.aspect = coreopt::AspectAuto;
+    e.host()->setCoreOptions(o);
     REQUIRE(setVdpMode(e, 0x87));
     s = copied(e);
-    CHECK_EQ(s.w, 320);
-    CHECK_EQ(s.h, 224);
+    CHECK_EQ(s.width, 320);
+    CHECK_EQ(s.height, 224);
     o.doubleField = 1;
     e.host()->setCoreOptions(o);
     REQUIRE(runFrames(e, 2));
     s = copied(e);
-    CHECK_EQ(s.w, 320);
-    CHECK_EQ(s.h, 448);
+    CHECK_EQ(s.width, 320);
+    CHECK_EQ(s.height, 448);
+    CHECK(areaIs(s, 0, 0, 320, 448));
+    CHECK_EQ(s.displayH, 224);
     CHECK(drawnAreaIs(e, 320, 448));
     CHECK(approx(lastSunk().aspect, ntsc));
+    o.aspect = coreopt::AspectSquare;
+    e.host()->setCoreOptions(o);
+    REQUIRE(runFrames(e, 2));
+    CHECK(approx(lastSunk().aspect, 320.0 / 224.0));    // the field's shape, not 320:448
 }
 
 // Without options — the IDA plugin — the screen keeps square pixels.
@@ -648,10 +670,180 @@ TEST(host_without_options_runs_on_core_defaults)
 
     // A reset does not bring them in either.
     const uint64_t r = e.host()->resetCount();
+    const uint64_t s = e.pauseSeq();
     REQUIRE(e.host()->reset(true));
-    e.backend()->resume();
-    REQUIRE(waitFor([&] { return e.host()->resetCount() > r; }));
-    REQUIRE(e.pauseAndWait());
+    REQUIRE(e.waitPause(s));
+    CHECK_EQ(e.host()->resetCount(), r + 1);
     CHECK_EQ(config.region_detect, 0);
     CHECK_EQ(region_code, REGION_USA);
+}
+
+// ---------------------------------------------------------------------------
+// The emulator runs at the console's own rate, which a forced VDP mode does
+// not round to 50 or 60: an NTSC console at 50 Hz keeps its NTSC clock.
+// Paced at 50, it made fewer samples than the sound card played.
+// ---------------------------------------------------------------------------
+TEST(frame_rate_is_the_console_clock)
+{
+    t::Emu e;
+    CoreOptions o;
+    o.region = coreopt::RegionUsa;
+    e.host()->setCoreOptions(o);
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+    CHECK(std::abs(coreopt::frameRate() - 53693175.0 / (262 * 3420)) < 1e-6);     // 59.92
+
+    o.vdpMode = coreopt::VdpMode50Hz;
+    e.host()->setCoreOptions(o);
+    REQUIRE(runFrames(e, 1));
+    CHECK_EQ(lines_per_frame, 313);
+    CHECK(std::abs(coreopt::frameRate() - 53693175.0 / (313 * 3420)) < 1e-6);     // 50.16
+
+    o.region = coreopt::RegionEurope;
+    o.vdpMode = coreopt::VdpModeAuto;
+    e.host()->setCoreOptions(o);
+    REQUIRE(runFrames(e, 1));
+    CHECK(std::abs(coreopt::frameRate() - 53203424.0 / (313 * 3420)) < 1e-6);     // 49.70
+}
+
+// ---------------------------------------------------------------------------
+// Reload ROM while the file is being rewritten finds it empty. That must be
+// refused up front: the load would take the running game down with it.
+// ---------------------------------------------------------------------------
+TEST(reload_of_an_empty_rom_file_is_refused)
+{
+    namespace fs = std::filesystem;
+    // Its own file: the fixture's lives in %TEMP% under a fixed name that a
+    // test run in another checkout may be using.
+    const fs::path dir = fs::temp_directory_path() / "smd_dgx_reload_test";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    REQUIRE(fs::create_directories(dir));
+    const fs::path rom = dir / "game.bin";
+    const std::vector<uint8_t> image = buildRom();
+    auto writeRom = [&](size_t n) {
+        std::ofstream(rom, std::ios::binary | std::ios::trunc)
+            .write(reinterpret_cast<const char*>(image.data()), (std::streamsize)n);
+    };
+    writeRom(image.size());
+
+    {
+        EmuHost host;
+        host.setCoreOptions(CoreOptions{});
+        REQUIRE(host.start(rom.string()));
+        const uint64_t resets = host.resetCount();
+
+        writeRom(0);
+        CHECK(!host.reload());
+        const uint64_t frames = host.frameCount();
+        CHECK(waitFor([&] { return host.frameCount() > frames + 2; }));
+        CHECK(host.isRunning());
+        CHECK_EQ(host.resetCount(), resets);
+        CHECK_STR(host.stopReason(), "");
+
+        // Control: the same file, written back, reloads.
+        writeRom(image.size());
+        CHECK(host.reload());
+        CHECK(waitFor([&] { return host.resetCount() > resets; }));
+        CHECK(host.isRunning());
+        host.stop();
+    }
+    fs::remove_all(dir, ec);
+}
+
+// ---------------------------------------------------------------------------
+// A save state holds the chip of the FM core it was saved with, MAME's or
+// Nuked's. Loaded under the other one, it used to land in a chip nobody
+// plays while the playing one stayed reset; now the state's core comes back
+// with it, and the options report that.
+// ---------------------------------------------------------------------------
+TEST(save_state_brings_back_its_fm_core)
+{
+    namespace fs = std::filesystem;
+    const fs::path state = fs::temp_directory_path() / "smd_dgx_fm_core_test.gs0";
+    std::error_code ec;
+
+    t::Emu e;
+    CoreOptions o;                                   // MAME (YM2612)
+    e.host()->setCoreOptions(o);
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+    REQUIRE(config.ym3438 == 0);
+    bool ok = false;
+    REQUIRE(e.host()->invoke([&] { ok = e.backend()->saveState(state.string().c_str()); }));
+    REQUIRE(ok);
+
+    o.fmCore = coreopt::FmNukedYm3438;
+    e.host()->setCoreOptions(o);
+    REQUIRE(runFrames(e, 1));
+    REQUIRE(config.ym3438 == 2);
+
+    REQUIRE(e.host()->invoke([&] { ok = e.backend()->loadState(state.string().c_str()); }));
+    REQUIRE(ok);
+    CHECK_EQ(config.ym3438, 0);
+    const int fm = e.host()->coreOptionsRunning().fmCore;
+    CHECK(fm < coreopt::FmNukedYm2612);
+    CHECK_EQ(fm, coreopt::runningFmCore());
+    CHECK_EQ(e.host()->coreOptions().fmCore, fm);       // what a UI shows
+
+    // Another option changed after it leaves the FM core alone.
+    CoreOptions next = e.host()->coreOptions();
+    next.overscan = coreopt::OverscanFull;
+    e.host()->setCoreOptions(next);
+    REQUIRE(runFrames(e, 1));
+    CHECK_EQ(config.ym3438, 0);
+    CHECK_EQ(config.overscan, 3);
+
+    // And the other way round: a Nuked state on MAME brings Nuked back.
+    next.fmCore = coreopt::FmNukedYm2612;
+    e.host()->setCoreOptions(next);
+    REQUIRE(runFrames(e, 1));
+    REQUIRE(e.host()->invoke([&] { ok = e.backend()->saveState(state.string().c_str()); }));
+    REQUIRE(ok);
+    next.fmCore = coreopt::FmMameYm2612;
+    e.host()->setCoreOptions(next);
+    REQUIRE(runFrames(e, 1));
+    REQUIRE(config.ym3438 == 0);
+    REQUIRE(e.host()->invoke([&] { ok = e.backend()->loadState(state.string().c_str()); }));
+    REQUIRE(ok);
+    CHECK_EQ(config.ym3438, 1);
+    CHECK_EQ(e.host()->coreOptionsRunning().fmCore, coreopt::FmNukedYm2612);
+
+    fs::remove(state, ec);
+}
+
+// ---------------------------------------------------------------------------
+// The enhanced per-tile vscroll hack: the VDP chooses its renderer only when
+// register 11 is written, so switching the option has to swap it too.
+// ---------------------------------------------------------------------------
+TEST(enhanced_vscroll_switches_the_renderer_live)
+{
+    t::Emu e;
+    CoreOptions o;
+    e.host()->setCoreOptions(o);
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+
+    // Mode 5, 2-cell vertical scroll.
+    const uint8_t prog[] = {
+        0x33, 0xFC, 0x81, 0x44, 0x00, 0xC0, 0x00, 0x04,   // move.w #$8144,$C00004
+        0x33, 0xFC, 0x8B, 0x04, 0x00, 0xC0, 0x00, 0x04,   // move.w #$8B04,$C00004
+        0x60, 0xFE,                                       // bra.s *
+    };
+    REQUIRE(e.backend()->writeMemory(kModeProg, prog, sizeof prog));
+    e.parkM68kAt(kModeProg);
+    REQUIRE(runFrames(e, 2));
+    REQUIRE(render_bg == render_bg_m5_vs);
+
+    o.enhancedVscroll = 1;
+    o.enhancedVscrollLimit = 12;
+    e.host()->setCoreOptions(o);
+    REQUIRE(runFrames(e, 1));
+    CHECK(render_bg == render_bg_m5_vs_enhanced);
+    CHECK_EQ(config.enhanced_vscroll_limit, 12);
+
+    o.enhancedVscroll = 0;
+    e.host()->setCoreOptions(o);
+    REQUIRE(runFrames(e, 1));
+    CHECK(render_bg == render_bg_m5_vs);
 }

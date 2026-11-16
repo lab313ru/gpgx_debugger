@@ -94,13 +94,27 @@ public:
     // has to ask the user for.
     coreopt::CoreOptions coreOptionsRunning() const;
 
-    // Queued like setCoreOptions. Hard: a power cycle that keeps cartridge
-    // SRAM and picks up RESET-class options. Soft: the console's reset button.
-    // False when nothing is running.
+    // Hard: a power cycle that keeps cartridge SRAM and picks up RESET-class
+    // options. Soft: the console's reset button. False when nothing is
+    // running.
+    //
+    // Carried out at the top of the run loop like an option change, but not
+    // left waiting there: the rest of the current frame runs with breakpoints
+    // and steps passing through, so a breakpoint hit on every frame cannot
+    // put it off. A paused emulator is resumed for that, and stops again at
+    // the first instruction after the reset.
     bool reset(bool hard);
     // Loads the ROM again with the current options, keeping cartridge SRAM.
-    // False when nothing is running or the ROM file cannot be read now.
+    // Carried out as reset() is. False when nothing is running or the ROM
+    // file cannot be read now or is empty.
+    //
+    // A file that changes between this check and the load can still fail it.
+    // Then the run ends: the emulation thread exits, isRunning() turns false,
+    // a Stopped event goes out from that thread, and stopReason() says why.
     bool reload();
+
+    // Why the run ended on its own, or "" while it runs or when stop() ended it.
+    std::string stopReason() const;
 
     // Resets and reloads performed so far, to tell that a queued one is done.
     uint64_t resetCount() const { return resets_.load(); }
@@ -162,17 +176,22 @@ public:
     const HostMutations& hostMutations() const { return hostMut_; }
 
     // Copy the picture the frame sink is given as tightly packed RGB565
-    // (w*h*2 bytes): borders, the NTSC filter's width and both interlaced
-    // fields included when they are on. Call from the emulation thread — i.e.
-    // through invoke() — so the framebuffer is not being redrawn underneath.
-    void copyPicture(std::vector<uint8_t>& out, int& w, int& h) const;
+    // (width*height*2 bytes): borders, the NTSC filter's width and both
+    // interlaced fields included when they are on. Returns its size, shape
+    // and where the game's display lies in it; a zero size and an empty
+    // `out` when there is none. Call from the emulation thread — i.e. through
+    // invoke() — so the framebuffer is not being redrawn underneath.
+    coreopt::Picture copyPicture(std::vector<uint8_t>& out) const;
 
 private:
     void run(std::string romPath);
     void applyPending();
+    void runToFrameEnd();
     void beforeLoad();
+    void afterStateLoad();
     void hardReset();
     void doReload();
+    void emitStopped();
     void installBootRomFor(const coreopt::CoreOptions& o);
     void setInCore(const coreopt::CoreOptions& o);
     void drainCommands();
@@ -195,6 +214,10 @@ private:
     std::atomic<uint64_t> stops_  { 0 };
     std::atomic<uint64_t> frames_ { 0 };
     std::atomic<uint64_t> resets_ { 0 };
+    std::atomic<bool> stoppedSent_ { false };   // one Stopped event per run
+    // A reset or reload holds stops until the frame ends (runToFrameEnd);
+    // repause_ says the emulator was paused when it was asked for.
+    std::atomic<bool> repause_ { false };
     HostMutations     hostMut_;
 
     // Requests for the top of the run loop, applied in the order made.
@@ -208,6 +231,7 @@ private:
     coreopt::CoreOptions    want_;              // as last set       (optMx_)
     bool                    haveOptions_ = false;                  // (optMx_)
     std::deque<Pending>     pending_;                              // (optMx_)
+    std::string             stopReason_;                           // (optMx_)
     // Emulation thread only (and start(), before the thread exists):
     bool                    useOptions_ = false;   // haveOptions_ as of the run
     coreopt::CoreOptions    requested_;   // the latest Options request applied

@@ -204,7 +204,9 @@ bool GpgxBackend::loadState(const char* path)
     f.seekg(0);
     std::vector<uint8_t> buf(STATE_SIZE, 0);
     if (!f.read(reinterpret_cast<char*>(buf.data()), size)) return false;
-    return state_load(buf.data()) != 0;
+    if (state_load(buf.data()) == 0) return false;
+    if (afterStateLoad_) afterStateLoad_();
+    return true;
 }
 
 bool GpgxBackend::runSafely(const std::function<void()>& fn)
@@ -519,6 +521,7 @@ bool GpgxBackend::loadRom(const char* path)
 
     onSystemReset();
     abandoned_.store(false);        // a previous shutdown must not mute this run
+    held_.store(false);             // nor a hold the previous run never released
 
     // gx::init() has just put config back to defaults, and load_rom reads it.
     if (beforeLoad_) beforeLoad_();
@@ -616,6 +619,8 @@ void GpgxBackend::abortRunControl()
 void GpgxBackend::firePause(uint32_t pc, Cpu cpu, int bpId)
 {
     if (abandoned_.load()) return;      // shutting down: do not park the thread
+    // Held: pass through, and leave any step armed for when the hold ends.
+    if (held_.load()) return;
     // Any stop ends whatever step was in flight. F8 over a call that hits a
     // breakpoint inside would otherwise leave its target armed, and a later F9
     // would stop there for no reason the user can see.
@@ -627,6 +632,11 @@ void GpgxBackend::firePause(uint32_t pc, Cpu cpu, int bpId)
     stepOutSpZ80_.store(-1);
     lastBpId_.store(bpId);
     paused_.store(true);
+    // A hold that began after the check above. The host sets the hold and
+    // then looks at isPaused(); this sets paused_ and then looks at the hold,
+    // so one of the two always sees the other and the thread is not left
+    // parked with the hold on.
+    if (held_.load()) { paused_.store(false); return; }
     if (pauseCb_) pauseCb_(pc, cpu);
     // Block the emulation thread until resumed. While blocked, pump host
     // commands (resume/step/read) so run-control can proceed — nested-loop
