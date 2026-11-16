@@ -1,15 +1,17 @@
-// listAround: the lines a disassembly window shows, on the synthetic ROM.
+// listAround and listAroundZ80: the lines a disassembly window shows, on the
+// synthetic ROM and on Z80 code the tests write into sound RAM.
 //
 // Two things here matter more than the text, which test_disasm already pins:
 // that the lines before an address are whole instructions of the real stream,
 // not the tail of one read from the middle; and that building a listing reads
-// nothing but ROM and work RAM, because on this bus a read of anything else
+// nothing but ROM and RAM, because on this bus a read of anything else
 // is an access the game sees.
 
 #include "fixture.h"
 
 #include "debugger/Disasm68k.h"
 #include "debugger/DisasmListing.h"
+#include "debugger/DisasmZ80.h"
 
 #include <optional>
 #include <vector>
@@ -17,6 +19,7 @@
 using namespace synth;
 using disasm::ListingLine;
 using disasm::listAround;
+using disasm::listAroundZ80;
 
 namespace {
 
@@ -425,6 +428,398 @@ TEST(listing_flow_targets_from_disasm_text)
     for (const auto& c : cases) {
         const auto line = disasm::disasm68k(c.bytes.data(), c.bytes.size(), c.addr);
         const auto got = disasm::flowTarget(line.text);
+        if (got != c.target)
+            t::fail(__FILE__, __LINE__,
+                    t::hexBytes(c.bytes) + " at " + t::hex(c.addr) + " \"" + line.text + "\": got "
+                        + (got ? t::hex(*got) : std::string("none")) + ", want "
+                        + (c.target ? t::hex(*c.target) : std::string("none")));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// listAroundZ80
+// ---------------------------------------------------------------------------
+namespace {
+
+// A Z80 program for the listing, written into sound RAM:
+//
+//   0100  3E 12        ld a,$12
+//   0102  DD 21 00 10  ld ix,$1000
+//   0106  DD CB 05 06  rlc (ix+$05)
+//   010A  CD 20 01     call $0120
+//   010D  18 F1        jr $0100
+//   0120  C9           ret
+//
+// Sound RAM is zero at reset, so nops lead up to it. Two bytes back from the
+// return address, $010D, is the call's operand: "20 01" is jr nz and lands
+// on $010D just as well, which is the case resync exists for.
+constexpr uint16_t kListProg   = 0x0100;
+constexpr uint16_t kListIx     = 0x0102;
+constexpr uint16_t kListRlc    = 0x0106;
+constexpr uint16_t kListCall   = 0x010A;
+constexpr uint16_t kListJr     = 0x010D;
+constexpr uint16_t kListCallee = 0x0120;
+
+bool putZ80Listing(t::Emu& e)
+{
+    const uint8_t prog[] = {
+        0x3E, 0x12,
+        0xDD, 0x21, 0x00, 0x10,
+        0xDD, 0xCB, 0x05, 0x06,
+        0xCD, 0x20, 0x01,
+        0x18, 0xF1,
+    };
+    const uint8_t ret = 0xC9;
+    return e.backend()->writeRegion(2, kListProg, prog, sizeof prog)
+        && e.backend()->writeRegion(2, kListCallee, &ret, 1);
+}
+
+// Shifts `bank` into the bank register the way a sound driver does: nine
+// writes to $6000, bit 15 of the 68000 address first. Runs the Z80 to the
+// end of it and leaves the machine paused there; false if it never got there.
+constexpr uint16_t kBankProg = 0x0200;
+
+bool setZ80Bank(t::Emu& e, uint32_t bank)
+{
+    std::vector<uint8_t> prog = { 0x21, 0x00, 0x60 };   // ld hl,$6000
+    for (int bit = 15; bit <= 23; ++bit) {
+        prog.push_back(0x36);                          // ld (hl),n
+        prog.push_back(uint8_t((bank >> bit) & 1));
+    }
+    const uint16_t done = uint16_t(kBankProg + prog.size());
+    prog.push_back(0x18);                              // jr $
+    prog.push_back(0xFE);
+    if (!e.backend()->writeRegion(2, kBankProg, prog.data(), uint32_t(prog.size()))) return false;
+
+    Z80Regs z = e.backend()->getZ80Regs();
+    z.pc = kBankProg;
+    e.backend()->setZ80Regs(z);
+
+    Breakpoint bp;
+    bp.type = BpType::PC; bp.cpu = Cpu::Z80; bp.is_vdp = false;
+    bp.start = bp.end = done;
+    const int id = e.backend()->addBreakpoint(bp);
+
+    const uint64_t s = e.pauseSeq();
+    e.backend()->resume();
+    const bool stopped = e.waitPause(s, 3000);
+    e.backend()->removeBreakpoint(id);
+    return stopped && e.pauseCpu() == Cpu::Z80 && e.backend()->getZ80Regs().pc == done;
+}
+
+// Every read a Z80 listing made went to sound RAM, inside its 8K.
+bool onlySoundRam(const ReadSpy& spy)
+{
+    for (const auto& r : spy.regionReads)
+        if (r.id != 2 || r.off + r.size > 0x2000u) return false;
+    return true;
+}
+
+} // namespace
+
+TEST(listing_z80_before_the_return_address_is_the_whole_call)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+    REQUIRE(putZ80Listing(e));
+
+    Z80Regs z = e.backend()->getZ80Regs();
+    z.pc = kListRlc;
+    e.backend()->setZ80Regs(z);
+
+    Breakpoint bp;
+    bp.type = BpType::PC; bp.cpu = Cpu::Z80; bp.is_vdp = false;
+    bp.start = bp.end = kListCall;
+    REQUIRE(e.backend()->addBreakpoint(bp) >= 0);
+
+    // On the rlc, every breakpoint that must not count as one: the 68000's
+    // at the same number, a disabled one, a read and a VDP one.
+    auto m68k = bp;
+    m68k.start = m68k.end = kListRlc;
+    m68k.cpu = Cpu::M68K;
+    auto off = bp;
+    off.start = off.end = kListRlc;
+    off.enabled = false;
+    auto read = bp;
+    read.start = read.end = kListRlc;
+    read.type = BpType::Read;
+    auto vdp = bp;
+    vdp.start = vdp.end = kListRlc;
+    vdp.is_vdp = true;
+    for (const Breakpoint& b : { m68k, off, read, vdp })
+        REQUIRE(e.backend()->addBreakpoint(b) >= 0);
+
+    ReadSpy spy(e.backend());
+    for (int before : { 4, 12 }) {
+        const auto v = listAroundZ80(spy, kListJr, before, 2);
+        REQUIRE(v.size() == size_t(before) + 1 + 2);
+        CHECK(contiguous(v));
+        REQUIRE(indexOf(v, kListJr) == size_t(before));
+
+        const ListingLine& call = v[before - 1];
+        CHECK_EQ(call.addr, kListCall);
+        CHECK_EQ(call.len, 3u);
+        CHECK_STR(call.text, "call    $0120");
+        CHECK_STR(call.hex, "CD 20 01");
+        CHECK(call.readable);
+        CHECK(call.target == std::optional<uint32_t>(kListCallee));
+        CHECK(call.hasBreakpoint);
+        CHECK(!call.isPc);
+
+        const ListingLine& rlc = v[before - 2];
+        CHECK_EQ(rlc.addr, kListRlc);
+        CHECK_EQ(rlc.len, 4u);
+        CHECK_STR(rlc.text, "rlc     (ix+$05)");
+        CHECK_STR(rlc.hex, "DD CB 05 06");
+        CHECK(!rlc.target);
+        CHECK(rlc.isPc);
+        CHECK(!rlc.hasBreakpoint);
+
+        CHECK_EQ(v[before - 3].addr, kListIx);
+        CHECK_STR(v[before - 3].text, "ld      ix,$1000");
+        CHECK_EQ(v[before - 4].addr, kListProg);
+        CHECK_STR(v[before - 4].text, "ld      a,$12");
+        CHECK_STR(v[before - 4].hex, "3E 12");
+        for (int i = 0; i < before - 4; ++i) {
+            CHECK_EQ(v[i].addr, uint32_t(kListProg - (before - 4) + i));
+            CHECK_STR(v[i].text, "nop");
+        }
+
+        // Nothing starts inside an instruction: not in the rlc's operand, and
+        // not at the "jr nz" in the call's.
+        CHECK(lineAt(v, kListRlc + 1) == nullptr);
+        CHECK(lineAt(v, kListCall + 1) == nullptr);
+        CHECK(lineAt(v, kListCall + 2) == nullptr);
+
+        const ListingLine& jr = v[before];
+        CHECK_STR(jr.text, "jr      $0100");
+        CHECK_STR(jr.hex, "18 F1");
+        CHECK(jr.target == std::optional<uint32_t>(kListProg));
+        CHECK_STR(v[before + 1].text, "nop");
+
+        int pcLines = 0, bpLines = 0;
+        for (const auto& l : v) {
+            pcLines += l.isPc;
+            bpLines += l.hasBreakpoint;
+        }
+        CHECK_EQ(pcLines, 1);
+        CHECK_EQ(bpLines, 1);
+    }
+
+    // Nothing comes before address 0, and the lines after it are not padded
+    // out to make up the count.
+    const auto start = listAroundZ80(spy, 0, 8, 4);
+    REQUIRE(start.size() == 5u);
+    CHECK_EQ(start.front().addr, 0u);
+    CHECK(contiguous(start));
+
+    CHECK(onlySoundRam(spy));
+    CHECK_EQ(spy.busReads, 0);
+    e.backend()->clearBreakpoints();
+}
+
+// $2000-$3FFF is the same 8K again, listed under its own address. The YM2612,
+// the bank register, the VDP and the PSG behind $4000-$7FFF are never read.
+TEST(listing_z80_reads_sound_ram_and_its_mirror_and_never_the_ports)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+    REQUIRE(putZ80Listing(e));
+    ReadSpy spy(e.backend());
+
+    // A relative target follows the address shown; an absolute one does not.
+    const auto m = listAroundZ80(spy, 0x2000 + kListCall, 1, 1);
+    REQUIRE(m.size() == 3u);
+    CHECK(contiguous(m));
+    CHECK_EQ(m[0].addr, 0x2000u + kListRlc);
+    CHECK_STR(m[0].text, "rlc     (ix+$05)");
+    CHECK(m[0].readable);
+    CHECK_EQ(m[1].addr, 0x2000u + kListCall);
+    CHECK_STR(m[1].text, "call    $0120");
+    CHECK(m[1].target == std::optional<uint32_t>(kListCallee));
+    CHECK_STR(m[2].text, "jr      $2100");
+    CHECK(m[2].target == std::optional<uint32_t>(0x2000u + kListProg));
+    CHECK(onlySoundRam(spy));
+
+    for (uint16_t centre : { 0x4020, 0x4100, 0x5FFF, 0x6000, 0x7F00, 0x7F11 }) {
+        spy.regionReads.clear();
+        const auto v = listAroundZ80(spy, centre, 4, 8);
+        REQUIRE(v.size() == 13u);
+        CHECK(contiguous(v));
+        CHECK_EQ(v[4].addr, uint32_t(centre));
+        for (const auto& l : v) {
+            CHECK(!l.readable);
+            CHECK_EQ(l.len, 1u);
+            CHECK_STR(l.text, disasm::kNotReadable);
+            CHECK(l.hex.empty());
+            CHECK(!l.target);
+        }
+        CHECK(spy.regionReads.empty());
+    }
+
+    // Across $4000: RAM up to it, nothing from it on.
+    spy.regionReads.clear();
+    const auto edge = listAroundZ80(spy, 0x4000, 4, 4);
+    REQUIRE(edge.size() == 9u);
+    CHECK(contiguous(edge));
+    for (size_t i = 0; i < edge.size(); ++i) {
+        CHECK_EQ(edge[i].readable, i < 4);
+        CHECK_STR(edge[i].text, i < 4 ? "nop" : disasm::kNotReadable);
+    }
+    CHECK(onlySoundRam(spy));
+    CHECK_EQ(spy.busReads, 0);
+}
+
+// The window shows ROM where the core hands the Z80 ROM bytes, and nothing
+// anywhere else: not I/O, not the VDP, not the 68000's work RAM, which the Z80
+// can write but not read, and not the space past the end of the ROM.
+TEST(listing_z80_bank_window_reads_rom_and_nothing_else)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+    ReadSpy spy(e.backend());
+
+    const uint16_t centre = uint16_t(0x8000 + kEntry);
+    for (uint32_t bank : { 0xA10000u, 0xC00000u, 0xFF0000u, 0x400000u, 0x008000u }) {
+        REQUIRE(setZ80Bank(e, bank));
+        REQUIRE(e.backend()->getZ80Regs().bank == bank);
+        spy.regionReads.clear();
+        const auto v = listAroundZ80(spy, centre, 4, 4);
+        REQUIRE(v.size() == 9u);
+        CHECK(contiguous(v));
+        for (const auto& l : v) {
+            CHECK(!l.readable);
+            CHECK_EQ(l.len, 1u);
+            CHECK_STR(l.text, disasm::kNotReadable);
+        }
+        CHECK(spy.regionReads.empty());
+    }
+
+    // Back at the start of the ROM: the 68000 bring-up, decoded as Z80 code.
+    REQUIRE(setZ80Bank(e, 0));
+    REQUIRE(e.backend()->getZ80Regs().bank == 0u);
+    const std::vector<uint8_t> rom = e.backend()->readRegion(0, 0, kRomSize);
+    REQUIRE(rom.size() == kRomSize);
+
+    spy.regionReads.clear();
+    const auto v = listAroundZ80(spy, centre, 4, 8);
+    REQUIRE(v.size() == 13u);
+    CHECK(contiguous(v));
+    REQUIRE(indexOf(v, centre) == 4u);
+    for (const auto& l : v) {
+        CHECK(l.readable);
+        const uint32_t off = l.addr - 0x8000;
+        const auto want = disasm::disasmZ80(&rom[off], rom.size() - off, uint16_t(l.addr));
+        CHECK_EQ(l.len, want.len);
+        CHECK_STR(l.text, want.text);
+    }
+    CHECK_STR(v[4].text, "inc     sp");                 // 33
+    CHECK_STR(v[5].text, "call    m,$0001");            // FC 01 00
+    CHECK_STR(v[5].hex, "FC 01 00");
+    CHECK(v[5].target == std::optional<uint32_t>(0x0001u));
+    for (const auto& r : spy.regionReads) {
+        CHECK_EQ(r.id, 0);
+        CHECK(r.off + r.size <= kRomSize);
+    }
+
+    // Across $8000 the ports end and the ROM begins; at $FFFF the lines end
+    // instead of wrapping round to sound RAM.
+    const auto low = listAroundZ80(spy, 0x8000, 2, 2);
+    REQUIRE(low.size() == 5u);
+    CHECK(contiguous(low));
+    CHECK(!low[0].readable);
+    CHECK(!low[1].readable);
+    CHECK_EQ(low[2].addr, 0x8000u);
+    CHECK_STR(low[2].text, "nop");                      // the stack pointer's top byte
+    CHECK_STR(low[3].text, "rst     $38");
+    CHECK(low[3].target == std::optional<uint32_t>(0x38u));
+
+    const auto high = listAroundZ80(spy, 0xFFFE, 2, 4);
+    REQUIRE(high.size() == 4u);
+    CHECK(contiguous(high));
+    CHECK_EQ(high.back().addr, 0xFFFFu);
+    CHECK_STR(high.back().text, "rst     $38");          // the ROM's $FF fill
+    CHECK(high.back().readable);
+
+    CHECK_EQ(spy.busReads, 0);
+}
+
+// Each write a game makes to $A11100 and $A11200 shows in zstate: the 68000
+// below does them one step at a time. The first pause can come before the
+// ROM's own bring-up has run, so the routine starts by releasing both.
+TEST(z80_state_follows_busreq_and_reset)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+
+    constexpr uint32_t at = 0xFF2000;
+    const uint8_t code[] = {
+        0x33, 0xFC, 0x00, 0x00, 0x00, 0xA1, 0x11, 0x00,   // move.w #$0000,$A11100  bus released
+        0x33, 0xFC, 0x01, 0x00, 0x00, 0xA1, 0x12, 0x00,   // move.w #$0100,$A11200  /RESET released
+        0x33, 0xFC, 0x01, 0x00, 0x00, 0xA1, 0x11, 0x00,   // move.w #$0100,$A11100  BUSREQ
+        0x33, 0xFC, 0x00, 0x00, 0x00, 0xA1, 0x12, 0x00,   // move.w #$0000,$A11200  /RESET asserted
+        0x33, 0xFC, 0x01, 0x00, 0x00, 0xA1, 0x12, 0x00,   // move.w #$0100,$A11200  /RESET released
+        0x33, 0xFC, 0x00, 0x00, 0x00, 0xA1, 0x11, 0x00,   // move.w #$0000,$A11100  bus released
+        0x60, 0xFE,                                       // bra.s *
+    };
+    REQUIRE(e.backend()->writeRegion(1, at & 0xFFFF, code, sizeof code));
+    e.parkM68kAt(at);
+    REQUIRE(e.stepAndWait(Cpu::M68K));
+
+    uint32_t pc = at + 8;
+    for (unsigned want : { 1u, 3u, 2u, 3u, 1u }) {
+        REQUIRE(e.stepAndWait(Cpu::M68K));
+        pc += 8;
+        REQUIRE(e.backend()->getM68kRegs().pc == pc);
+        CHECK_EQ(e.backend()->getZ80Regs().zstate, want);
+    }
+
+    // It belongs to the bus glue, not the CPU: setZ80Regs leaves it alone.
+    Z80Regs z = e.backend()->getZ80Regs();
+    z.zstate = 0;
+    e.backend()->setZ80Regs(z);
+    CHECK_EQ(e.backend()->getZ80Regs().zstate, 1u);
+}
+
+// A target comes from the operand that names it, with 16-bit arithmetic.
+TEST(listing_z80_flow_targets_from_disasm_text)
+{
+    struct Case { std::vector<uint8_t> bytes; uint16_t addr; std::optional<uint32_t> target; };
+    const Case cases[] = {
+        { { 0xC3, 0x34, 0x12 }, 0x0100, 0x1234 },          // jp $1234
+        { { 0xC2, 0x34, 0x12 }, 0x0100, 0x1234 },          // jp nz,$1234
+        { { 0xFA, 0x00, 0x80 }, 0x0100, 0x8000 },          // jp m,$8000
+        { { 0x18, 0xFE },       0x0100, 0x0100 },          // jr $
+        { { 0x20, 0x02 },       0x0100, 0x0104 },          // jr nz
+        { { 0x38, 0x80 },       0x0100, 0x0082 },          // jr c, back 128
+        { { 0x10, 0xFE },       0x0100, 0x0100 },          // djnz $
+        { { 0x18, 0x7F },       0xFFF0, 0x0071 },          // past $FFFF
+        { { 0x18, 0x80 },       0x0010, 0xFF92 },          // below 0
+        { { 0xCD, 0x20, 0x01 }, 0x0100, 0x0120 },          // call $0120
+        { { 0xC4, 0x20, 0x01 }, 0x0100, 0x0120 },          // call nz,$0120
+        { { 0xFC, 0x01, 0x00 }, 0x0100, 0x0001 },          // call m,$0001
+        { { 0xC7 },             0x0100, 0x0000 },          // rst $00
+        { { 0xFF },             0x0100, 0x0038 },          // rst $38
+        { { 0xE9 },             0x0100, std::nullopt },    // jp (hl)
+        { { 0xDD, 0xE9 },       0x0100, std::nullopt },    // jp (ix)
+        { { 0xFD, 0xE9 },       0x0100, std::nullopt },    // jp (iy)
+        { { 0xC9 },             0x0100, std::nullopt },    // ret
+        { { 0xC0 },             0x0100, std::nullopt },    // ret nz
+        { { 0xED, 0x4D },       0x0100, std::nullopt },    // reti
+        { { 0x21, 0x00, 0x10 }, 0x0100, std::nullopt },    // ld hl,$1000
+        { { 0x3A, 0x00, 0x10 }, 0x0100, std::nullopt },    // ld a,($1000)
+        { { 0x22, 0x00, 0x10 }, 0x0100, std::nullopt },    // ld ($1000),hl
+        { { 0xDB, 0x12 },       0x0100, std::nullopt },    // in a,($12)
+        { { 0x3E, 0x12 },       0x0100, std::nullopt },    // ld a,$12
+        { { 0xDD, 0x00 },       0x0100, std::nullopt },    // db $dd
+    };
+    for (const auto& c : cases) {
+        const auto line = disasm::disasmZ80(c.bytes.data(), c.bytes.size(), c.addr);
+        const auto got = disasm::flowTargetZ80(line.text);
         if (got != c.target)
             t::fail(__FILE__, __LINE__,
                     t::hexBytes(c.bytes) + " at " + t::hex(c.addr) + " \"" + line.text + "\": got "
