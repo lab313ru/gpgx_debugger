@@ -255,6 +255,56 @@ TEST(m68k_step_over_a_call_that_hits_a_breakpoint_forgets_its_target)
     REQUIRE(e.pauseAndWait());
 }
 
+// Clients know their breakpoints by id, so turning one off and on again must
+// leave it under the same id, and off must really mean off.
+TEST(breakpoint_toggles_in_place_and_keeps_its_id)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+
+    Breakpoint bp;
+    bp.type = BpType::PC; bp.cpu = Cpu::M68K; bp.is_vdp = false;
+    bp.start = kSubEntry; bp.end = kSubEntry;
+    const int id = e.backend()->addBreakpoint(bp);
+
+    REQUIRE(e.backend()->setBreakpointEnabled(id, false));
+    auto listed = e.backend()->getBreakpoints();
+    REQUIRE(listed.size() == 1);
+    CHECK_EQ(listed[0].id, id);
+    CHECK(!listed[0].enabled);
+
+    uint64_t s = e.pauseSeq();
+    e.backend()->resume();
+    CHECK(!e.waitPause(s, 400));            // the loop runs through kSubEntry
+    REQUIRE(e.pauseAndWait());
+
+    REQUIRE(e.backend()->setBreakpointEnabled(id, true));
+    listed = e.backend()->getBreakpoints();
+    REQUIRE(listed.size() == 1);
+    CHECK_EQ(listed[0].id, id);
+    CHECK(listed[0].enabled);
+    s = e.pauseSeq();
+    e.backend()->resume();
+    REQUIRE(e.waitPause(s));
+    CHECK_EQ(e.pausePc(), kSubEntry);
+
+    CHECK(!e.backend()->setBreakpointEnabled(id + 1000, false));
+    e.backend()->clearBreakpoints();
+}
+
+// A step asked for while no ROM runs stays armed in the backend, and loading
+// a ROM used to keep it: the game then stopped on its first instruction.
+TEST(step_asked_for_before_start_does_not_stop_the_rom)
+{
+    t::Emu e;
+    e.backend()->stepInto(Cpu::M68K);
+    e.backend()->stepInto(Cpu::Z80);
+    REQUIRE(e.start());
+    CHECK(!e.waitPause(0, 400));
+    REQUIRE(e.pauseAndWait());
+}
+
 // Pausing is a one-instruction step underneath, so a pause aimed at a machine
 // already parked used to stop the next resume one instruction in.
 TEST(m68k_pause_on_a_parked_machine_does_not_stop_the_next_resume)

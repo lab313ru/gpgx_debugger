@@ -587,6 +587,39 @@ TEST(bridge_client_stops_claiming_health_after_the_server_goes)
     CHECK(!rb.isConnected());
 }
 
+TEST(bridge_toggles_a_breakpoint_in_place)
+{
+    Wired w(25);
+    REQUIRE(w.ok);
+    Raw raw;
+    REQUIRE(raw.connect(portFor(25)));
+
+    Breakpoint bp;
+    bp.type = BpType::PC; bp.cpu = Cpu::M68K; bp.is_vdp = false;
+    bp.start = kSubEntry; bp.end = kSubEntry;
+    const int id = w.remote.addBreakpoint(bp);
+    REQUIRE(id >= 0);
+
+    CHECK(w.remote.setBreakpointEnabled(id, false));
+    auto listed = w.remote.getBreakpoints();
+    REQUIRE(listed.size() == 1);
+    CHECK_EQ(listed[0].id, id);
+    CHECK(!listed[0].enabled);
+    CHECK(!w.emu.backend()->getBreakpoints()[0].enabled);
+
+    CHECK(w.remote.setBreakpointEnabled(id, true));
+    listed = w.remote.getBreakpoints();
+    REQUIRE(listed.size() == 1);
+    CHECK_EQ(listed[0].id, id);
+    CHECK(listed[0].enabled);
+
+    CHECK(!w.remote.setBreakpointEnabled(id + 1000, false));
+    CHECK(raw.cmd("bpenable").rfind("err usage", 0) == 0);
+    CHECK(raw.cmd("bpenable " + std::to_string(id)).rfind("err usage", 0) == 0);
+    CHECK(raw.cmd("bpenable " + std::to_string(id) + " 2").rfind("err usage", 0) == 0);
+    w.remote.clearBreakpoints();
+}
+
 // ---------------------------------------------------------------------------
 // A host that models run control and breakpoints itself (IDA does) must be the
 // one that performs them, or its view goes stale: IDA owns the Breakpoints
@@ -602,7 +635,7 @@ TEST(bridge_routes_mutations_through_the_host_when_one_is_installed)
     REQUIRE(raw.connect(portFor(17)));
 
     struct Seen {
-        int resume = 0, pause = 0, add = 0, del = 0, clear = 0;
+        int resume = 0, pause = 0, add = 0, del = 0, enable = 0, clear = 0;
     } seen;
 
     EmuHost::HostMutations hm;
@@ -614,6 +647,7 @@ TEST(bridge_routes_mutations_through_the_host_when_one_is_installed)
         ++seen.add; if (id) *id = 4242; return true;
     };
     hm.removeBreakpoint = [&](int) { ++seen.del;   return true; };
+    hm.enableBreakpoint = [&](int, bool) { ++seen.enable; return true; };
     hm.clearBreakpoints = [&]      { ++seen.clear; return true; };
     w.emu.host()->setHostMutations(hm);
 
@@ -621,6 +655,7 @@ TEST(bridge_routes_mutations_through_the_host_when_one_is_installed)
     CHECK_STR(raw.cmd("pause"),  "ok");
     // The id the host reports is the one the client is told.
     CHECK_STR(raw.cmd("bpadd x 200 200"), "ok 4242");
+    CHECK_STR(raw.cmd("bpenable 4242 0"), "ok 4242");
     CHECK_STR(raw.cmd("bpdel 4242"), "ok");
     CHECK_STR(raw.cmd("bpclear"), "ok");
 
@@ -628,6 +663,7 @@ TEST(bridge_routes_mutations_through_the_host_when_one_is_installed)
     CHECK_EQ(seen.pause,  1);
     CHECK_EQ(seen.add,    1);
     CHECK_EQ(seen.del,    1);
+    CHECK_EQ(seen.enable, 1);
     CHECK_EQ(seen.clear,  1);
 
     // ...and the backend was NOT touched behind the host's back: the host said

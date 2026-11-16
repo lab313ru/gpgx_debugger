@@ -13,6 +13,7 @@
 #include "views/MemoryView.h"
 #include "views/RamSearchView.h"
 #include "views/RamWatchView.h"
+#include "views/CpuDebugView.h"
 #include "debugger/GpgxBackend.h"
 #include "ViewSettings.h"
 
@@ -75,6 +76,14 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
     const QByteArray docks = s.value(QStringLiteral("Window/state")).toByteArray();
     if (!geom.isEmpty())  restoreGeometry(geom);
     if (!docks.isEmpty()) restoreState(docks);
+
+    // A layout saved before the Debugger dock existed keeps whichever tab it had
+    // in front, so the new dock would start hidden behind the Hex Editor: bring
+    // it forward. Not yet, though: the dock tab bars appear when the window is
+    // first laid out, and raise() needs one.
+    if (!docks.isEmpty() && !s.value(QStringLiteral("Window/stateHasDebugger")).toBool())
+        if (auto* d = findChild<QDockWidget*>(QStringLiteral("Debugger")))
+            QTimer::singleShot(0, d, &QWidget::raise);
 }
 
 MainWindow::~MainWindow()
@@ -96,6 +105,7 @@ void MainWindow::stopEmulator()
     if (emuHost_) emuHost_->stop();
     delete audio_; audio_ = nullptr;      // outlives the host: the sink writes to it
     refreshTimer_.stop();
+    if (debuggerView_) debuggerView_->setRunning(false);
     attachLabel_->setText(QStringLiteral("IDA attach: open a ROM first"));
     attachLabel_->setToolTip(QString());
 }
@@ -107,6 +117,7 @@ void MainWindow::closeEvent(QCloseEvent* e)
     auto& s = viewsettings::store();
     s.setValue(QStringLiteral("Window/geometry"), saveGeometry());
     s.setValue(QStringLiteral("Window/state"), saveState());
+    s.setValue(QStringLiteral("Window/stateHasDebugger"), true);
 
     stopEmulator();
     e->accept();
@@ -146,6 +157,7 @@ void MainWindow::buildDocks()
     hexView_       = new MemoryView(this);
     ramSearchView_ = new RamSearchView(this);
     ramWatchView_  = new RamWatchView(this);
+    debuggerView_  = new CpuDebugView(this);
 
     vdpRamView_->setBackend(backend_);
     vdpRegView_->setBackend(backend_);
@@ -157,6 +169,7 @@ void MainWindow::buildDocks()
     hexView_->setBackend(backend_);
     ramSearchView_->setBackend(backend_);
     ramWatchView_->setBackend(backend_);
+    debuggerView_->setBackend(backend_);
 
     connect(ramSearchView_, &RamSearchView::addWatchRequested,
             ramWatchView_,  &RamWatchView::addWatch);
@@ -186,9 +199,13 @@ void MainWindow::buildDocks()
     auto* dHex    = addDock(QStringLiteral("Hex Editor"),      hexView_,       Qt::BottomDockWidgetArea, true);
     auto* dSearch = addDock(QStringLiteral("RAM Search"),      ramSearchView_, Qt::BottomDockWidgetArea, false);
     auto* dWatch  = addDock(QStringLiteral("RAM Watch"),       ramWatchView_,  Qt::BottomDockWidgetArea, false);
+    // The standalone has no IDA, so it carries its own disassembly, registers
+    // and breakpoints; it is the window a debugging session starts in.
+    auto* dDebug  = addDock(QStringLiteral("Debugger"),        debuggerView_,  Qt::BottomDockWidgetArea, true);
     tabifyDockWidget(dHex, dSearch);
     tabifyDockWidget(dHex, dWatch);
-    dHex->raise();
+    tabifyDockWidget(dHex, dDebug);
+    dDebug->raise();
 
     addDock(QStringLiteral("Save States"),     statesView_, Qt::LeftDockWidgetArea, false);
     addDock(QStringLiteral("Plane Explorer"),  planeView_, Qt::LeftDockWidgetArea, false);
@@ -272,6 +289,7 @@ void MainWindow::openRomFile(const QString& path)
     setWindowTitle(fi.completeBaseName() + QStringLiteral(" — Genesis Plus GX Debugger"));
 
     refreshTimer_.start();
+    debuggerView_->setRunning(true);
     statusLabel_->setText(QStringLiteral("Running: ") + path);
     actPause_->setEnabled(true);
     actResume_->setEnabled(false);
@@ -292,6 +310,7 @@ void MainWindow::refreshViews()
     refreshIfVisible(hexView_);
     refreshIfVisible(ramSearchView_);
     refreshIfVisible(ramWatchView_);
+    refreshIfVisible(debuggerView_);
 }
 
 void MainWindow::onPaused(uint32_t pc, Cpu cpu)
@@ -307,6 +326,7 @@ void MainWindow::onPaused(uint32_t pc, Cpu cpu)
     hexView_->refresh();
     ramSearchView_->refresh();
     ramWatchView_->refresh();
+    debuggerView_->followPc();
 
     if (audio_) audio_->pause(true);     // nothing refills it while stopped
     actPause_->setEnabled(false);
@@ -328,6 +348,7 @@ void MainWindow::onResumed()
     actStepInto_->setEnabled(false);
     actStepOver_->setEnabled(false);
     actStepOut_->setEnabled(false);
+    debuggerView_->refresh();            // its Pause button
     statusLabel_->setText(QStringLiteral("Running"));
 }
 

@@ -23,6 +23,7 @@ class SoundDebugView;
 class MemoryView;
 class RamSearchView;
 class RamWatchView;
+class CpuDebugView;
 
 class MainWindow : public QMainWindow
 {
@@ -76,6 +77,7 @@ private:
     MemoryView*        hexView_       = nullptr;
     RamSearchView*     ramSearchView_ = nullptr;
     RamWatchView*      ramWatchView_  = nullptr;
+    CpuDebugView*      debuggerView_  = nullptr;   // standalone only; IDA has its own
 
     QLabel* statusLabel_ = nullptr;
     QLabel* attachLabel_ = nullptr;           // how IDA reaches this session

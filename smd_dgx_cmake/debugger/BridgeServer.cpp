@@ -901,6 +901,18 @@ std::string BridgeServer::handle(const std::string& line, Client& client)
         return "ok";
     }
 
+    if (cmd == "bpenable") {
+        uint32_t idv = 0, on = 0;
+        if (!parseNum(arg(), idv, 10) || !parseNum(arg(), on, 10) || on > 1)
+            return "err usage: bpenable <id> <0|1>";
+        const int id = (int)idv;
+        const auto& hm = host_->hostMutations();
+        if ((hm.enableBreakpoint && hm.enableBreakpoint(id, on != 0))
+            || be->setBreakpointEnabled(id, on != 0))
+            return "ok " + std::to_string(id);
+        return "err no breakpoint " + std::to_string(id);
+    }
+
     if (cmd == "bpclear") {
         const auto& hm = host_->hostMutations();
         if (!(hm.clearBreakpoints && hm.clearBreakpoints()))
