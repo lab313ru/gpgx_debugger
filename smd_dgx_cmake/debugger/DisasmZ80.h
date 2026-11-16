@@ -31,6 +31,10 @@
 //   - a DD or FD in front of an opcode that does not touch HL, H, L or (HL),
 //     or in front of another DD, FD or ED, only delays the next opcode: it is
 //     "db      $dd" (or $fd) with len 1, and the next line is the instruction.
+//     The core runs the prefix and that instruction as one step, though (no
+//     interrupt and no hook between them), so a step from the prefix line
+//     ends after the next line too, and a PC breakpoint on the next line
+//     fires only when code jumps straight to it.
 //
 // Reads no more than avail bytes. An instruction longer than that comes back
 // as "db      $xx" (its first byte) with len 1, never with operands made up

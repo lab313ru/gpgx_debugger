@@ -4,7 +4,7 @@
 #include <initializer_list>
 #include <string>
 
-// Decoded with the field method of "Decoding Z80 Opcodes" (C. Young): an
+// Decoded with the field method of "Decoding Z80 Opcodes" (Cristian Dinu): an
 // opcode byte is split into x = bits 7-6, y = bits 5-3, z = bits 2-0, and y
 // again into p = bits 5-4, q = bit 3. Each table below is indexed by one of
 // those fields.

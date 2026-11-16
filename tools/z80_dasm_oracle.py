@@ -211,22 +211,28 @@ def rule(name, oracle, reason):
 
 
 # Sources: the Zilog Z80 CPU User Manual (UM0080) for the documented set, and
-# Sean Young, "The Undocumented Z80 Documented" (v0.91) for the rest. Both
-# agree with how the core this debugger runs (MAME's Z80, in Genesis Plus GX)
-# executes these opcodes.
+# Sean Young, "The Undocumented Z80 Documented" (v0.91) for the rest. The core
+# this debugger runs (MAME's Z80, in Genesis Plus GX) executes these opcodes
+# with the same effect; where it names one differently, the rule says so.
 
 def _db(text, first):
     """Whether the oracle left the bytes as data, starting with first."""
     return text == "db %d" % first or text.startswith("db %d," % first)
 
 
+_ED_MIRROR_TEXT = {4: lambda y: "neg", 5: lambda y: "retn", 6: lambda y: "im " + "00120012"[y]}
+
+
 @rule("ed-mirror", "*",
       "ED 4C/54/5C/64/6C/74/7C run NEG, ED 55/5D/65/6D/75/7D run RETN, ED 4E/66/6E/76/7E "
-      "run IM 0/0/0/1/2 (Young, ED table); the oracle leaves them as data")
+      "run IM 0/0/0/1/2 (Young, ED table); the oracle leaves them as data. The core runs "
+      "ED 5D/6D/7D as its RETI macro, which does what RETN does (IFF1 = IFF2), so they "
+      "are spelled retn as in Young")
 def _ed_mirror(c, o, t):
     return (c[0] == 0xED and _x(c[1]) == 1 and _z(c[1]) in (4, 5, 6)
             and c[1] not in (0x44, 0x45, 0x4D, 0x46, 0x56, 0x5E)
-            and o[0] == 2 and _db(t[1], 0xED))
+            and o == (2, _ED_MIRROR_TEXT[_z(c[1])](_y(c[1])))
+            and _db(t[1], 0xED))
 
 
 @rule("ed-ld-hl-alias", "z80dasm",
@@ -247,8 +253,10 @@ def _ed_nop(c, o, t):
 @rule("index-prefix-alone", "z80dasm",
       "DD/FD before an opcode that does not use HL/H/L/(HL), or before DD/FD/ED, only "
       "costs 4 T-states; the next opcode then runs unchanged (Young, DD/FD prefixes), so "
-      "the prefix is a 1-byte line. z80dasm glues it to the next bytes as an 'illegal "
-      "sequence' of fixed size; objdump agrees with us")
+      "the prefix is a 1-byte line. The core still runs the prefix and that opcode as one "
+      "step, so a breakpoint on the line after the prefix fires only on a jump to it. "
+      "z80dasm glues the prefix to the next bytes as an 'illegal sequence' of fixed size; "
+      "objdump agrees with us")
 def _index_alone(c, o, t):
     return (c[0] in (0xDD, 0xFD) and o == (1, "db %d" % c[0])
             and t[1].startswith("db %d," % c[0]))

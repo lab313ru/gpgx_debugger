@@ -105,6 +105,22 @@ const std::vector<Golden>& goldens()
         { { 0xED, 0x5E },                      2, 0x4000, 2, "im      2" },
         { { 0xED, 0x4E },                      2, 0x4000, 2, "im      0" },  // mirror, mode 0
         { { 0xED, 0x76 },                      2, 0x4000, 2, "im      1" },  // mirror
+        // The other mirrors: ED x4 is neg, ED x5 retn (5D/6D/7D included,
+        // which the core runs as RETI with the same effect), ED x6 im.
+        { { 0xED, 0x4C },                      2, 0x4000, 2, "neg" },
+        { { 0xED, 0x54 },                      2, 0x4000, 2, "neg" },
+        { { 0xED, 0x5C },                      2, 0x4000, 2, "neg" },
+        { { 0xED, 0x64 },                      2, 0x4000, 2, "neg" },
+        { { 0xED, 0x6C },                      2, 0x4000, 2, "neg" },
+        { { 0xED, 0x74 },                      2, 0x4000, 2, "neg" },
+        { { 0xED, 0x5D },                      2, 0x4000, 2, "retn" },
+        { { 0xED, 0x65 },                      2, 0x4000, 2, "retn" },
+        { { 0xED, 0x6D },                      2, 0x4000, 2, "retn" },
+        { { 0xED, 0x75 },                      2, 0x4000, 2, "retn" },
+        { { 0xED, 0x7D },                      2, 0x4000, 2, "retn" },
+        { { 0xED, 0x66 },                      2, 0x4000, 2, "im      0" },
+        { { 0xED, 0x6E },                      2, 0x4000, 2, "im      0" },
+        { { 0xED, 0x7E },                      2, 0x4000, 2, "im      2" },
         { { 0xED, 0x47 },                      2, 0x4000, 2, "ld      i,a" },
         { { 0xED, 0x5F },                      2, 0x4000, 2, "ld      a,r" },
         { { 0xED, 0x67 },                      2, 0x4000, 2, "rrd" },
