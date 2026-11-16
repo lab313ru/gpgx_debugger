@@ -288,9 +288,10 @@ means building the whole package on an older distribution, not only the app.
 ctest --test-dir <build> --output-on-failure
 ```
 
-42 cases over the shared debug layer — no Qt, no IDA, no SDL, and no ROM file:
-the tests synthesise their own Mega Drive, so nothing is ever skipped for a
-missing dump.
+The cases cover the shared debug layer, the bridge, the 68000 disassembler and
+listing, and the core options — no Qt, no IDA, no SDL, and no ROM file: the
+tests synthesise their own Mega Drive (and the boot and lock-on files the
+options look for), so nothing is ever skipped for a missing dump.
 
 ---
 
