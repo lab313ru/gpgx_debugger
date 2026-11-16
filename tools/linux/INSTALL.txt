@@ -40,8 +40,9 @@ glibc 2.35, Debian 12 has 2.36, Ubuntu 24.04 has 2.39.
 
 Sound goes through SDL2, loaded at run time from the system
 (libSDL2-2.0.so.0; on Ubuntu, the libsdl2-2.0-0 package). Without it the
-emulator runs silently and everything else works. DGX_NO_AUDIO=1 silences
-it on purpose.
+emulator runs silently, everything else works, and the reason goes to
+IDA's stderr ("smd_dgx: no sound, SDL2 did not load: ..."). DGX_NO_AUDIO=1
+silences it on purpose.
 
 
 USE

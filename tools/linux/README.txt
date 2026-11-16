@@ -2,7 +2,8 @@ SMD DGX - standalone debugger for Linux
 =======================================
 
 Sega Mega Drive / Genesis debugger built on Genesis Plus GX.
-Linux x86_64. Qt @QT_VERSION@ and SDL2 come with it: nothing to install.
+Linux x86_64. Qt @QT_VERSION@ and SDL2 come with it; the few libraries it
+takes from the system are listed under REQUIREMENTS.
 
   @VERSION@
   https://github.com/DramaDesu/gpgx_debugger
@@ -42,9 +43,28 @@ REQUIREMENTS
   the package, the Wayland one is not. On Wayland Qt first says it cannot
   find the "wayland" plugin, then opens the window through XWayland.
 
-  Like any AppImage, it takes the libraries every desktop has from the
-  system: libstdc++, X11/xcb, OpenGL/EGL, fontconfig, freetype, harfbuzz,
-  ALSA (libasound) and zlib. Everything else is in usr/lib.
+  Like any AppImage, it takes the libraries that belong to the desktop and
+  its graphics drivers from the system rather than carrying them. A desktop
+  install has them; a minimal or server install may not. To start at all,
+  it needs these:
+
+@START_LIBS@
+
+  which on Debian and Ubuntu come from
+
+@START_DEBS@
+
+  Without one of them it does not start, and the dynamic linker names the
+  missing file. For sound, the bundled SDL2 needs these as well:
+
+@SOUND_LIBS@
+
+  which on Debian and Ubuntu come from
+
+@SOUND_DEBS@
+
+  Without them the app runs silently and prints why on stderr
+  ("smd_dgx: no sound, SDL2 did not load: ...").
 
   Sound: the bundled SDL2 plays through the system's PulseAudio/PipeWire or
   ALSA. If none answers, the emulator runs silently. DGX_NO_AUDIO=1 silences
@@ -106,10 +126,17 @@ drive the plugin. The status bar shows the port.
 LICENCE
 -------
 
-Genesis Plus GX licence (non-commercial) - see LICENSE.txt.
+Genesis Plus GX licence (non-commercial): LICENSE.txt. It lies next to
+this README in the folder, at the top of the AppImage (which
+--appimage-extract unpacks into squashfs-root/), and next to the AppImage
+as smd_dgx_linux_LICENSE.txt.
 Genesis Plus GX by Charles MacDonald and Eke-Eke.
 Gens debug tooling this follows by DrMefistO (lab313ru).
 
-usr/lib holds unmodified builds of Qt (LGPL-3), SDL2 (zlib licence) and the
-libraries they need, taken from the build machine's distribution, each under
-its own licence; their copyright files are in usr/share/doc.
+usr/lib and usr/plugins hold Qt (LGPL-3), SDL2 (zlib licence) and the
+libraries they need, each under its own licence. They are the build
+machine's distribution packages, which linuxdeploy copied, pointed at
+usr/lib (RUNPATH) and ran strip over. BUNDLED.txt, next to this README,
+names the distribution and each file's package, version and source
+package; the sources are the distribution's. Their copyright files are in
+usr/share/doc.
