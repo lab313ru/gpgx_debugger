@@ -69,6 +69,11 @@ endif()
 add_library(musashi_dasm STATIC
   "${CMAKE_CURRENT_LIST_DIR}/third_party/musashi_dasm/m68kdasm.c")
 target_compile_definitions(musashi_dasm PRIVATE _CRT_SECURE_NO_WARNINGS)   # sprintf
+# GCC sizes "#%s" from the 21-byte buffer behind make_signed_hex_str_*, not from
+# what goes in it: the longest operand is "#-$80000000", 11 characters.
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+  target_compile_options(musashi_dasm PRIVATE -Wno-format-overflow)
+endif()
 
 # DisasmListing builds the lines a disassembly window shows on top of it and
 # the IDebugBackend interface alone, so it needs no emulator either.
