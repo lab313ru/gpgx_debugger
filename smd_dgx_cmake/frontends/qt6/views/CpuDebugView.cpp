@@ -381,21 +381,21 @@ QWidget* CpuDebugView::buildZ80Tab()
         [](const Z80Regs& r) { return r.iff2 != 0; }, [](Z80Regs& r, bool on) { r.iff2 = on; }));
     iff->addStretch();
 
-    // read-only: the bank window and the bus
-    auto mkInfo = [](const QString& name) {
-        auto* l = new QLabel;
-        l->setFont(monoFont());
-        l->setAccessibleName(name);
-        l->setTextInteractionFlags(Qt::TextSelectableByMouse);
-        return l;
+    // read-only, as USP and ISP are on the 68000 tab: the bank window and the bus
+    auto mkInfo = [](const QString& name, const QString& tip) {
+        auto* e = new QLineEdit;
+        e->setFont(monoFont());
+        e->setAccessibleName(name);
+        e->setToolTip(tip);
+        e->setReadOnly(true);
+        return e;
     };
-    z80Bank_ = mkInfo(QStringLiteral("Z80 bank"));
-    z80Bank_->setToolTip(QStringLiteral("Where the window at Z80 $8000-$FFFF looks on the 68000 bus"));
-    z80Bus_ = mkInfo(QStringLiteral("Z80 bus state"));
-    z80Bus_->setToolTip(QStringLiteral("What the 68000 does to the Z80 through $A11100 (BUSREQ) and $A11200 (RESET)"));
+    z80Bank_ = mkInfo(QStringLiteral("Z80 bank"), QStringLiteral(
+        "Where the window at Z80 $8000-$FFFF looks on the 68000 bus"));
+    z80Bus_ = mkInfo(QStringLiteral("Z80 bus state"), QStringLiteral(
+        "What the 68000 does to the Z80 through $A11100 (BUSREQ) and $A11200 (RESET)"));
     z80Held_ = new QLabel(QStringLiteral(
         "The Z80 is stopped: a Z80 step finishes only once the 68000 lets it run."));
-    z80Held_->setAccessibleName(QStringLiteral("Z80 step note"));
     z80Held_->setWordWrap(true);
     z80Held_->setVisible(false);
     auto* info = new QGridLayout;
@@ -705,9 +705,9 @@ void CpuDebugView::showZ80Registers(const Z80Regs& r)
     const QString bankText = QLatin1Char('$') + hex(bank, 6) + QStringLiteral(" ($")
                            + hex(bank, 6) + QStringLiteral("-$") + hex((bank + 0x7FFF) & 0xFFFFFF, 6)
                            + QLatin1Char(')');
-    if (z80Bank_->text() != bankText) z80Bank_->setText(bankText);
+    if (z80Bank_->text() != bankText) { z80Bank_->setText(bankText); z80Bank_->setCursorPosition(0); }
     const QString bus = z80BusText(r.zstate);
-    if (z80Bus_->text() != bus) z80Bus_->setText(bus);
+    if (z80Bus_->text() != bus) { z80Bus_->setText(bus); z80Bus_->setCursorPosition(0); }
     z80Held_->setVisible(r.zstate != 1 && r.zstate != kZ80StateUnknown);
 }
 

@@ -140,10 +140,10 @@ private:
         std::function<void(Z80Regs&, bool)> write;
     };
     std::vector<Z80Bit> z80Bits_;                   // the flags in F, IFF1, IFF2
-    QSpinBox* z80Im_   = nullptr;
-    QLabel*   z80Bank_ = nullptr;
-    QLabel*   z80Bus_  = nullptr;
-    QLabel*   z80Held_ = nullptr;                   // why a Z80 step may not finish yet
+    QSpinBox*  z80Im_   = nullptr;
+    QLineEdit* z80Bank_ = nullptr;
+    QLineEdit* z80Bus_  = nullptr;
+    QLabel*    z80Held_ = nullptr;                  // why a Z80 step may not finish yet
 
     QRadioButton* kindRadio_[6]{};
     QComboBox*    bpCpu_    = nullptr;              // the CPU of a PC breakpoint
