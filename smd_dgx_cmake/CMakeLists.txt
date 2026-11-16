@@ -75,10 +75,12 @@ if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
   target_compile_options(musashi_dasm PRIVATE -Wno-format-overflow)
 endif()
 
+# DisasmZ80 is our own decoder, no third-party code.
 # DisasmListing builds the lines a disassembly window shows on top of it and
 # the IDebugBackend interface alone, so it needs no emulator either.
 add_library(smd_dgx_disasm STATIC
   "${CMAKE_CURRENT_LIST_DIR}/debugger/Disasm68k.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/debugger/DisasmZ80.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/debugger/DisasmListing.cpp")
 target_include_directories(smd_dgx_disasm PUBLIC "${CMAKE_CURRENT_LIST_DIR}")
 target_include_directories(smd_dgx_disasm PRIVATE "${CMAKE_CURRENT_LIST_DIR}/third_party")
