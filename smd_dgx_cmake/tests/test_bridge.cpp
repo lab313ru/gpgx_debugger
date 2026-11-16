@@ -129,6 +129,8 @@ TEST(bridge_z80_registers_are_complete)
     CHECK_EQ(got.i, want.i);     CHECK_EQ(got.r, want.r);
     CHECK_EQ(got.im, want.im);   CHECK_EQ(got.iff1, want.iff1);
     CHECK_EQ(got.bank, w.emu.backend()->getZ80Regs().bank);
+    // The reply has no zstate: unknown, not a Z80 that reads as held in reset.
+    CHECK_EQ(got.zstate, kZ80StateUnknown);
 }
 
 TEST(bridge_m68k_registers_round_trip)

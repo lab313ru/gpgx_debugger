@@ -87,37 +87,75 @@ DisasmLine decodeAt(const Window& w, uint32_t a)
     return disasm68k(&w.bytes[a - w.lo], n, a);
 }
 
+// The lines before centre: the stream of lines from start, up to stop. When
+// a stream lands exactly on centre, stop is centre; otherwise the words
+// [stop, centre) are left for one-word lines.
+struct Lead {
+    uint32_t start;
+    uint32_t stop;
+};
+
 // The start in [w.lo, centre) whose stream of lines lands exactly on centre
-// with the most lines, or centre itself when no start lands. decoded receives
-// the line at every even address tried, indexed by (addr - w.lo) / 2.
-uint32_t resync(const Window& w, uint32_t centre, std::vector<DisasmLine>& decoded)
+// with the most lines. When no start lands (every stream steps over centre),
+// the stream with the most lines before the one that steps over, stopping at
+// that line, so the lines above centre never run out and scrolling up always
+// moves. decoded receives the line at every even address tried, indexed by
+// (addr - w.lo) / 2.
+Lead resync(const Window& w, uint32_t centre, std::vector<DisasmLine>& decoded)
 {
     const uint32_t n = (centre - w.lo) / 2;
     decoded.assign(n, {});
 
     // lines[i]: how many lines the stream from w.lo + 2i takes to reach
-    // centre, or -1 when it steps over it. Filled from centre down, so the
-    // line after each start has been counted already.
+    // centre, or -1 when it steps over it. For one that steps over, short_[i]
+    // counts its lines before the one that does, and stops[i] is where that
+    // line starts. Filled from centre down, so the line after each start has
+    // been counted already. A line that ends on an odd address (a dc.b where
+    // a readable run ends) counts as stepping over.
     std::vector<int> lines(n, -1);
-    uint32_t best = centre;
+    std::vector<int> short_(n, 0);
+    std::vector<uint32_t> stops(n, centre);
+    Lead best{ centre, centre };
+    Lead nearest{ centre, centre };
     int most = 0;
+    int mostShort = -1;
     for (uint32_t i = n; i-- > 0; ) {
         const uint32_t a = w.lo + 2 * i;
         decoded[i] = decodeAt(w, a);
         const uint32_t next = a + decoded[i].len;
+        const uint32_t j = (next - w.lo) / 2;
         int count = -1;
-        if (next == centre)
+        if (next == centre) {
             count = 1;
-        else if (next < centre && (next - w.lo) % 2 == 0 && lines[(next - w.lo) / 2] >= 0)
-            count = lines[(next - w.lo) / 2] + 1;
+        } else if (next < centre && (next - w.lo) % 2 == 0 && lines[j] >= 0) {
+            count = lines[j] + 1;
+        } else if (next < centre && (next - w.lo) % 2 == 0) {
+            short_[i] = short_[j] + 1;
+            stops[i] = stops[j];
+        } else {
+            stops[i] = a;
+        }
         lines[i] = count;
         // Strictly more: of two streams as long, the one starting nearer wins.
         if (count > most) {
             most = count;
-            best = a;
+            best = { a, centre };
+        }
+        if (count < 0 && short_[i] > mostShort) {
+            mostShort = short_[i];
+            nearest = { a, stops[i] };
         }
     }
-    return best;
+    return most > 0 ? best : nearest;
+}
+
+// A word left between a stream that does not land and centre.
+DisasmLine wordLine(const Window& w, uint32_t a)
+{
+    if (!w.readable(a) || !w.readable(a + 1)) return { a, 2, kNotReadable };
+    char t[16];
+    std::snprintf(t, sizeof t, "dc.w $%04x", (w.bytes[a - w.lo] << 8) | w.bytes[a + 1 - w.lo]);
+    return { a, 2, t };
 }
 
 std::string hexWords(const Window& w, uint32_t addr, uint32_t len)
@@ -220,10 +258,13 @@ std::vector<ListingLine> listAround(IDebugBackend& be, uint32_t centre, int befo
 
     std::vector<DisasmLine> decoded;
     std::vector<DisasmLine> lines;
-    for (uint32_t a = resync(w, centre, decoded); a < centre; ) {
+    const Lead lead = resync(w, centre, decoded);
+    for (uint32_t a = lead.start; a < lead.stop; ) {
         lines.push_back(decoded[(a - lo) / 2]);
         a += lines.back().len;
     }
+    for (uint32_t a = lead.stop; a < centre; a += 2)
+        lines.push_back(wordLine(w, a));
     if (lines.size() > size_t(before))
         lines.erase(lines.begin(), lines.end() - before);
 

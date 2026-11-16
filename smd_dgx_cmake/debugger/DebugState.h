@@ -14,12 +14,24 @@ struct Z80Regs {
     uint16_t af2, bc2, de2, hl2;
     uint16_t ix, iy, sp, pc;
     uint8_t  i, r, im, iff1, iff2, halt;
+    // How the bus glue holds the Z80 (the core's zstate): d0 = /RESET
+    // released, d1 = BUSREQ asserted, d2 = WAIT. The Z80 executes only while
+    // it is exactly 1; 3 means the 68000 owns the Z80 bus, 0 and 2 mean the
+    // Z80 sits in reset, or has locked up: the core also sets 0 itself when
+    // the Z80 reads or writes $800000-$DFFFFF outside the VDP and I/O through
+    // its bank window. Read-only: setZ80Regs leaves it alone. The bridge
+    // does not carry it, so over a socket it is kZ80StateUnknown.
+    uint8_t  zstate;
     // Base of the 68000-space window the Z80 sees at $8000..$FFFF. Not a CPU
     // register — it lives in the bus glue, shifted in one bit at a time
     // through $6000 — but a Z80 disassembly is unreadable without it: sample
     // banks and driver overlays all arrive through that window.
     uint32_t bank;
 };
+
+// Z80Regs::zstate when the backend cannot see the bus glue. The core uses
+// only the low three bits, so this cannot be a real state.
+inline constexpr uint8_t kZ80StateUnknown = 0xFF;
 
 // Byte-order contract for the raw pointers below (LSB_FIRST build). The core
 // accesses all of these as native uint16/uint32 words, so on a little-endian

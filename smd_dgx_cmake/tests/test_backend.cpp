@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 using namespace synth;
@@ -522,12 +523,12 @@ TEST(m68k_read_breakpoint_does_not_fire_on_a_write)
 namespace {
 
 // Load the Z80 test program and park the CPU on its first instruction, with
-// nothing executed yet. Returns false if the Z80 never came out of reset, which
-// would make every assertion below meaningless.
-//
-// The first step does not advance: the emulator stopped inside the *68000*
-// hook, so the Z80's own hook has not yet run for the instruction it is about
-// to execute. That first hook is where it stops.
+// nothing executed yet: it returns there from the ret at kZ80Sub, and a Z80
+// breakpoint stops it inside the Z80's own hook, before the instruction runs.
+// (Started on $0000 itself, the Z80 would run it: the instruction a CPU sits
+// on during the other CPU's stop passes its hook once.) Returns false if the
+// Z80 never came out of reset, which would make every assertion below
+// meaningless.
 bool armZ80(t::Emu& e)
 {
     const auto prog = buildZ80();
@@ -537,14 +538,22 @@ bool armZ80(t::Emu& e)
     if (back.size() != prog.size() || !std::equal(prog.begin(), prog.end(), back.begin()))
         return false;
 
+    const uint8_t ret0[2] = { 0x00, 0x00 };             // return address $0000
+    if (!e.backend()->writeRegion(2, 0x1FEE, ret0, 2)) return false;
     Z80Regs z = e.backend()->getZ80Regs();
-    z.pc = 0; z.sp = 0x1FF0; z.halt = 0;
+    z.pc = kZ80Sub; z.sp = 0x1FEE; z.halt = 0;
     e.backend()->setZ80Regs(z);
 
+    Breakpoint bp;
+    bp.type = BpType::PC; bp.cpu = Cpu::Z80; bp.start = 0; bp.end = 0;
+    const int id = e.backend()->addBreakpoint(bp);
+    const uint64_t s = e.pauseSeq();
+    e.backend()->resume();
     // If the bus were still held, this would never complete; it proves the Z80
     // is actually executing.
-    if (!e.stepAndWait(Cpu::Z80, 3000)) return false;
-    return e.backend()->getZ80Regs().pc == 0;
+    const bool stopped = e.waitPause(s, 3000);
+    e.backend()->removeBreakpoint(id);
+    return stopped && e.pauseCpu() == Cpu::Z80 && e.backend()->getZ80Regs().pc == 0;
 }
 
 } // namespace
@@ -564,6 +573,192 @@ TEST(z80_steps_one_instruction)
     REQUIRE(e.stepAndWait(Cpu::Z80));                     // xor a
     CHECK_EQ(e.backend()->getZ80Regs().pc, kZ80CallNotTaken);
     CHECK_EQ(e.backend()->getZ80Regs().af & 0x40, 0x40u); // Z set by xor a
+}
+
+namespace {
+// Where the 68000's main loop goes after each of its instructions.
+std::optional<uint32_t> loopSuccessor(uint32_t pc)
+{
+    switch (pc) {
+    case kJsr:          return kSubEntry;
+    case kSubEntry:     return kSubRts;
+    case kSubRts:       return kAfterJsr;
+    case kAfterJsr:     return kAfterJsr + 2;
+    case kAfterJsr + 2: return kJsr;
+    default:            return std::nullopt;
+    }
+}
+} // namespace
+
+// Stopped by the 68000, the Z80 sits on an instruction its hook has not seen.
+// A Z80 step runs that instruction; it used to stop on it without moving.
+TEST(z80_step_after_a_68000_stop_runs_one_instruction)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+    REQUIRE(armZ80(e));
+    // pause() does nothing on a parked machine; a 68000 step is a 68000 stop.
+    REQUIRE(e.stepAndWait(Cpu::M68K));
+    REQUIRE(e.pauseCpu() == Cpu::M68K);
+
+    Z80Regs z = e.backend()->getZ80Regs();
+    z.pc = 0; z.sp = 0x1000;
+    e.backend()->setZ80Regs(z);
+
+    REQUIRE(e.stepAndWait(Cpu::Z80));                     // ld sp,$1FF0
+    CHECK(e.pauseCpu() == Cpu::Z80);
+    CHECK_EQ(e.backend()->getZ80Regs().pc, kZ80Xor);
+    CHECK_EQ(e.backend()->getZ80Regs().sp, 0x1FF0u);
+}
+
+// The same the other way round: stopped by the Z80, the 68000 is between
+// instructions and a 68000 step runs the one it sits on.
+TEST(m68k_step_after_a_z80_stop_runs_one_instruction)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+    REQUIRE(armZ80(e));                                   // a Z80 stop
+
+    const uint32_t at = e.backend()->getM68kRegs().pc & 0xFFFFFF;
+    const auto next = loopSuccessor(at);
+    REQUIRE(next.has_value());
+    REQUIRE(e.stepAndWait(Cpu::M68K));
+    CHECK(e.pauseCpu() == Cpu::M68K);
+    CHECK_EQ(e.pausePc(), *next);
+}
+
+// Run from a Z80 stop with a 68000 breakpoint on the instruction the 68000
+// sits on: that instruction runs, and the next breakpoint is the one that
+// fires, not the same one at once.
+TEST(breakpoint_where_the_other_cpu_sits_does_not_refire_on_run)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+    REQUIRE(armZ80(e));                                   // a Z80 stop
+
+    const uint32_t at = e.backend()->getM68kRegs().pc & 0xFFFFFF;
+    const auto next = loopSuccessor(at);
+    REQUIRE(next.has_value());
+    Breakpoint bp;
+    bp.type = BpType::PC; bp.cpu = Cpu::M68K;
+    bp.start = bp.end = at;    e.backend()->addBreakpoint(bp);
+    bp.start = bp.end = *next; e.backend()->addBreakpoint(bp);
+
+    const uint64_t s = e.pauseSeq();
+    e.backend()->resume();
+    REQUIRE(e.waitPause(s, 3000));
+    CHECK(e.pauseCpu() == Cpu::M68K);
+    CHECK_EQ(e.pausePc(), *next);
+    e.backend()->clearBreakpoints();
+}
+
+// R's bit 7 is kept apart from the 7 bits that count (z80.h): what is
+// written comes back, and the count wraps within the low 7 bits.
+TEST(z80_r_keeps_bit_7_across_steps)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+    REQUIRE(armZ80(e));
+
+    for (uint8_t r : { uint8_t(0xFF), uint8_t(0x7F), uint8_t(0x80) }) {
+        Z80Regs z = e.backend()->getZ80Regs();
+        z.r = r;
+        e.backend()->setZ80Regs(z);
+        CHECK_EQ(e.backend()->getZ80Regs().r, uint32_t(r));
+    }
+
+    // From $FF one opcode fetch wraps the low 7 bits to 0 and leaves bit 7.
+    Z80Regs z = e.backend()->getZ80Regs();
+    z.r = 0xFF;
+    e.backend()->setZ80Regs(z);
+    REQUIRE(e.stepAndWait(Cpu::Z80));                     // ld sp,$1FF0
+    CHECK_EQ(e.backend()->getZ80Regs().r, 0x80u);
+}
+
+// While the 68000 holds the Z80 in reset, a Z80 step cannot finish, and the
+// machine runs on; the backend must say it resumed, or the window would still
+// show it paused.
+TEST(z80_step_while_held_in_reset_reports_resumed)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+
+    constexpr uint32_t at = 0xFF2000;
+    const uint8_t code[] = {
+        0x33, 0xFC, 0x00, 0x00, 0x00, 0xA1, 0x12, 0x00,   // move.w #$0000,$A11200  /RESET asserted
+        0x60, 0xFE,                                       // bra.s *
+    };
+    REQUIRE(e.backend()->writeRegion(1, at & 0xFFFF, code, sizeof code));
+    e.parkM68kAt(at);
+    REQUIRE(e.stepAndWait(Cpu::M68K));
+    REQUIRE(e.stepAndWait(Cpu::M68K));
+    REQUIRE(e.backend()->getM68kRegs().pc == at + 8);
+    REQUIRE((e.backend()->getZ80Regs().zstate & 1) == 0);
+
+    const uint64_t r = e.resumeSeq();
+    const uint64_t p = e.pauseSeq();
+    e.backend()->stepInto(Cpu::Z80);
+    CHECK(e.waitResume(r, 3000));
+    CHECK(!e.waitPause(p, 200));                          // still held: no stop
+    CHECK(!e.backend()->isPaused());
+    REQUIRE(e.pauseAndWait());
+}
+
+// $A11200 and the VDP's ports carry work RAM as their base only for DMA: a
+// write there must not land in work RAM at the same offset, and a read there
+// shows none of it.
+TEST(memory_io_and_vdp_pages_are_not_work_ram)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+
+    const uint8_t marker[2] = { 0x5A, 0xA5 };
+    REQUIRE(e.backend()->writeMemory(0xFF1200, marker, 2));
+    const uint8_t zero[2] = { 0, 0 };
+    CHECK(!e.backend()->writeMemory(0xA11200, zero, 2));
+    CHECK(!e.backend()->writeMemory(0xC00004, zero, 2));
+    const auto ram = e.backend()->readMemory(0xFF1200, 2);
+    REQUIRE(ram.size() == 2u);
+    CHECK_EQ(ram[0], 0x5Au);
+    CHECK_EQ(ram[1], 0xA5u);
+
+    for (uint32_t a : { 0xA11200u, 0xC01200u, 0x801200u }) {
+        const auto io = e.backend()->readMemory(a, 2);
+        REQUIRE(io.size() == 2u);
+        CHECK_EQ(io[0], 0xFFu);
+        CHECK_EQ(io[1], 0xFFu);
+    }
+}
+
+// $A00000-$A03FFF is Z80 RAM on the 68000's bus, mirrored once; the page's
+// base is work RAM (for DMA), which is not what lives there.
+TEST(memory_a0_page_is_z80_ram)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+
+    const uint8_t marker[2] = { 0x3C, 0xC3 };
+    REQUIRE(e.backend()->writeRegion(2, 0x0123, marker, 2));
+    for (uint32_t a : { 0xA00123u, 0xA02123u }) {
+        const auto z = e.backend()->readMemory(a, 2);
+        REQUIRE(z.size() == 2u);
+        CHECK_EQ(z[0], 0x3Cu);
+        CHECK_EQ(z[1], 0xC3u);
+    }
+
+    const uint8_t w = 0x77;
+    REQUIRE(e.backend()->writeMemory(0xA03FFF, &w, 1));
+    CHECK_EQ(e.backend()->readZ80Memory(0x1FFF, 1)[0], 0x77u);
+    const auto past = e.backend()->readMemory(0xA04000, 1);     // the YM2612
+    REQUIRE(past.size() == 1u);
+    CHECK_EQ(past[0], 0xFFu);
 }
 
 TEST(z80_step_out_returns_to_the_caller)

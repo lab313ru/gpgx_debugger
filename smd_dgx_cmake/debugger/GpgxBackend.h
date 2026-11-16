@@ -146,6 +146,14 @@ private:
     // A HALT re-executes the same address forever, so a breakpoint there would
     // retrigger the instant it resumes. Skip one hit at the address we stopped.
     std::atomic<int>  z80ResumeSkip_ {-1};
+    // Both CPUs' hooks run before the instruction at PC. Parked in one CPU's
+    // hook, the other CPU sits on an instruction its own hook has not seen
+    // yet, though the user has seen it as where that CPU stopped. On leaving
+    // the stop, firePause puts that PC here, and the CPU's next hook passes
+    // once if it is that PC: without it, a step on that CPU stopped where it
+    // already was, and a breakpoint there fired again on Run. -1 = none.
+    std::atomic<int>  passOnce_    {-1};
+    std::atomic<int>  passOnceZ80_ {-1};
 
     std::mutex bpMutex_;
     std::vector<Breakpoint> breakpoints_;

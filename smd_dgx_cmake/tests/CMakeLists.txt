@@ -10,6 +10,7 @@ add_executable(smd_dgx_tests
   test_backend.cpp
   test_bridge.cpp
   test_disasm.cpp
+  test_disasm_z80.cpp
   test_listing.cpp
   test_core_options.cpp
   test_input.c          # headless osd_input_update, as every other host has

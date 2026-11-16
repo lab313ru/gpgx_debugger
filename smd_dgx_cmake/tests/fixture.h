@@ -31,6 +31,7 @@ public:
                 ++pauseSeq_;
             } else if (ev.type == DebugEvent::Type::Resumed) {
                 paused_ = false;
+                ++resumeSeq_;
             }
             cv_.notify_all();
         });
@@ -50,7 +51,16 @@ public:
                             [&] { return pauseSeq_ > since; });
     }
 
+    // Wait for a resume event newer than `since`. Returns false on timeout.
+    bool waitResume(uint64_t since, int ms = 5000)
+    {
+        std::unique_lock<std::mutex> lk(mx_);
+        return cv_.wait_for(lk, std::chrono::milliseconds(ms),
+                            [&] { return resumeSeq_ > since; });
+    }
+
     uint64_t pauseSeq() { std::lock_guard<std::mutex> lk(mx_); return pauseSeq_; }
+    uint64_t resumeSeq() { std::lock_guard<std::mutex> lk(mx_); return resumeSeq_; }
     uint32_t pausePc()  { std::lock_guard<std::mutex> lk(mx_); return pausePc_; }
     Cpu      pauseCpu() { std::lock_guard<std::mutex> lk(mx_); return pauseCpu_; }
 
@@ -102,6 +112,7 @@ private:
     uint32_t pausePc_  = 0;
     Cpu      pauseCpu_ = Cpu::M68K;
     uint64_t pauseSeq_ = 0;
+    uint64_t resumeSeq_ = 0;
 };
 
 } // namespace t
