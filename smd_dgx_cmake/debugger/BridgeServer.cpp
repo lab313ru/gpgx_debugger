@@ -210,6 +210,7 @@ void BridgeServer::stop()
     if (!thread_.joinable()) { running_.store(false); return; }
     stopFlag_.store(true);
     if (listenFd_ >= 0) {
+        sockcompat::wakeBlocked(static_cast<socket_t>(listenFd_));
         CLOSESOCK(static_cast<socket_t>(listenFd_));   // unblocks accept()
         listenFd_ = -1;
     }
@@ -218,7 +219,11 @@ void BridgeServer::stop()
     {
         std::lock_guard<std::mutex> lk(clientsMx_);
         for (auto& c : clients_)
-            if (c->fd >= 0) { CLOSESOCK(static_cast<socket_t>(c->fd)); c->fd = -1; }
+            if (c->fd >= 0) {
+                sockcompat::wakeBlocked(static_cast<socket_t>(c->fd));
+                CLOSESOCK(static_cast<socket_t>(c->fd));
+                c->fd = -1;
+            }
     }
     // A client parked inside handleWait() is not in recv(), so closing its
     // socket does not wake it — only the condition variable does. Without this
