@@ -109,7 +109,11 @@ target_include_directories(gx_audio PUBLIC "${CMAKE_CURRENT_LIST_DIR}/platform")
 if (WIN32)
   target_link_libraries(gx_audio PRIVATE winmm)          # waveOut
 else()
-  target_link_libraries(gx_audio PRIVATE SDL2::SDL2)
+  # SDL headers only: the library is dlopen()ed at run time, because the IDA
+  # plugin links this too and IDA does not ship SDL.
+  target_include_directories(gx_audio PRIVATE
+    $<TARGET_PROPERTY:SDL2::SDL2,INTERFACE_INCLUDE_DIRECTORIES>)
+  target_link_libraries(gx_audio PRIVATE ${CMAKE_DL_LIBS})
 endif()
 set_target_properties(gx_audio PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES
                                           POSITION_INDEPENDENT_CODE ON)
