@@ -86,6 +86,23 @@
             }
         },
         {
+            "name": "linux-release",
+            "displayName": "Linux Release",
+            "description": "Set IDA_SDK_DIR in the environment to build the IDA modules too",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/../builds/${presetName}",
+            "installDir": "${sourceDir}/out/install/${presetName}",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "IDA_SDK_DIR": "$env{IDA_SDK_DIR}"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Linux"
+            }
+        },
+        {
             "name": "macos-debug",
             "displayName": "macOS Debug",
             "generator": "Ninja",

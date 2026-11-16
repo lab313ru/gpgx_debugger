@@ -189,12 +189,22 @@ cmake --preset x64-release
 cmake --build ../builds/x64-release
 ```
 
-**Linux / macOS** — expected to work, never run:
+**Linux** — built and run on Ubuntu 24.04 (WSL2, GCC 13, Qt 6.4, Ninja):
 
 ```
-cmake -S smd_dgx_cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+export IDA_SDK_DIR=<sdk>/src      # optional, see below
+cd smd_dgx_cmake
+cmake --preset linux-release
+cmake --build ../builds/linux-release
 ```
+
+Sound goes through SDL2, which is loaded at run time: without
+`libSDL2-2.0.so.0` the app runs silently, so the IDA plugin loads on machines
+that have no SDL. A binary runs only where glibc and libstdc++ are at least as
+new as on the build machine (Ubuntu 24.04: glibc 2.38, GLIBCXX 3.4.31) — build
+on the oldest system you mean to support.
+
+**macOS** — never configured.
 
 Set `VCPKG_ROOT` and the vcpkg toolchain is picked up automatically; leave it
 unset and dependencies resolve from the system.
@@ -249,14 +259,19 @@ writes, the code map and detach, against a running game; and on the 68000, attac
 and in-process, `F7`, `F8`, `Ctrl+F7`, `F4` and the Stack trace, pressed through
 IDA's own actions, with the trace checked against the machine's stack memory.
 
+**Verified on Linux by a scripted run (Ubuntu 24.04 under WSL2):** the whole
+test suite, and the standalone app loading a game in WSLg and answering the
+bridge's `ping`, `status`, `pause` and `frame`.
+
 **Built but never driven by hand:**
 
 - The Z80 chain end to end through IDA's own interface, including its steps. The
   bridge-level behaviour is tested; the IDA UI path is not.
-- Any build on Linux or macOS. The reasons it definitely failed there are gone
-  — real audio, portable sockets, per-platform IDA module suffixes — but
-  nothing has ever been configured there. On Linux the IDA plugin additionally
-  needs its static dependencies rebuilt as position-independent code.
+- The IDA modules on Linux. They build, export only `PLUGIN` or `LDSC`, and
+  every import resolves against the SDK's `libida.so` and the C/C++ runtime —
+  except Qt, which binds to IDA's own namespaced Qt at load time and was checked
+  only by name. There was no Linux IDA to load them into.
+- Any build on macOS.
 - In IDA: VDP-space breakpoints, breakpoint conditions, layout presets, save
   states, ROM patching, the `J` decoder, A/F-line decoding.
 
