@@ -619,6 +619,46 @@ TEST(listing_z80_before_the_return_address_is_the_whole_call)
     e.backend()->clearBreakpoints();
 }
 
+// Centre on $0101, the operand of "ld a,$12": every stream before it runs
+// into $0100 and steps over $0101, so none lands. The nops still lead up to
+// it, and the byte at $0100 is a one-byte line, so scrolling up from the
+// first line (which re-centres on it) always moves.
+TEST(listing_z80_lines_lead_to_a_centre_no_stream_lands_on)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+    REQUIRE(putZ80Listing(e));
+
+    ReadSpy spy(e.backend());
+    const auto v = listAroundZ80(spy, kListProg + 1, 4, 1);
+    REQUIRE(v.size() == 6u);
+    CHECK(contiguous(v));
+    REQUIRE(indexOf(v, kListProg + 1) == 4u);
+    for (int i = 0; i < 3; ++i) {
+        CHECK_EQ(v[i].addr, uint32_t(kListProg - 3 + i));
+        CHECK_STR(v[i].text, "nop");
+    }
+    CHECK_EQ(v[3].addr, uint32_t(kListProg));
+    CHECK_EQ(v[3].len, 1u);
+    CHECK_STR(v[3].text, "db      $3e");
+    CHECK_STR(v[3].hex, "3E");
+    CHECK(v[3].readable);
+    CHECK_STR(v[4].text, "ld      (de),a");
+
+    // What ListingPane::scrollBy(-n) does: centre on the first line, again
+    // and again. Each pass must reach further back, down to $0000.
+    uint32_t centre = kListProg + 1;
+    for (int pass = 0; pass < 200 && centre > 0; ++pass) {
+        const auto up = listAroundZ80(spy, uint16_t(centre), 3, 3);
+        REQUIRE(!up.empty());
+        REQUIRE(up.front().addr < centre);
+        centre = up.front().addr;
+    }
+    CHECK_EQ(centre, 0u);
+    CHECK(onlySoundRam(spy));
+}
+
 // $2000-$3FFF is the same 8K again, listed under its own address. The YM2612,
 // the bank register, the VDP and the PSG behind $4000-$7FFF are never read.
 TEST(listing_z80_reads_sound_ram_and_its_mirror_and_never_the_ports)

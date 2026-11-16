@@ -93,37 +93,72 @@ DisasmLine decodeAt(const Window& w, uint32_t a)
     return disasmZ80(&w.bytes[a - w.lo], n, uint16_t(a));
 }
 
+// The lines before centre: the stream of lines from start, up to stop. When
+// a stream lands exactly on centre, stop is centre; otherwise the bytes
+// [stop, centre) are left for one-byte lines.
+struct Lead {
+    uint32_t start;
+    uint32_t stop;
+};
+
 // The start in [w.lo, centre) whose stream of lines lands exactly on centre
-// with the most lines, or centre itself when no start lands. decoded receives
-// the line at every address tried, indexed by addr - w.lo.
-uint32_t resync(const Window& w, uint32_t centre, std::vector<DisasmLine>& decoded)
+// with the most lines. When no start lands (every stream steps over centre),
+// the stream with the most lines before the one that steps over, stopping at
+// that line; it stops at most kMaxInsn - 1 bytes short of centre. decoded
+// receives the line at every address tried, indexed by addr - w.lo.
+Lead resync(const Window& w, uint32_t centre, std::vector<DisasmLine>& decoded)
 {
     const uint32_t n = centre - w.lo;
     decoded.assign(n, {});
 
     // lines[i]: how many lines the stream from w.lo + i takes to reach
-    // centre, or -1 when it steps over it. Filled from centre down, so the
-    // line after each start has been counted already.
+    // centre, or -1 when it steps over it. For one that steps over, short_[i]
+    // counts its lines before the one that does, and stops[i] is where that
+    // line starts. Filled from centre down, so the line after each start has
+    // been counted already.
     std::vector<int> lines(n, -1);
-    uint32_t best = centre;
+    std::vector<int> short_(n, 0);
+    std::vector<uint32_t> stops(n, centre);
+    Lead best{ centre, centre };
+    Lead nearest{ centre, centre };
     int most = 0;
+    int mostShort = -1;
     for (uint32_t i = n; i-- > 0; ) {
         const uint32_t a = w.lo + i;
         decoded[i] = decodeAt(w, a);
         const uint32_t next = a + decoded[i].len;
         int count = -1;
-        if (next == centre)
+        if (next == centre) {
             count = 1;
-        else if (next < centre && lines[next - w.lo] >= 0)
+        } else if (next < centre && lines[next - w.lo] >= 0) {
             count = lines[next - w.lo] + 1;
+        } else if (next < centre) {
+            short_[i] = short_[next - w.lo] + 1;
+            stops[i] = stops[next - w.lo];
+        } else {
+            stops[i] = a;
+        }
         lines[i] = count;
         // Strictly more: of two streams as long, the one starting nearer wins.
         if (count > most) {
             most = count;
-            best = a;
+            best = { a, centre };
+        }
+        if (count < 0 && short_[i] > mostShort) {
+            mostShort = short_[i];
+            nearest = { a, stops[i] };
         }
     }
-    return best;
+    return most > 0 ? best : nearest;
+}
+
+// A byte left between a stream that does not land and centre.
+DisasmLine byteLine(const Window& w, uint32_t a)
+{
+    if (!w.readable(a)) return { a, 1, kNotReadable };
+    char t[16];
+    std::snprintf(t, sizeof t, "db      $%02x", w.bytes[a - w.lo]);
+    return { a, 1, t };
 }
 
 std::string hexBytes(const Window& w, uint32_t addr, uint32_t len)
@@ -181,10 +216,13 @@ std::vector<ListingLine> listAroundZ80(IDebugBackend& be, uint16_t centre, int b
 
     std::vector<DisasmLine> decoded;
     std::vector<DisasmLine> lines;
-    for (uint32_t a = resync(w, centre, decoded); a < centre; ) {
+    const Lead lead = resync(w, centre, decoded);
+    for (uint32_t a = lead.start; a < lead.stop; ) {
         lines.push_back(decoded[a - lo]);
         a += lines.back().len;
     }
+    for (uint32_t a = lead.stop; a < centre; ++a)
+        lines.push_back(byteLine(w, a));
     if (lines.size() > size_t(before))
         lines.erase(lines.begin(), lines.end() - before);
 

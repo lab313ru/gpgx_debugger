@@ -90,9 +90,14 @@ std::optional<uint32_t> flowTarget(const std::string& text);
 // Lines before centre are found by resync, as listAround does: from every
 // start between centre-1 and centre-$20 (further back when `before` asks for
 // more lines than that can hold), decode forward, and keep the start whose
-// stream lands exactly on centre with the most lines; when none lands there
-// are no lines before it. The bytes are read once, with room after the last
-// line, so no instruction is cut short by the fetch.
+// stream lands exactly on centre with the most lines. Z80 instructions start
+// at any byte, so often none lands; then the stream with the most lines is
+// kept up to the line that would step over centre, and each of the 1-3 bytes
+// left before centre is a one-byte "db      $xx" line (kNotReadable when it
+// is not readable). So there are lines before centre whenever centre is
+// above $0000, and scrolling up from the first line always moves. The bytes
+// are read once, with room after the last line, so no instruction is cut
+// short by the fetch.
 //
 // isPc is the Z80 PC; hasBreakpoint is an enabled, non-VDP, PC breakpoint of
 // the Z80 whose range holds addr. Both come from the backend at the call.
