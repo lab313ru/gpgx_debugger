@@ -1,6 +1,7 @@
 #include "AudioOutput.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 // ===========================================================================
@@ -33,6 +34,11 @@ struct AudioOutput::Impl {
 
 AudioOutput::AudioOutput() : impl_(new Impl)
 {
+    // A run driven over the bridge has no listener. Without a device nothing
+    // reaches the system mixer, and the host goes on silently (isOpen false).
+    if (std::getenv("DGX_NO_AUDIO") != nullptr)
+        return;
+
     impl_->event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
 
     WAVEFORMATEX wfx{};
