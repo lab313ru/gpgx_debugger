@@ -190,6 +190,9 @@ if (Qt6_FOUND)
     "${GX_PLATFORM_QT6}/views/RamSearchView.cpp"
     "${GX_PLATFORM_QT6}/views/RamWatchView.h"
     "${GX_PLATFORM_QT6}/views/RamWatchView.cpp"
+    # standalone only: disassembly, registers and breakpoints, which IDA has itself
+    "${GX_PLATFORM_QT6}/views/CpuDebugView.h"
+    "${GX_PLATFORM_QT6}/views/CpuDebugView.cpp"
   )
 
   target_include_directories(smd_dgx_qt6 PRIVATE
