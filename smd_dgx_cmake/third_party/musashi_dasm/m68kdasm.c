@@ -475,7 +475,7 @@ static char* get_ea_mode_str(uint instruction, uint size)
 		/* address register indirect with index */
 			extension = read_imm_16();
 
-			if(EXT_FULL(extension))
+			if(EXT_FULL(extension) && (g_cpu_type & M68020_PLUS))
 			{
 				if(EXT_EFFECTIVE_ZERO(extension))
 				{
@@ -552,7 +552,7 @@ static char* get_ea_mode_str(uint instruction, uint size)
 				sprintf(mode, "(A%d,%c%d.%c", instruction&7, EXT_INDEX_AR(extension) ? 'A' : 'D', EXT_INDEX_REGISTER(extension), EXT_INDEX_LONG(extension) ? 'l' : 'w');
 			else
 				sprintf(mode, "(%s,A%d,%c%d.%c", make_signed_hex_str_8(extension), instruction&7, EXT_INDEX_AR(extension) ? 'A' : 'D', EXT_INDEX_REGISTER(extension), EXT_INDEX_LONG(extension) ? 'l' : 'w');
-			if(EXT_INDEX_SCALE(extension))
+			if(EXT_INDEX_SCALE(extension) && (g_cpu_type & M68020_PLUS))
 				sprintf(mode+strlen(mode), "*%d", 1 << EXT_INDEX_SCALE(extension));
 			strcat(mode, ")");
 			break;
@@ -574,7 +574,7 @@ static char* get_ea_mode_str(uint instruction, uint size)
 		/* program counter with index */
 			extension = read_imm_16();
 
-			if(EXT_FULL(extension))
+			if(EXT_FULL(extension) && (g_cpu_type & M68020_PLUS))
 			{
 				if(EXT_EFFECTIVE_ZERO(extension))
 				{
@@ -644,7 +644,7 @@ static char* get_ea_mode_str(uint instruction, uint size)
 				sprintf(mode, "(PC,%c%d.%c", EXT_INDEX_AR(extension) ? 'A' : 'D', EXT_INDEX_REGISTER(extension), EXT_INDEX_LONG(extension) ? 'l' : 'w');
 			else
 				sprintf(mode, "(%s,PC,%c%d.%c", make_signed_hex_str_8(extension), EXT_INDEX_AR(extension) ? 'A' : 'D', EXT_INDEX_REGISTER(extension), EXT_INDEX_LONG(extension) ? 'l' : 'w');
-			if(EXT_INDEX_SCALE(extension))
+			if(EXT_INDEX_SCALE(extension) && (g_cpu_type & M68020_PLUS))
 				sprintf(mode+strlen(mode), "*%d", 1 << EXT_INDEX_SCALE(extension));
 			strcat(mode, ")");
 			break;

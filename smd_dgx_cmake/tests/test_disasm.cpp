@@ -49,6 +49,14 @@ const std::vector<Golden>& goldens()
         { { 0x61, 0x00, 0xFF, 0xFE },             4, 0x001000, 4, "bsr     $1000" },
         { { 0x41, 0xFA, 0x00, 0x10 },             4, 0x001000, 4, "lea     ($10,PC), A0; ($1012)" },
 
+        // Indexed modes: a 68000 reads the extension word in the brief format
+        // only. Bit 8 (full format on a 68020) and the scale in bits 9-10 are
+        // ignored, so the instruction is still 4 bytes and the nop after it is
+        // an instruction of its own.
+        { { 0x30, 0x30, 0x01, 0x20, 0x4E, 0x71 }, 6, 0x001000, 4, "move.w  ($20,A0,D0.w), D0" },
+        { { 0x30, 0x30, 0x02, 0x20 },             4, 0x001000, 4, "move.w  ($20,A0,D0.w), D0" },
+        { { 0x4E, 0xFB, 0x01, 0x30, 0x56, 0x78 }, 6, 0x001000, 4, "jmp     ($30,PC,D0.w)" },
+
         // Not instructions on a 68000, in Musashi's own spelling.
         { { 0x4A, 0xFC },                         2, 0x001000, 2, "dc.w $4afc; ILLEGAL" },
         { { 0x4E, 0x7A, 0x00, 0x01 },             4, 0x001000, 2, "dc.w $4e7a; ILLEGAL" }, // movec, 68010+
