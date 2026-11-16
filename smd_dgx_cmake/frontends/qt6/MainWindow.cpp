@@ -666,9 +666,16 @@ void MainWindow::onPaused(uint32_t pc, Cpu cpu)
     hexView_->refresh();
     ramSearchView_->refresh();
     ramWatchView_->refresh();
-    // A Z80 stop brings its tab forward; a 68000 stop leaves whichever tab
-    // is in front.
-    if (cpu == Cpu::Z80) debuggerView_->showCpu(Cpu::Z80);
+    // A Z80 stop brings its tab forward, and the Debugger dock with it: the
+    // menu steps go to the tab in front, so it must be one the user can see.
+    // A 68000 stop leaves whichever tab is in front.
+    if (cpu == Cpu::Z80) {
+        debuggerView_->showCpu(Cpu::Z80);
+        if (auto* dock = qobject_cast<QDockWidget*>(debuggerView_->parentWidget())) {
+            dock->show();
+            dock->raise();
+        }
+    }
     debuggerView_->followPc();
 
     if (audio_) audio_->pause(true);     // nothing refills it while stopped

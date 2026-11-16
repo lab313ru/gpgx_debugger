@@ -17,7 +17,9 @@ struct Z80Regs {
     // How the bus glue holds the Z80 (the core's zstate): d0 = /RESET
     // released, d1 = BUSREQ asserted, d2 = WAIT. The Z80 executes only while
     // it is exactly 1; 3 means the 68000 owns the Z80 bus, 0 and 2 mean the
-    // Z80 sits in reset. Read-only: setZ80Regs leaves it alone. The bridge
+    // Z80 sits in reset, or has locked up: the core also sets 0 itself when
+    // the Z80 reads or writes $800000-$DFFFFF outside the VDP and I/O through
+    // its bank window. Read-only: setZ80Regs leaves it alone. The bridge
     // does not carry it, so over a socket it is kZ80StateUnknown.
     uint8_t  zstate;
     // Base of the 68000-space window the Z80 sees at $8000..$FFFF. Not a CPU

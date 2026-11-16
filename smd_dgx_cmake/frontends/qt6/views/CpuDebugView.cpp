@@ -66,15 +66,23 @@ bool sameBreakpoint(const Breakpoint& a, const Breakpoint& b)
 }
 
 // The Z80's bus state in words, from the core's zstate: d0 set = /RESET
-// released, d1 = the 68000 holds BUSREQ, d2 = WAIT. It runs only at 1.
-QString z80BusText(uint8_t z)
+// released, d1 = the 68000 holds BUSREQ, d2 = WAIT. It runs only at 1. d0
+// clear is either the 68000's reset or a lock-up: the core clears zstate
+// itself when the Z80 reaches through its bank window into $800000-$DFFFFF
+// outside the VDP and I/O (membnk.c), and nothing in zstate tells them apart.
+// Short for the field, full for its tooltip.
+QString z80BusText(uint8_t z, bool full)
 {
     if (z == kZ80StateUnknown) return QStringLiteral("unknown");
     if (z == 1) return QStringLiteral("running");
     QStringList parts;
-    if (!(z & 1)) parts << QStringLiteral("held in reset by the 68000");
-    if (z & 2)    parts << QStringLiteral("bus taken by the 68000");
-    if (z & 4)    parts << QStringLiteral("waiting for the 68000 bus");
+    if (!(z & 1)) parts << (full ? QStringLiteral("in reset by the 68000 ($A11200), or locked up by a "
+                                                  "bank access to $800000-$DFFFFF")
+                                 : QStringLiteral("reset or lock-up"));
+    if (z & 2)    parts << (full ? QStringLiteral("bus taken by the 68000 ($A11100)")
+                                 : QStringLiteral("bus taken"));
+    if (z & 4)    parts << (full ? QStringLiteral("waiting for the 68000 bus")
+                                 : QStringLiteral("waiting"));
     return parts.join(QStringLiteral(", "));
 }
 
@@ -392,10 +400,10 @@ QWidget* CpuDebugView::buildZ80Tab()
     };
     z80Bank_ = mkInfo(QStringLiteral("Z80 bank"), QStringLiteral(
         "Where the window at Z80 $8000-$FFFF looks on the 68000 bus"));
-    z80Bus_ = mkInfo(QStringLiteral("Z80 bus state"), QStringLiteral(
-        "What the 68000 does to the Z80 through $A11100 (BUSREQ) and $A11200 (RESET)"));
+    z80Bus_ = mkInfo(QStringLiteral("Z80 bus state"), QString());
     z80Held_ = new QLabel(QStringLiteral(
-        "The Z80 is stopped: a Z80 step finishes only once the 68000 lets it run."));
+        "The Z80 is stopped: a Z80 step finishes only once the 68000 lets it run "
+        "(or resets it, after a lock-up)."));
     z80Held_->setWordWrap(true);
     z80Held_->setVisible(false);
     auto* info = new QGridLayout;
@@ -702,12 +710,16 @@ void CpuDebugView::showZ80Registers(const Z80Regs& r)
     showSpin(z80Im_, r.im);
 
     const uint32_t bank = r.bank & 0xFFFFFF;
-    const QString bankText = QLatin1Char('$') + hex(bank, 6) + QStringLiteral(" ($")
-                           + hex(bank, 6) + QStringLiteral("-$") + hex((bank + 0x7FFF) & 0xFFFFFF, 6)
-                           + QLatin1Char(')');
+    const QString bankText = QLatin1Char('$') + hex(bank, 6) + QStringLiteral("-$")
+                           + hex((bank + 0x7FFF) & 0xFFFFFF, 6);
     if (z80Bank_->text() != bankText) { z80Bank_->setText(bankText); z80Bank_->setCursorPosition(0); }
-    const QString bus = z80BusText(r.zstate);
-    if (z80Bus_->text() != bus) { z80Bus_->setText(bus); z80Bus_->setCursorPosition(0); }
+    const QString bus = z80BusText(r.zstate, false);
+    if (z80Bus_->text() != bus) {
+        z80Bus_->setText(bus);
+        z80Bus_->setCursorPosition(0);
+        z80Bus_->setToolTip(QStringLiteral("What the 68000 does to the Z80 through $A11100 (BUSREQ) "
+                                           "and $A11200 (RESET). Now: ") + z80BusText(r.zstate, true));
+    }
     z80Held_->setVisible(r.zstate != 1 && r.zstate != kZ80StateUnknown);
 }
 
