@@ -44,6 +44,11 @@ file(GLOB GX_ZLIB_SOURCES "${GX_ROOT}/core/cd_hw/libchdr/deps/zlib-1.3.1/*.c")
 add_library(gx_zlib STATIC ${GX_ZLIB_SOURCES})
 target_include_directories(gx_zlib PUBLIC "${GX_ROOT}/core/cd_hw/libchdr/deps/zlib-1.3.1")
 target_compile_definitions(gx_zlib PRIVATE _CRT_SECURE_NO_WARNINGS)
+if (NOT WIN32)
+  # gz*.c call read/write/lseek/close, which zconf.h declares through
+  # <unistd.h> only when told to; zlib's own configure step normally does.
+  target_compile_definitions(gx_zlib PUBLIC Z_HAVE_UNISTD_H)
+endif()
 add_library(ZLIB::ZLIB ALIAS gx_zlib)
 
 target_link_libraries(gx_core PRIVATE gx_zlib)

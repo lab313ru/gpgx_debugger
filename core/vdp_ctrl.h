@@ -112,6 +112,9 @@ extern int vdp_68k_irq_ack(int int_level);
 #ifdef HOOK_CPU
 /* Debugger: pending VDP access (address register + code register) */
 extern void vdp_debug_get_access(unsigned int *out_addr, unsigned int *out_code);
+/* Debugger: source and destination of the DMA the registers describe */
+extern int vdp_dma_calc_src(void);
+extern int vdp_dma_get_dst(void);
 #endif
 
 #ifdef __cplusplus
