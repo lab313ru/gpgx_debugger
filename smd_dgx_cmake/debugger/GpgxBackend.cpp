@@ -166,6 +166,14 @@ bool baseIsForDmaOnly(const cpu_memory_map* map, uint32_t a)
 {
     return map->base == work_ram && (a >> 16) < 0xE0;
 }
+
+// $A00000-$A03FFF is the Z80's 8 KB of RAM and its mirror, as the 68000 sees
+// it with the Z80 bus taken. The debugger reads and writes it whoever has the
+// bus, as the hex editor's Z80 RAM region does.
+uint8_t* z80RamAt(uint32_t a)
+{
+    return (a & 0xFFC000) == 0xA00000 ? &zram[a & 0x1FFF] : nullptr;
+}
 } // namespace
 
 std::vector<uint8_t> GpgxBackend::readMemory(uint32_t addr, uint32_t size)
@@ -174,6 +182,7 @@ std::vector<uint8_t> GpgxBackend::readMemory(uint32_t addr, uint32_t size)
     for (uint32_t i = 0; i < size; ++i) {
         uint32_t a = (addr + i) & 0xFFFFFF;
         const cpu_memory_map* map = &m68k.memory_map[(a >> 16) & 0xFF];
+        if (const uint8_t* z = z80RamAt(a)) { buf[i] = *z; continue; }
         // A read on those pages is an access (the VDP's ports, the lock-up),
         // so they read as $FF.
         if (baseIsForDmaOnly(map, a)) continue;
@@ -188,6 +197,7 @@ bool GpgxBackend::writeMemory(uint32_t addr, const uint8_t* data, uint32_t size)
     for (uint32_t i = 0; i < size; ++i) {
         uint32_t a = (addr + i) & 0xFFFFFF;
         cpu_memory_map* map = &m68k.memory_map[(a >> 16) & 0xFF];
+        if (uint8_t* z = z80RamAt(a)) { *z = data[i]; continue; }
         // Not into work RAM, and not through the handler either: a write to
         // $A11100 or $A11200 runs the Z80 up to the 68000's cycle (genesis.c,
         // gen_zbusreq_w), which from a debugger call would re-enter the core
@@ -441,6 +451,14 @@ std::vector<Breakpoint> GpgxBackend::getBreakpoints() { std::lock_guard<std::mut
 // ---------------------------------------------------------------------------
 // Control
 // ---------------------------------------------------------------------------
+namespace {
+bool isM68kReturn(uint16_t opc)
+{
+    return opc == 0x4E75 || opc == 0x4E77 || opc == 0x4E73;     // rts, rtr, rte
+}
+constexpr uint32_t kM68kAddrMask = 0xFFFFFF;
+}
+
 // Pausing is a one-instruction step, so on a machine already parked the flag would
 // sit there and stop the next resume after a single instruction.
 void GpgxBackend::pause()   { if (!paused_.load()) stepInto_.store(true); }
@@ -459,14 +477,6 @@ void GpgxBackend::stepInto(Cpu cpu)
     }
     stepInto_.store(true);
     paused_.store(false);
-}
-
-namespace {
-bool isM68kReturn(uint16_t opc)
-{
-    return opc == 0x4E75 || opc == 0x4E77 || opc == 0x4E73;     // rts, rtr, rte
-}
-constexpr uint32_t kM68kAddrMask = 0xFFFFFF;
 }
 
 // Runs until a return lifts SP above where it stands now. Comparing SP rather than
@@ -566,6 +576,7 @@ bool GpgxBackend::loadRom(const char* path)
     stepIntoZ80_.store(false);
     stepOverAddrZ80_.store(-1);
     stepOutSpZ80_.store(-1);
+    passOnce_.store(-1); passOnceZ80_.store(-1);
     held_.store(false);             // nor a hold the previous run never released
 
     // gx::init() has just put config back to defaults, and load_rom reads it.
@@ -608,6 +619,9 @@ void GpgxBackend::onCpuHook(int type, int width, uint32_t addr, uint32_t /*value
         }
         lastPc_ = addr;
         trackCall(addr);
+        if (passOnce_.load(std::memory_order_relaxed) >= 0 &&
+            uint32_t(passOnce_.exchange(-1)) == (addr & kM68kAddrMask))
+            return;                     // where it sat during a Z80 stop (passOnce_)
         bool brk = stepInto_.exchange(false);
         if (!brk) { int so = stepOverAddr_.load(); if (so >= 0 && (uint32_t)so == addr) { stepOverAddr_.store(-1); brk = true; } }
         if (!brk) {
@@ -690,6 +704,11 @@ void GpgxBackend::firePause(uint32_t pc, Cpu cpu, int bpId)
         if (pausePump_) pausePump_();
         else std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    // The CPU that did not stop is between instructions, on one its hook has
+    // not run for yet; read here, so a PC edited during the stop counts.
+    if (abandoned_.load()) return;
+    if (cpu == Cpu::Z80) passOnce_.store(int(m68k_get_reg(M68K_REG_PC) & kM68kAddrMask));
+    else                 passOnceZ80_.store(int(Z80.pc.w.l));
 }
 
 // Returns the id of the breakpoint that matched, or -1. Which one matched is
@@ -880,6 +899,9 @@ void GpgxBackend::onZ80Exec(uint32_t pc)
 
     lastPcZ80_ = pc;
     trackZ80Call(uint16_t(pc));
+    if (passOnceZ80_.load(std::memory_order_relaxed) >= 0 &&
+        uint32_t(passOnceZ80_.exchange(-1)) == pc)
+        return;                         // where it sat during a 68000 stop (passOnce_)
 
     bool brk = stepIntoZ80_.exchange(false);
     if (!brk) {
