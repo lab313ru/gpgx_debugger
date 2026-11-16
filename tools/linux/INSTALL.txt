@@ -1,0 +1,136 @@
+SMD DGX - IDA modules for Linux
+===============================
+
+Sega Mega Drive / Genesis debugger for IDA, built on Genesis Plus GX.
+Linux x86_64, IDA 9.2+ (built against the IDA 9.3 SDK).
+
+  @VERSION@
+  https://github.com/DramaDesu/gpgx_debugger
+
+NOT YET LOADED IN A REAL LINUX IDA. These modules build, export only what
+IDA looks for (PLUGIN from the plugin, LDSC from the loaders), and every
+symbol they import resolves against the SDK's libida.so and the C/C++
+runtime; the Qt imports were checked by name against IDA's namespaced Qt
+only. The Windows build is the one that has been used in IDA.
+
+
+INSTALL
+-------
+
+Close IDA first.
+
+  plugins/smd_dgx_ida.so        ->  ~/.idapro/plugins/
+  loaders/smd_dgx_ldr.so        ->  ~/.idapro/loaders/
+  loaders/smd_dgx_z80_ldr.so    ->  ~/.idapro/loaders/
+
+  mkdir -p ~/.idapro/plugins ~/.idapro/loaders
+  cp plugins/*.so ~/.idapro/plugins/
+  cp loaders/*.so ~/.idapro/loaders/
+
+(If IDAUSR is set, use that directory instead of ~/.idapro. The plugins/
+and loaders/ folders of the IDA installation work too.)
+
+Nothing else is needed. The emulator is linked into the plugin, and it uses
+the Qt that IDA has already loaded - do not put any Qt libraries next to it.
+
+Requirements: glibc @GLIBC@ or newer, and a libstdc++ with GLIBCXX_@GLIBCXX@
+or newer, measured over the three modules. For comparison: Ubuntu 22.04 has
+glibc 2.35, Debian 12 has 2.36, Ubuntu 24.04 has 2.39.
+
+Sound goes through SDL2, loaded at run time from the system
+(libSDL2-2.0.so.0; on Ubuntu, the libsdl2-2.0-0 package). Without it the
+emulator runs silently and everything else works. DGX_NO_AUDIO=1 silences
+it on purpose.
+
+
+USE
+---
+
+1. Open a Mega Drive ROM. The loader offers
+   "Sega Genesis/MegaDrive ROM (SMD DGX)" and builds the segments, header
+   fields and vector table.
+
+2. Debugger -> Select debugger -> SMD DGX, then F9 to start. The emulator
+   runs inside IDA and stops at the entry point.
+
+   Registers, Hex View, breakpoints (execute / read / write, on both CPUs),
+   F7 / F8 / Ctrl+F7 / F4 and the Stack trace all work through IDA's own
+   windows. VDP memory appears as pseudo-segments: $D00000 VRAM,
+   $D10000 CRAM, $D20000 VSRAM.
+
+3. Debugger -> Debugger windows -> SMD ... for the emulator screen and the
+   VDP / memory / sound views. Debugger -> SMD layouts for ready-made
+   arrangements.
+
+4. Press J on an instruction to decode Mega Drive magic numbers into a
+   comment (VDP access modes, register writes, Z80 bus control, SR masks).
+
+To drive a game that is already running - in the standalone app or another
+IDA - use Debugger -> Attach to process..., or put "attach" (or
+attach:<port>, attach:<part of the ROM name>) into Debugger -> Process
+options -> Parameters and press F9.
+
+
+DEBUGGING A Z80 SOUND DRIVER
+----------------------------
+
+An IDA database holds one processor module, so the game and its sound
+driver need two - sharing one emulator:
+
+1. In the 68000 database, start the game and let it reach sound init.
+2. Debugger -> SMD patches -> Dump Z80 driver...  writes the live 8 KB of
+   sound RAM. (The copy in the ROM is usually compressed or relocated, so
+   it is not what the Z80 actually executes.)
+3. Open that dump in a SECOND IDA. The Z80 loader offers
+   "Sega Mega Drive Z80 driver" and preselects the z80 processor.
+4. Debugger -> Select debugger -> SMD DGX Z80, then start. It attaches to
+   the emulator already running in the first IDA instead of launching one.
+
+Any stop - including a 68000 breakpoint in the other database - is
+reported here at the Z80's own PC. Detaching leaves the game running.
+
+
+DRIVING IT FROM AN AGENT (optional)
+-----------------------------------
+
+mcp/smd_dgx_mcp.py is an MCP server over the emulator's control socket, so
+an agent works on the same session you have open. It needs the mcp Python
+package; on distributions that keep pip away from the system Python
+(Ubuntu 24.04, Debian 12), use a venv:
+
+  python3 -m venv ~/.venvs/smd_dgx && ~/.venvs/smd_dgx/bin/pip install mcp
+  ~/.venvs/smd_dgx/bin/python mcp/smd_dgx_mcp.py     (stdio, name "smd-dgx")
+
+The socket opens when the debugger starts; the port is printed to IDA's
+Output window. Several emulators can run at once - each takes a free port
+from 27042 upward and identifies its game, so list_sessions tells you which
+is which.
+
+mcp/ida_hub/ is a proxy in front of the third-party ida-pro-mcp plugin, so
+an agent can tell several IDAs apart; "python3 mcp/ida_hub/install.py" puts
+its IDA side into ~/.idapro/plugins. See README.md in the repository.
+
+
+STATUS
+------
+
+Known broken: J overwrites an existing comment; CRAM/VSRAM breakpoint
+addresses are not masked the way the core masks them.
+
+On Windows, never driven by hand: the Z80 chain through IDA's own UI,
+VDP-space breakpoints, breakpoint conditions, layout presets, save states,
+ROM patching, the J decoder. On Linux, none of the IDA side has run yet.
+
+Full status, including what is verified and what is not, is in README.md
+and smd_dgx_cmake/ARCHITECTURE.md in the repository.
+
+
+LICENCE
+-------
+
+Genesis Plus GX licence (non-commercial) - see LICENSE.txt.
+loaders/smd_dgx_z80_ldr.so is ported from smd_ida_tools2 and is
+GPL-2-or-later. mcp/ida_hub/mcp-plugin.py is ida-pro-mcp (MIT, see
+mcp/ida_hub/LICENSE-ida-pro-mcp).
+Genesis Plus GX by Charles MacDonald and Eke-Eke.
+Gens debug tooling this follows by DrMefistO (lab313ru).

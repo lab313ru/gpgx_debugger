@@ -207,7 +207,9 @@ step-over на обоих процессорах, брейкпоинты (исп
   `PLUGIN`/`LDSC`, импорты сходятся с `libida.so` из SDK и рантаймом C/C++, но
   Linux-IDA не было — в IDA они не загружались. Qt-импорты (`namespace QT`)
   проверены только по именам. Standalone и тесты на Linux (Ubuntu 24.04, WSL2)
-  прогнаны скриптом.
+  прогнаны скриптом. Пакеты (AppImage, tar.gz, архив IDA) собирает
+  `tools/package_linux.sh`; оба standalone-пакета запускались вне дерева сборки
+  (`tools/check_linux_package.sh`). Пол: glibc 2.38, GLIBCXX 3.4.31.
 - Сборка на macOS.
 - Многое из накопленного раньше: VDP-брейкпоинты, условия, ROM-патчи,
   декодер `J`, A/F-line, менеджер сохранений, пресеты.

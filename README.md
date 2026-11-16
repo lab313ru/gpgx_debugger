@@ -189,20 +189,8 @@ cmake --preset x64-release
 cmake --build ../builds/x64-release
 ```
 
-**Linux** — built and run on Ubuntu 24.04 (WSL2, GCC 13, Qt 6.4, Ninja):
-
-```
-export IDA_SDK_DIR=<sdk>/src      # optional, see below
-cd smd_dgx_cmake
-cmake --preset linux-release
-cmake --build ../builds/linux-release
-```
-
-Sound goes through SDL2, which is loaded at run time: without
-`libSDL2-2.0.so.0` the app runs silently, so the IDA plugin loads on machines
-that have no SDL. A binary runs only where glibc and libstdc++ are at least as
-new as on the build machine (Ubuntu 24.04: glibc 2.38, GLIBCXX 3.4.31) — build
-on the oldest system you mean to support.
+**Linux** — built, packaged and run on Ubuntu 24.04 under WSL2; see
+[Linux](#linux) below.
 
 **macOS** — never configured.
 
@@ -230,6 +218,53 @@ failing the build.
 **Build the plugin in Release.** Nothing enforces it, but the SDK ships only
 release Qt import libraries and IDA is a release binary — a debug-CRT plugin
 sharing Qt objects with a release host is a crash waiting to happen.
+
+### Linux
+
+Built and run on Ubuntu 24.04 under WSL2 (GCC 13.3, Qt 6.4.2, CMake 3.28,
+Ninja). Build from a clone on the Linux file system: a checkout under `/mnt/c`
+or `/mnt/f` builds slowly, and a Windows checkout has CRLF line endings.
+
+```
+sudo apt install build-essential cmake ninja-build qt6-base-dev libsdl2-dev
+export IDA_SDK_DIR=<sdk>/src      # optional: the IDA modules
+cd smd_dgx_cmake
+cmake --preset linux-release
+cmake --build ../builds/linux-release
+```
+
+Sound goes through SDL2, loaded at run time: building needs only its headers,
+and without `libSDL2-2.0.so.0` the app runs silently. That is what lets the IDA
+plugin load in an IDA that ships no SDL.
+
+**Packages.** `tools/package_linux.sh`, run on Linux from a clone, configures
+and builds the `linux-release` preset, runs the tests and writes to
+`builds/linux-package/`:
+
+| File | What |
+|---|---|
+| `smd_dgx-linux-x86_64.AppImage` | the standalone app as one file |
+| `smd_dgx_standalone_linux_x86_64.tar.gz` | the same files unpacked, started by `AppRun`, for machines without FUSE |
+| `smd_dgx_ida_linux_x86_64.tar.gz` | `plugins/smd_dgx_ida.so`, `loaders/*.so` and `mcp/`, with an `INSTALL.txt` for `~/.idapro` |
+
+The IDA modules have **never been loaded into a real Linux IDA** — there was
+none to load them into. What was checked instead is under Status below.
+
+Qt, SDL2 and the libraries they need travel inside the standalone packages. The
+script downloads linuxdeploy and its Qt plugin (their GitHub "continuous"
+releases) into `~/.cache/smd_dgx/tools` on first use and says so on every run;
+the AppImage runtime it takes out of linuxdeploy itself, where appimagetool
+would download another. `tools/check_linux_package.sh <unpacked dir | AppImage>
+<rom>` starts a package on the current display, checks that it answers on the
+control socket, and fails if anything loads from the build tree or any Qt
+library from outside the package.
+
+**The floor: glibc 2.38 and GLIBCXX 3.4.31**, the highest versions any ELF file
+in either archive imports (`objdump -T`, undefined symbols only). Ubuntu
+24.04's headers turn `strtoul` and `sscanf` into glibc 2.38's `__isoc23_*`, and
+the Ubuntu libraries bundled with Qt need 2.38 too: the packages run on Ubuntu
+24.04 and newer, not on 22.04 (glibc 2.35) or Debian 12 (2.36). A lower floor
+means building the whole package on an older distribution, not only the app.
 
 ### Tests
 
@@ -261,7 +296,14 @@ IDA's own actions, with the trace checked against the machine's stack memory.
 
 **Verified on Linux by a scripted run (Ubuntu 24.04 under WSL2):** the whole
 test suite, and the standalone app loading a game in WSLg and answering the
-bridge's `ping`, `status`, `pause` and `frame`.
+bridge's `ping`, `status`, `pause` and `frame`. Both standalone packages, away
+from the build tree and with an empty `LD_LIBRARY_PATH` — the tarball unpacked
+into a fresh directory, the AppImage with `APPIMAGE_EXTRACT_AND_RUN=1` — ran a
+game in WSLg and drew it over the bridge, and `ldd` and the running app's
+memory map showed Qt loaded from the package and nothing from the build tree.
+Every run was silent (`DGX_NO_AUDIO=1`): that `dlopen` finds the bundled SDL2
+was checked with a probe, not by listening. No other distribution or desktop
+has run the packages; the glibc 2.38 floor is measured, not tried.
 
 **Built but never driven by hand:**
 

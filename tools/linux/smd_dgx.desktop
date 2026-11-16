@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=SMD DGX
+GenericName=Mega Drive debugger
+Comment=Sega Mega Drive / Genesis debugger built on Genesis Plus GX
+Exec=smd_dgx_qt6 %f
+Icon=smd_dgx
+Terminal=false
+Categories=Development;Debugger;
