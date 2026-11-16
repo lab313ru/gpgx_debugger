@@ -94,6 +94,9 @@ struct OptionDef {
     Apply               apply;
     int CoreOptions::*  field;
     std::vector<Choice> choices;
+    // The stored values a menu offers, for a long numeric range; empty offers
+    // every choice. Any listed value is still accepted from the settings file.
+    std::vector<int>    presets = {};
 };
 
 // All options, in menu order within each category.
@@ -123,10 +126,22 @@ struct BootRom {
     std::string          path;      // the file found, or empty
     std::vector<uint8_t> image;     // 2 KB as stored on disk, if valid
     std::string          problem;   // why there is no usable image, or empty
+    std::string          brief;     // the same in a few words, for a menu
     bool ok() const { return problem.empty(); }
 };
 // File access only; safe on any thread.
 BootRom findBootRom();
+
+// The core reads a lock-on cartridge's ROM from the working directory
+// (ggenie.bin, areplay.bin, sk.bin with sk2chip.bin) and silently runs without
+// it when the file is not there. Both strings are empty when o.lockOn is off
+// or has its files. File access only.
+struct LockOnRom {
+    std::string problem;   // why the lock-on cartridge has nothing to load
+    std::string brief;     // the same in a few words, for a menu
+    bool ok() const { return problem.empty(); }
+};
+LockOnRom checkLockOn(const CoreOptions& o);
 
 // --- core side: emulation thread only ------------------------------------
 

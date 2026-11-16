@@ -152,6 +152,8 @@ std::string EmuHost::setCoreOptions(const coreopt::CoreOptions& o)
 {
     std::string problem;
     if (o.bootRom) problem = coreopt::findBootRom().problem;
+    if (const coreopt::LockOnRom lockOn = coreopt::checkLockOn(o); !lockOn.ok())
+        problem += (problem.empty() ? "" : "; ") + lockOn.problem;
 
     std::lock_guard<std::mutex> lk(optMx_);
     want_ = o;
@@ -165,6 +167,18 @@ coreopt::CoreOptions EmuHost::coreOptions() const
 {
     std::lock_guard<std::mutex> lk(optMx_);
     return want_;
+}
+
+coreopt::CoreOptions EmuHost::coreOptionsRunning() const
+{
+    std::lock_guard<std::mutex> lk(optMx_);
+    return inCore_;
+}
+
+void EmuHost::setInCore(const coreopt::CoreOptions& o)
+{
+    std::lock_guard<std::mutex> lk(optMx_);
+    inCore_ = o;
 }
 
 bool EmuHost::reset(bool hard)
@@ -201,7 +215,7 @@ void EmuHost::applyPending()
             const coreopt::CoreOptions next =
                 coreopt::withClass(inCore_, op.opts, coreopt::Apply::Live);
             const bool reinit = coreopt::applyLive(inCore_, next);
-            inCore_ = next;
+            setInCore(next);
             if (reinit) hardReset();
             break;
         }
@@ -229,13 +243,13 @@ void EmuHost::beforeLoad()
     if (!useOptions_) return;
     coreopt::applyAtLoad(requested_);
     installBootRomFor(requested_);
-    inCore_ = requested_;
+    setInCore(requested_);
 }
 
 void EmuHost::hardReset()
 {
     if (useOptions_) {
-        inCore_ = coreopt::withClass(inCore_, requested_, coreopt::Apply::Reset);
+        setInCore(coreopt::withClass(inCore_, requested_, coreopt::Apply::Reset));
         coreopt::applyResetFields(inCore_);
         installBootRomFor(inCore_);
     }

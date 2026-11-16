@@ -7,6 +7,7 @@
 #include <cstdint>
 
 #include "debugger/DebugState.h"
+#include "debugger/CoreOptions.h"
 
 class EmulatorScreen;
 class EmuHost;
@@ -23,6 +24,7 @@ class SoundDebugView;
 class MemoryView;
 class RamSearchView;
 class RamWatchView;
+class QToolButton;
 
 class MainWindow : public QMainWindow
 {
@@ -47,11 +49,19 @@ private slots:
     void debugStepOver();
     void debugStepOut();
     void refreshViews();
+    void resetSoft();
+    void resetHard();
+    void reloadRom();
+    void updateApplyHint();
 
 private:
     void buildMenus();
     void stopEmulator();
     void buildDocks();
+    void buildOptionsMenu();
+    void setCoreOption(const coreopt::OptionDef& def, int stored);
+    void saveCoreOptions();
+    void reportQueued(const QString& what);
 
     // The host owns the backend, and there must be exactly one: the CPU hook is
     // a single global that the most recently constructed GpgxBackend claims, so
@@ -85,4 +95,13 @@ private:
     QAction* actStepInto_ = nullptr;
     QAction* actStepOver_ = nullptr;
     QAction* actStepOut_  = nullptr;
+
+    // Emulator core options: the standalone app's only, kept in views.ini
+    // [Core]. The IDA plugin never sets any and runs on the core defaults.
+    coreopt::CoreOptions coreOpts_;
+    QAction*     actReset_     = nullptr;
+    QAction*     actHardReset_ = nullptr;
+    QAction*     actReload_    = nullptr;
+    QLabel*      applyLabel_   = nullptr;   // options waiting for a reset or reload
+    QToolButton* applyButton_  = nullptr;   // ... and the one click that applies them
 };

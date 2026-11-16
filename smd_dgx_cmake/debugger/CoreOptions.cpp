@@ -18,12 +18,13 @@ namespace coreopt {
 
 namespace {
 
-std::vector<Choice> numbers(int from, int to, int step)
+// Every numeric option is a percentage.
+std::vector<Choice> percents(int from, int to, int step)
 {
     std::vector<Choice> v;
     for (int n = from; n <= to; n += step) {
         const std::string s = std::to_string(n);
-        v.push_back({ s, s, n });
+        v.push_back({ s, s + "%", n });
     }
     return v;
 }
@@ -39,50 +40,56 @@ std::vector<OptionDef> buildTable()
     using A = Apply;
     return {
         // ---- System ----
-        { "genesis_plus_gx_region_detect", "System region", C::System, A::Live, &CoreOptions::region, {
-            { "auto",      "Auto",      RegionAuto },
-            { "ntsc-u",    "NTSC-U",    RegionUsa },
-            { "pal",       "PAL",       RegionEurope },
-            { "ntsc-j",    "NTSC-J",    RegionJapanNtsc },
+        { "genesis_plus_gx_system_hw", "Hardware", C::System, A::Reload, &CoreOptions::hardware, {
+            { "auto",                 "Auto",               HardwareAuto },
+            { "mega drive / genesis", "Mega Drive/Genesis", HardwareMegaDrive } } },
+        { "genesis_plus_gx_region_detect", "Region", C::System, A::Live, &CoreOptions::region, {
+            { "auto",      "Auto",           RegionAuto },
+            { "ntsc-u",    "USA (NTSC-U)",   RegionUsa },
+            { "pal",       "Europe (PAL)",   RegionEurope },
+            { "ntsc-j",    "Japan (NTSC-J)", RegionJapanNtsc },
             // Not a libretro value: the core has the region, libretro does not offer it.
-            { "japan pal", "Japan PAL", RegionJapanPal } } },
-        { "genesis_plus_gx_vdp_mode", "Force VDP mode", C::System, A::Live, &CoreOptions::vdpMode, {
-            { "auto",  "Disabled",    VdpModeAuto },
+            { "japan pal", "Japan (PAL)",    RegionJapanPal } } },
+        { "genesis_plus_gx_vdp_mode", "VDP Mode", C::System, A::Live, &CoreOptions::vdpMode, {
+            { "auto",  "Auto",        VdpModeAuto },
             { "60hz",  "NTSC (60Hz)", VdpMode60Hz },
             { "50hz",  "PAL (50Hz)",  VdpMode50Hz } } },
         // Values are libretro's, the meaning is the Wii GUI's: see CoreOptions::lockups.
-        { "genesis_plus_gx_force_dtack", "System lock-ups", C::System, A::Live, &CoreOptions::lockups, onOff() },
-        { "genesis_plus_gx_addr_error", "68K address error", C::System, A::Live, &CoreOptions::addrError, onOff() },
-        { "genesis_plus_gx_bios", "System boot ROM (TMSS)", C::System, A::Reset, &CoreOptions::bootRom, onOff() },
-        { "genesis_plus_gx_lock_on", "Cartridge lock-on", C::System, A::Reset, &CoreOptions::lockOn, {
+        { "genesis_plus_gx_force_dtack", "System Lockups", C::System, A::Live, &CoreOptions::lockups, onOff() },
+        { "genesis_plus_gx_addr_error", "68K Address Error", C::System, A::Live, &CoreOptions::addrError, onOff() },
+        { "genesis_plus_gx_bios", "System Bootrom", C::System, A::Reset, &CoreOptions::bootRom, onOff() },
+        { "genesis_plus_gx_lock_on", "Cartridge Lock-On", C::System, A::Reset, &CoreOptions::lockOn, {
             { "disabled",            "Disabled",            LockOnOff },
             { "game genie",          "Game Genie",          LockOnGameGenie },
             { "action replay (pro)", "Action Replay (Pro)", LockOnActionReplay },
             { "sonic & knuckles",    "Sonic & Knuckles",    LockOnSonicKnuckles } } },
-        { "genesis_plus_gx_system_hw", "System hardware", C::System, A::Reload, &CoreOptions::hardware, {
-            { "auto",                 "Auto",               HardwareAuto },
-            { "mega drive / genesis", "Mega Drive/Genesis", HardwareMegaDrive } } },
 
         // ---- Audio ----
-        { "genesis_plus_gx_ym2612", "Mega Drive FM", C::Audio, A::Live, &CoreOptions::fmCore, {
+        { "genesis_plus_gx_ym2612", "YM2612 Core", C::Audio, A::Live, &CoreOptions::fmCore, {
             { "mame (ym2612)",          "MAME (YM2612)",          FmMameYm2612 },
             { "mame (asic ym3438)",     "MAME (ASIC YM3438)",     FmMameAsicYm3438 },
             { "mame (enhanced ym3438)", "MAME (Enhanced YM3438)", FmMameEnhancedYm3438 },
             { "nuked (ym2612)",         "Nuked (YM2612)",         FmNukedYm2612 },
             { "nuked (ym3438)",         "Nuked (YM3438)",         FmNukedYm3438 } } },
-        { "genesis_plus_gx_sound_output", "Sound output", C::Audio, A::Live, &CoreOptions::mono, {
+        { "genesis_plus_gx_sound_output", "Audio Output", C::Audio, A::Live, &CoreOptions::mono, {
             { "stereo", "Stereo", 0 },
             { "mono",   "Mono",   1 } } },
-        { "genesis_plus_gx_audio_filter", "Audio filter", C::Audio, A::Live, &CoreOptions::filter, {
+        { "genesis_plus_gx_audio_filter", "Audio Filter", C::Audio, A::Live, &CoreOptions::filter, {
             { "disabled", "Disabled", FilterOff },
             { "low-pass", "Low-Pass", FilterLowPass },
-            { "EQ",       "EQ",       FilterEq } } },
-        { "genesis_plus_gx_lowpass_range", "Low-pass filter %", C::Audio, A::Live, &CoreOptions::lowPassRange, numbers(5, 95, 5) },
-        { "genesis_plus_gx_psg_preamp", "PSG preamp level", C::Audio, A::Live, &CoreOptions::psgPreamp, numbers(0, 200, 5) },
-        { "genesis_plus_gx_fm_preamp", "FM preamp level", C::Audio, A::Live, &CoreOptions::fmPreamp, numbers(0, 200, 5) },
-        { "genesis_plus_gx_audio_eq_low", "EQ low", C::Audio, A::Live, &CoreOptions::eqLow, numbers(0, 100, 5) },
-        { "genesis_plus_gx_audio_eq_mid", "EQ mid", C::Audio, A::Live, &CoreOptions::eqMid, numbers(0, 100, 5) },
-        { "genesis_plus_gx_audio_eq_high", "EQ high", C::Audio, A::Live, &CoreOptions::eqHigh, numbers(0, 100, 5) },
+            { "EQ",       "3-Band EQ", FilterEq } } },
+        { "genesis_plus_gx_lowpass_range", "Low-Pass Range", C::Audio, A::Live, &CoreOptions::lowPassRange,
+            percents(5, 95, 5), { 20, 40, 60, 80 } },
+        { "genesis_plus_gx_psg_preamp", "PSG Preamp", C::Audio, A::Live, &CoreOptions::psgPreamp,
+            percents(0, 200, 5), { 0, 50, 100, 150, 200 } },
+        { "genesis_plus_gx_fm_preamp", "FM Preamp", C::Audio, A::Live, &CoreOptions::fmPreamp,
+            percents(0, 200, 5), { 0, 50, 100, 150, 200 } },
+        { "genesis_plus_gx_audio_eq_low", "EQ Low", C::Audio, A::Live, &CoreOptions::eqLow,
+            percents(0, 100, 5), { 0, 25, 50, 75, 100 } },
+        { "genesis_plus_gx_audio_eq_mid", "EQ Mid", C::Audio, A::Live, &CoreOptions::eqMid,
+            percents(0, 100, 5), { 0, 25, 50, 75, 100 } },
+        { "genesis_plus_gx_audio_eq_high", "EQ High", C::Audio, A::Live, &CoreOptions::eqHigh,
+            percents(0, 100, 5), { 0, 25, 50, 75, 100 } },
 
         // ---- Video ----
         { "genesis_plus_gx_overscan", "Borders", C::Video, A::Live, &CoreOptions::overscan, {
@@ -90,17 +97,17 @@ std::vector<OptionDef> buildTable()
             { "top/bottom", "Top/Bottom", OverscanTopBottom },
             { "left/right", "Left/Right", OverscanLeftRight },
             { "full",       "Full",       OverscanFull } } },
-        { "genesis_plus_gx_blargg_ntsc_filter", "Blargg NTSC filter", C::Video, A::Live, &CoreOptions::ntscFilter, {
+        { "genesis_plus_gx_blargg_ntsc_filter", "Blargg NTSC Filter", C::Video, A::Live, &CoreOptions::ntscFilter, {
             { "disabled",   "Disabled",   NtscOff },
             { "monochrome", "Monochrome", NtscMonochrome },
             { "composite",  "Composite",  NtscComposite },
             { "svideo",     "S-Video",    NtscSVideo },
             { "rgb",        "RGB",        NtscRgb } } },
-        { "genesis_plus_gx_lcd_filter", "LCD ghosting filter", C::Video, A::Live, &CoreOptions::lcdGhosting, onOff() },
-        { "genesis_plus_gx_render", "Interlaced mode 2 output", C::Video, A::Live, &CoreOptions::doubleField, {
+        { "genesis_plus_gx_lcd_filter", "LCD Ghosting Filter", C::Video, A::Live, &CoreOptions::lcdGhosting, onOff() },
+        { "genesis_plus_gx_render", "Interlaced Mode 2 Output", C::Video, A::Live, &CoreOptions::doubleField, {
             { "single field", "Single Field", 0 },
             { "double field", "Double Field", 1 } } },
-        { "genesis_plus_gx_aspect_ratio", "Aspect ratio", C::Video, A::Live, &CoreOptions::aspect, {
+        { "genesis_plus_gx_aspect_ratio", "Aspect Ratio", C::Video, A::Live, &CoreOptions::aspect, {
             { "auto",     "Auto",     AspectAuto },
             { "NTSC PAR", "NTSC PAR", AspectNtscPar },
             { "PAL PAR",  "PAL PAR",  AspectPalPar } } },
@@ -190,6 +197,7 @@ BootRom findBootRom()
     if (found.empty()) {
         r.problem = std::string(kName) + " not found beside the executable or in the working "
                     "directory: TMSS runs without the boot ROM";
+        r.brief = std::string(kName) + " not found";
         return r;
     }
     const std::u8string u8 = found.u8string();
@@ -202,9 +210,35 @@ BootRom findBootRom()
     // The check the core's own frontends make before trusting the file.
     if (got < 0x12A || std::memcmp(img.data() + 0x120, "GENESIS OS", 10) != 0) {
         r.problem = r.path + " is not a Mega Drive boot ROM: TMSS runs without it";
+        r.brief = std::string(kName) + " is not a boot ROM";
         return r;
     }
     r.image = std::move(img);
+    return r;
+}
+
+LockOnRom checkLockOn(const CoreOptions& o)
+{
+    // The names the core opens: GG_ROM, AR_ROM, SK_ROM and SK_UPMEM in osd.h.
+    std::vector<const char*> files;
+    switch (o.lockOn) {
+    case LockOnGameGenie:     files = { "ggenie.bin" }; break;
+    case LockOnActionReplay:  files = { "areplay.bin" }; break;
+    case LockOnSonicKnuckles: files = { "sk.bin", "sk2chip.bin" }; break;   // both or nothing
+    default:                  return {};
+    }
+    std::error_code ec;
+    std::string missing;
+    for (const char* f : files)
+        if (!std::filesystem::is_regular_file(f, ec))
+            missing += (missing.empty() ? "" : " and ") + std::string(f);
+    if (missing.empty()) return {};
+
+    const std::u8string cwd = std::filesystem::current_path(ec).u8string();
+    LockOnRom r;
+    r.problem = missing + " not found in the working directory (" + std::string(cwd.begin(), cwd.end())
+              + "): the lock-on cartridge has nothing to load";
+    r.brief = missing + " not found";
     return r;
 }
 

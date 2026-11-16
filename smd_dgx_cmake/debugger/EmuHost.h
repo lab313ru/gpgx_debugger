@@ -82,10 +82,17 @@ public:
     // resumed and the frame ends. LIVE options take effect there; RESET ones
     // at the next reset(true), RELOAD ones at the next reload() or start().
     //
-    // Returns why part of it cannot work as asked — today only a TMSS boot
-    // ROM that is switched on but missing or invalid — or "" when all is well.
+    // Returns why part of it cannot work as asked — a TMSS boot ROM switched
+    // on but missing or invalid, a lock-on cartridge whose ROM file is not
+    // there — or "" when all is well.
     std::string setCoreOptions(const coreopt::CoreOptions& o);
     coreopt::CoreOptions coreOptions() const;     // as last set
+    // What the core runs with: coreOptions() less each change not applied
+    // yet — RESET options until a hard reset, RELOAD ones until a reload or a
+    // start, the rest until the next frame boundary. So
+    // coreopt::needs(coreOptionsRunning(), coreOptions()) is what a UI still
+    // has to ask the user for.
+    coreopt::CoreOptions coreOptionsRunning() const;
 
     // Queued like setCoreOptions. Hard: a power cycle that keeps cartridge
     // SRAM and picks up RESET-class options. Soft: the console's reset button.
@@ -167,6 +174,7 @@ private:
     void hardReset();
     void doReload();
     void installBootRomFor(const coreopt::CoreOptions& o);
+    void setInCore(const coreopt::CoreOptions& o);
     void drainCommands();
     void drainTasks();
     void emitEvent(const DebugEvent& ev);   // not `emit`: clashes with Qt's macro
@@ -203,7 +211,10 @@ private:
     // Emulation thread only (and start(), before the thread exists):
     bool                    useOptions_ = false;   // haveOptions_ as of the run
     coreopt::CoreOptions    requested_;   // the latest Options request applied
-    coreopt::CoreOptions    inCore_;      // what the core is running with
+    // What the core is running with. Written there under optMx_ (setInCore),
+    // so coreOptionsRunning() can read it from another thread; the emulation
+    // thread itself reads it without the lock.
+    coreopt::CoreOptions    inCore_;
 
     // Work handed to the emulation thread by invoke().
     //

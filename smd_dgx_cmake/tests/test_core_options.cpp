@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -72,6 +74,13 @@ TEST(core_options_table_round_trips)
         CoreOptions keep;
         CHECK(!coreopt::setValue(keep, def, "no such value"));
         CHECK(keep == CoreOptions{});
+        // A menu preset that is not one of the values would be refused on the
+        // next start.
+        for (int p : def.presets)
+            if (std::none_of(def.choices.begin(), def.choices.end(),
+                             [p](const coreopt::Choice& c) { return c.stored == p; }))
+                t::fail(__FILE__, __LINE__, std::string(def.key) + ": preset " + std::to_string(p)
+                                            + " is not one of its values");
     }
 
     // The defaults are this program's behaviour before options existed.
@@ -227,12 +236,20 @@ TEST(reset_and_reload_classes_wait_for_their_event)
     REQUIRE(e.pauseAndWait());
 
     CoreOptions o;
+    o.overscan = coreopt::OverscanFull;        // LIVE
     o.lockOn   = coreopt::LockOnGameGenie;     // RESET
     o.hardware = coreopt::HardwareMegaDrive;   // RELOAD
     e.host()->setCoreOptions(o);
+    // Paused: queued, so nothing has reached the core yet.
+    CHECK(e.host()->coreOptionsRunning() == CoreOptions{});
     REQUIRE(runFrames(e, 2));
     CHECK_EQ(config.lock_on, 0);
     CHECK_EQ(config.system, 0);
+    // What a UI reads to tell the user what still waits.
+    CHECK_EQ(e.host()->coreOptionsRunning().overscan, coreopt::OverscanFull);
+    CHECK_EQ(e.host()->coreOptionsRunning().lockOn, coreopt::LockOnOff);
+    CHECK(coreopt::needs(e.host()->coreOptionsRunning(), e.host()->coreOptions())
+          == coreopt::Apply::Reload);
 
     // Soft: the 68000 restarts at the entry point, RAM survives.
     const uint8_t mark[2] = { 0x5A, 0xA5 };
@@ -256,6 +273,8 @@ TEST(reset_and_reload_classes_wait_for_their_event)
     REQUIRE(e.pauseAndWait());
     CHECK_EQ(config.lock_on, TYPE_GG);
     CHECK_EQ(config.system, 0);
+    CHECK_EQ(e.host()->coreOptionsRunning().lockOn, coreopt::LockOnGameGenie);
+    CHECK_EQ(e.host()->coreOptionsRunning().hardware, coreopt::HardwareAuto);
 
     r = e.host()->resetCount();
     REQUIRE(e.host()->reload());
@@ -264,6 +283,7 @@ TEST(reset_and_reload_classes_wait_for_their_event)
     REQUIRE(e.pauseAndWait());
     CHECK_EQ(config.system, SYSTEM_MD);
     CHECK_EQ(config.lock_on, TYPE_GG);
+    CHECK(e.host()->coreOptionsRunning() == o);
     // The reloaded game runs and stops like the first one did.
     CHECK(e.stepAndWait(Cpu::M68K));
 }
@@ -564,6 +584,44 @@ TEST(missing_boot_rom_is_reported)
     REQUIRE(e.pauseAndWait());
     CHECK_EQ(config.bios & 1, 1);
     CHECK_EQ(system_bios & SYSTEM_MD, 0);
+}
+
+// ---------------------------------------------------------------------------
+// The core opens a lock-on cartridge's ROM from the working directory and runs
+// without it when it is not there; the caller hears which file is missing.
+// ---------------------------------------------------------------------------
+TEST(missing_lock_on_rom_is_reported)
+{
+    namespace fs = std::filesystem;
+    CoreOptions o;
+    CHECK(coreopt::checkLockOn(o).ok());
+
+    const fs::path cwd = fs::current_path();
+    const fs::path dir = fs::temp_directory_path() / "smd_dgx_lock_on_test";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    REQUIRE(fs::create_directories(dir));
+    fs::current_path(dir);
+
+    o.lockOn = coreopt::LockOnSonicKnuckles;
+    std::string p = coreopt::checkLockOn(o).problem;
+    CHECK(p.find("sk.bin") != std::string::npos);
+    CHECK(p.find("sk2chip.bin") != std::string::npos);
+    CHECK_STR(coreopt::checkLockOn(o).brief, "sk.bin and sk2chip.bin not found");
+    {
+        t::Emu e;
+        CHECK(e.host()->setCoreOptions(o).find("sk.bin") != std::string::npos);
+    }
+    std::ofstream(dir / "sk.bin") << 'x';
+    CHECK_STR(coreopt::checkLockOn(o).brief, "sk2chip.bin not found");
+
+    o.lockOn = coreopt::LockOnGameGenie;
+    CHECK(coreopt::checkLockOn(o).problem.find("ggenie.bin") != std::string::npos);
+    std::ofstream(dir / "ggenie.bin") << 'x';
+    CHECK(coreopt::checkLockOn(o).ok());
+
+    fs::current_path(cwd);
+    fs::remove_all(dir, ec);
 }
 
 // ---------------------------------------------------------------------------

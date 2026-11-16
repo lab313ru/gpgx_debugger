@@ -17,6 +17,9 @@
 #include "ViewSettings.h"
 
 #include <QMenuBar>
+#include <QMenu>
+#include <QActionGroup>
+#include <QToolButton>
 #include <QStatusBar>
 #include <QDockWidget>
 #include <QFileDialog>
@@ -25,6 +28,8 @@
 #include <QFileInfo>
 #include <QFile>
 #include <QDir>
+
+#include <algorithm>
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
 {
@@ -117,6 +122,23 @@ void MainWindow::buildMenus()
     auto* file = menuBar()->addMenu(QStringLiteral("&File"));
     file->addAction(QStringLiteral("&Open ROM..."), this, &MainWindow::openRom, QKeySequence::Open);
     file->addSeparator();
+    actReset_     = file->addAction(QStringLiteral("&Reset"),      this, &MainWindow::resetSoft);
+    actHardReset_ = file->addAction(QStringLiteral("&Hard Reset"), this, &MainWindow::resetHard);
+    actReload_    = file->addAction(QStringLiteral("Re&load ROM"), this, &MainWindow::reloadRom);
+    actReset_->setToolTip(QStringLiteral("The console's reset button"));
+    actHardReset_->setToolTip(QStringLiteral(
+        "Power off and on, keeping the cartridge save; applies System Bootrom and Cartridge Lock-On"));
+    actReload_->setToolTip(QStringLiteral(
+        "Load the ROM file again, keeping the cartridge save; applies every option"));
+    file->setToolTipsVisible(true);
+    // Asked as the menu opens rather than at every place a game starts or stops.
+    connect(file, &QMenu::aboutToShow, this, [this] {
+        const bool running = emuHost_ && emuHost_->isRunning();
+        actReset_->setEnabled(running);
+        actHardReset_->setEnabled(running);
+        actReload_->setEnabled(running);
+    });
+    file->addSeparator();
     file->addAction(QStringLiteral("E&xit"), this, &QWidget::close, QKeySequence::Quit);
 
     auto* debug = menuBar()->addMenu(QStringLiteral("&Debug"));
@@ -132,6 +154,228 @@ void MainWindow::buildMenus()
     actStepInto_->setEnabled(false);
     actStepOver_->setEnabled(false);
     actStepOut_->setEnabled(false);
+
+    buildOptionsMenu();
+}
+
+namespace {
+
+const QString kCoreGroup = QStringLiteral("Core");
+
+QString menuText(QString s)
+{
+    return s.replace(QLatin1Char('&'), QStringLiteral("&&"));
+}
+
+QString choiceLabel(const coreopt::OptionDef& def, int stored)
+{
+    for (const auto& c : def.choices)
+        if (c.stored == stored) return QString::fromStdString(c.label);
+    return QString::number(stored);
+}
+
+} // namespace
+
+void MainWindow::buildOptionsMenu()
+{
+    // Stored as libretro's value strings, one key per option. A value this
+    // build does not list is skipped, so that option keeps its default.
+    for (const auto& def : coreopt::options()) {
+        const QString v = viewsettings::getString(kCoreGroup, QString::fromLatin1(def.key));
+        if (!v.isEmpty()) coreopt::setValue(coreOpts_, def, v.toStdString());
+    }
+    // The host keeps them across ROMs: every start() loads with them.
+    const std::string problem = emuHost_->setCoreOptions(coreOpts_);
+    if (!problem.empty())
+        statusBar()->showMessage(QString::fromStdString(problem), 20000);
+
+    using coreopt::Apply;
+    auto* options = menuBar()->addMenu(QStringLiteral("&Options"));
+    QMenu* byCategory[] = {                                // coreopt::Category order
+        options->addMenu(QStringLiteral("&System")),
+        options->addMenu(QStringLiteral("&Audio")),
+        options->addMenu(QStringLiteral("&Video")),
+    };
+    QMenu* input = options->addMenu(QStringLiteral("&Input"));
+
+    for (const auto& def : coreopt::options()) {
+        QMenu* m = byCategory[int(def.category)]->addMenu(menuText(QString::fromLatin1(def.label)));
+        QString tip;
+        if (def.apply == Apply::Reset)  tip = QStringLiteral("Takes effect at File > Hard Reset");
+        if (def.apply == Apply::Reload) tip = QStringLiteral("Takes effect at File > Reload ROM");
+        if (def.field == &coreopt::CoreOptions::bootRom)
+            tip += QStringLiteral(". Reads bios_MD.bin from beside the executable or the working directory");
+        if (def.field == &coreopt::CoreOptions::lockOn)
+            tip += QStringLiteral(". Reads ggenie.bin, areplay.bin or sk.bin and sk2chip.bin from the working directory");
+        m->menuAction()->setToolTip(tip);
+
+        auto* group = new QActionGroup(m);       // exclusive
+        const int current = coreOpts_.*def.field;
+        for (const auto& c : def.choices) {
+            // A long range offers its presets, plus whatever the file holds.
+            const bool offered = def.presets.empty() || c.stored == current
+                || std::find(def.presets.begin(), def.presets.end(), c.stored) != def.presets.end();
+            if (!offered) continue;
+            QAction* a = m->addAction(menuText(QString::fromStdString(c.label)));
+            a->setCheckable(true);
+            a->setChecked(c.stored == current);
+            a->setData(c.stored);
+            group->addAction(a);
+            const int stored = c.stored;
+            connect(a, &QAction::triggered, this, [this, &def, stored] { setCoreOption(def, stored); });
+        }
+
+        // A choice whose ROM file is missing says so, checked as the menu
+        // opens so a file copied in meanwhile is seen.
+        if (def.field == &coreopt::CoreOptions::bootRom || def.field == &coreopt::CoreOptions::lockOn) {
+            connect(m, &QMenu::aboutToShow, this, [m, &def] {
+                for (QAction* a : m->actions()) {
+                    coreopt::CoreOptions probe;
+                    probe.*def.field = a->data().toInt();
+                    const std::string brief = def.field == &coreopt::CoreOptions::lockOn
+                        ? coreopt::checkLockOn(probe).brief
+                        : probe.bootRom ? coreopt::findBootRom().brief : std::string();
+                    QString text = menuText(choiceLabel(def, probe.*def.field));
+                    if (!brief.empty()) text += QStringLiteral(" — ") + QString::fromStdString(brief);
+                    a->setText(text);
+                }
+            });
+        }
+    }
+
+    // The rest of the libretro core's menu, shown so their absence is not a
+    // mystery: this build runs Mega Drive cartridges with gamepads only.
+    auto unsupported = [](QMenu* m, const QString& text, const QString& why) {
+        QAction* a = m->addAction(text);
+        a->setEnabled(false);
+        a->setToolTip(why);
+    };
+    QMenu* sys   = byCategory[int(coreopt::Category::System)];
+    QMenu* audio = byCategory[int(coreopt::Category::Audio)];
+    QMenu* video = byCategory[int(coreopt::Category::Video)];
+    sys->addSeparator();
+    unsupported(sys, QStringLiteral("CD System BRAM"),
+                QStringLiteral("Not in this build: it runs Mega Drive cartridges only, no Mega-CD"));
+    audio->addSeparator();
+    unsupported(audio, QStringLiteral("Master System FM"),
+                QStringLiteral("Not in this build: it runs Mega Drive cartridges only, no Master System"));
+    video->addSeparator();
+    unsupported(video, QStringLiteral("Game Gear Extended Screen"),
+                QStringLiteral("Not in this build: it runs Mega Drive cartridges only, no Game Gear"));
+    unsupported(input, QStringLiteral("Show Lightgun Crosshair"),
+                QStringLiteral("Not in this build: only gamepads are connected, no light gun"));
+    unsupported(input, QStringLiteral("Invert Mouse Y-axis"),
+                QStringLiteral("Not in this build: only gamepads are connected, no mouse"));
+    for (QMenu* m : { sys, audio, video, input })
+        m->setToolTipsVisible(true);
+
+    // RESET and RELOAD options wait for their event; the status bar says so
+    // until it happens, beside the button that makes it happen.
+    applyLabel_  = new QLabel(this);
+    applyButton_ = new QToolButton(this);
+    applyButton_->setAutoRaise(true);
+    statusBar()->insertPermanentWidget(0, applyLabel_);
+    statusBar()->insertPermanentWidget(1, applyButton_);
+    applyLabel_->hide();
+    applyButton_->hide();
+    connect(applyButton_, &QToolButton::clicked, this, [this] {
+        if (coreopt::needs(emuHost_->coreOptionsRunning(), emuHost_->coreOptions()) == Apply::Reload)
+            reloadRom();
+        else
+            resetHard();
+    });
+    // Whatever applies them — this button, the File menu, a new ROM — the
+    // hint goes once the core has them: polled at the views' rate, which runs
+    // while a game does.
+    connect(&refreshTimer_, &QTimer::timeout, this, &MainWindow::updateApplyHint);
+}
+
+void MainWindow::setCoreOption(const coreopt::OptionDef& def, int stored)
+{
+    if (coreOpts_.*def.field == stored) return;
+    coreOpts_.*def.field = stored;
+    saveCoreOptions();
+    const QString problem = QString::fromStdString(emuHost_->setCoreOptions(coreOpts_));
+
+    // The problem names a missing boot ROM or lock-on file: report it with
+    // the option that asks for that file, not with every later change.
+    const bool asksForFile = def.field == &coreopt::CoreOptions::bootRom
+                          || def.field == &coreopt::CoreOptions::lockOn;
+    QString msg = QString::fromLatin1(def.label) + QStringLiteral(": ") + choiceLabel(def, stored);
+    if (asksForFile && !problem.isEmpty())
+        msg += QStringLiteral(" — ") + problem;
+    else if (!emuHost_->isRunning())
+        msg += QStringLiteral(" — applies when a ROM is loaded");
+    else if (def.apply == coreopt::Apply::Live && backend_->isPaused())
+        msg += QStringLiteral(" — applies when the emulator resumes");
+    statusBar()->showMessage(msg, asksForFile && !problem.isEmpty() ? 20000 : 4000);
+    updateApplyHint();
+}
+
+void MainWindow::saveCoreOptions()
+{
+    // Every option, not only the changed one, so the file shows them all.
+    for (const auto& def : coreopt::options())
+        viewsettings::putString(kCoreGroup, QString::fromLatin1(def.key),
+                                QString::fromStdString(coreopt::valueOf(coreOpts_, def)));
+    viewsettings::flush();
+}
+
+void MainWindow::updateApplyHint()
+{
+    using coreopt::Apply;
+    QStringList waiting;
+    Apply worst = Apply::Live;
+    if (emuHost_ && emuHost_->isRunning()) {
+        const coreopt::CoreOptions want = emuHost_->coreOptions();
+        const coreopt::CoreOptions have = emuHost_->coreOptionsRunning();
+        for (const auto& def : coreopt::options())
+            if (def.apply != Apply::Live && want.*def.field != have.*def.field) {
+                waiting << QString::fromLatin1(def.label);
+                worst = std::max(worst, def.apply);
+            }
+    }
+    if (waiting.isEmpty()) {
+        applyLabel_->hide();
+        applyButton_->hide();
+        return;
+    }
+    const QString event = worst == Apply::Reload ? QStringLiteral("Reload ROM")
+                                                 : QStringLiteral("Hard Reset");
+    applyLabel_->setText(waiting.join(QStringLiteral(", ")) + QStringLiteral(": applies after ") + event);
+    applyButton_->setText(event);
+    applyLabel_->show();
+    applyButton_->show();
+}
+
+void MainWindow::reportQueued(const QString& what)
+{
+    // Queued for the next frame boundary, which a paused emulator does not reach.
+    statusBar()->showMessage(backend_->isPaused()
+        ? what + QStringLiteral(": happens when the emulator resumes")
+        : what, 4000);
+}
+
+void MainWindow::resetSoft()
+{
+    if (!emuHost_->reset(false)) { statusBar()->showMessage(QStringLiteral("No ROM loaded"), 4000); return; }
+    reportQueued(QStringLiteral("Reset"));
+}
+
+void MainWindow::resetHard()
+{
+    if (!emuHost_->reset(true)) { statusBar()->showMessage(QStringLiteral("No ROM loaded"), 4000); return; }
+    reportQueued(QStringLiteral("Hard reset"));
+}
+
+void MainWindow::reloadRom()
+{
+    if (!emuHost_->isRunning()) { statusBar()->showMessage(QStringLiteral("No ROM loaded"), 4000); return; }
+    if (!emuHost_->reload()) {
+        statusBar()->showMessage(QStringLiteral("Reload ROM: the ROM file cannot be read now"), 8000);
+        return;
+    }
+    reportQueued(QStringLiteral("Reload ROM"));
 }
 
 void MainWindow::buildDocks()
