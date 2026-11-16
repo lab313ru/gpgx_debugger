@@ -29,10 +29,20 @@ why the same widgets run in the standalone app and docked inside IDA.
 `smd_dgx_qt6 [rom]` — arrows are the D-pad, `Z/X/C` and `A/S/D` are the six face
 buttons, Enter is Start. Letter keys are matched by physical position, so they
 stay put on a non-QWERTY layout. `F5`/`F9` pause and resume, `F7`/`F8` step into
-and over.
+and over, on the CPU whose tab is in front in the Debugger window.
 
 Views, all dockable and toggled from the **View** menu:
 
+- **Debugger** — the standalone's own disassembler, since there is no IDA here.
+  A **68000** tab and a **Z80** tab, each with a listing around that CPU's PC
+  (Go to, `F2` or double-click toggles a breakpoint), its registers, editable
+  while paused, and step buttons. The Z80 tab also shows IM, IFF1/IFF2, HALT,
+  the 68000 range its bank window maps, and whether the 68000 holds it in
+  reset or has taken its bus: a Z80 step finishes only once the Z80 runs. The
+  Debug menu's steps act on the tab in front and say "(Z80)" when it is the
+  Z80; a Z80 stop brings its tab forward. Beside the tabs, a breakpoint panel
+  for PC (68000 or Z80), 68K and Z80 bus reads and writes, and VRAM/CRAM/VSRAM,
+  listing every breakpoint, including those set from IDA or MCP.
 - **VDP Ram** — palette grid and tile browser. Click a palette cell to pick the
   decode colour, click a tile for a zoomed preview with CRAM/RGB readouts.
   Dump/load VRAM and CRAM as plain binary, export a YY-CHR palette.
@@ -288,8 +298,8 @@ means building the whole package on an older distribution, not only the app.
 ctest --test-dir <build> --output-on-failure
 ```
 
-The cases cover the shared debug layer, the bridge, the 68000 disassembler and
-listing, and the core options — no Qt, no IDA, no SDL, and no ROM file: the
+The cases cover the shared debug layer, the bridge, the 68000 and Z80
+disassemblers and listings, and the core options — no Qt, no IDA, no SDL, and no ROM file: the
 tests synthesise their own Mega Drive (and the boot and lock-on files the
 options look for), so nothing is ever skipped for a missing dump.
 
