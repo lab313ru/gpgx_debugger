@@ -214,15 +214,24 @@ void BridgeServer::stop()
         CLOSESOCK(static_cast<socket_t>(listenFd_));   // unblocks accept()
         listenFd_ = -1;
     }
-    // Close the client sockets so their recv() returns and the threads exit;
-    // otherwise a connected debugger keeps this object alive past the host.
+    // Wake the client threads so their recv() returns and they exit; otherwise
+    // a connected debugger keeps this object alive past the host.
+    //
+    // Each thread holds its own copy of the descriptor, so closing it here
+    // frees a number the thread may still send on: a client parked in
+    // handleWait() wakes after this and writes its reply to whatever the
+    // number names by then. On POSIX, shutdown() alone wakes recv() and makes
+    // that send fail, and serveClient() closes the socket itself. Windows
+    // needs the close to wake recv(), so there the thread finds fd == -1.
     {
         std::lock_guard<std::mutex> lk(clientsMx_);
         for (auto& c : clients_)
             if (c->fd >= 0) {
                 sockcompat::wakeBlocked(static_cast<socket_t>(c->fd));
+#ifdef _WIN32
                 CLOSESOCK(static_cast<socket_t>(c->fd));
                 c->fd = -1;
+#endif
             }
     }
     // A client parked inside handleWait() is not in recv(), so closing its
@@ -283,9 +292,10 @@ void BridgeServer::serveClient(std::shared_ptr<Client> c)
     }
 gone:
 
-    // Claim the descriptor before closing it. stop() closes client sockets to
-    // wake their threads, so without this handshake the same fd is closed
-    // twice — and a descriptor number reused by then belongs to someone else.
+    // Claim the descriptor before closing it. On Windows stop() closes client
+    // sockets to wake their threads, so without this handshake the same fd is
+    // closed twice — and a descriptor number reused by then belongs to someone
+    // else. On POSIX stop() only shuts them down and this is the one close.
     {
         std::lock_guard<std::mutex> lk(clientsMx_);
         if (c->fd >= 0) { c->fd = -1; CLOSESOCK(fd); }
