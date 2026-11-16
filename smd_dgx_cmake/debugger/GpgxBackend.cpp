@@ -204,7 +204,9 @@ bool GpgxBackend::loadState(const char* path)
     f.seekg(0);
     std::vector<uint8_t> buf(STATE_SIZE, 0);
     if (!f.read(reinterpret_cast<char*>(buf.data()), size)) return false;
-    return state_load(buf.data()) != 0;
+    if (state_load(buf.data()) == 0) return false;
+    if (afterStateLoad_) afterStateLoad_();
+    return true;
 }
 
 bool GpgxBackend::runSafely(const std::function<void()>& fn)
@@ -524,13 +526,7 @@ bool GpgxBackend::loadRom(const char* path)
     static std::vector<uint8_t> framebuffer(720 * 576 * 4, 0);
     gx::bitmap_data() = framebuffer.data();
 
-    {
-        std::lock_guard<std::mutex> lk(callstackMutex_);
-        callstack_.clear();
-        callstackSlot_.clear();
-        callstackZ80_.clear();
-        callstackSlotZ80_.clear();
-    }
+    onSystemReset();
     abandoned_.store(false);        // a previous shutdown must not mute this run
     // Nor stop it: a step asked for while nothing ran, or one a shutdown left
     // armed, would park the new ROM on its first instruction.
@@ -540,17 +536,33 @@ bool GpgxBackend::loadRom(const char* path)
     stepIntoZ80_.store(false);
     stepOverAddrZ80_.store(-1);
     stepOutSpZ80_.store(-1);
+    held_.store(false);             // nor a hold the previous run never released
+
+    // gx::init() has just put config back to defaults, and load_rom reads it.
+    if (beforeLoad_) beforeLoad_();
 
     bool ok = gx::load_rom(path);
     if (ok) {
-        romFile_ = path;
-        const size_t slash = romFile_.find_last_of("/\\");
-        if (slash != std::string::npos) romFile_.erase(0, slash + 1);
-        const size_t dot = romFile_.rfind('.');
-        if (dot != std::string::npos && dot > 0) romFile_.resize(dot);
+        std::string name = path;
+        const size_t slash = name.find_last_of("/\\");
+        if (slash != std::string::npos) name.erase(0, slash + 1);
+        const size_t dot = name.rfind('.');
+        if (dot != std::string::npos && dot > 0) name.resize(dot);
+        // A reload runs on the emulation thread while bridge clients read
+        // sessionInfo(); the same name must not be rewritten under them.
+        if (name != romFile_) romFile_ = std::move(name);
         running_.store(true);
     }
     return ok;
+}
+
+void GpgxBackend::onSystemReset()
+{
+    std::lock_guard<std::mutex> lk(callstackMutex_);
+    callstack_.clear();
+    callstackSlot_.clear();
+    callstackZ80_.clear();
+    callstackSlotZ80_.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -622,6 +634,8 @@ void GpgxBackend::abortRunControl()
 void GpgxBackend::firePause(uint32_t pc, Cpu cpu, int bpId)
 {
     if (abandoned_.load()) return;      // shutting down: do not park the thread
+    // Held: pass through, and leave any step armed for when the hold ends.
+    if (held_.load()) return;
     // Any stop ends whatever step was in flight. F8 over a call that hits a
     // breakpoint inside would otherwise leave its target armed, and a later F9
     // would stop there for no reason the user can see.
@@ -633,6 +647,11 @@ void GpgxBackend::firePause(uint32_t pc, Cpu cpu, int bpId)
     stepOutSpZ80_.store(-1);
     lastBpId_.store(bpId);
     paused_.store(true);
+    // A hold that began after the check above. The host sets the hold and
+    // then looks at isPaused(); this sets paused_ and then looks at the hold,
+    // so one of the two always sees the other and the thread is not left
+    // parked with the hold on.
+    if (held_.load()) { paused_.store(false); return; }
     if (pauseCb_) pauseCb_(pc, cpu);
     // Block the emulation thread until resumed. While blocked, pump host
     // commands (resume/step/read) so run-control can proceed — nested-loop

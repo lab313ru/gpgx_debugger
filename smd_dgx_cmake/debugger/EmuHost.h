@@ -1,6 +1,7 @@
 #pragma once
 #include "GpgxBackend.h"
 #include "DebugApi.h"
+#include "CoreOptions.h"
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -27,12 +28,15 @@
 // the emulator core is only ever touched from one thread.
 class EmuHost {
 public:
-    // Optional sinks. FrameSink receives the rendered framebuffer each frame
-    // (RGB565, gpgx t_bitmap geometry) plus the active viewport rect — the
-    // visible area varies with H32/H40 and border settings. Omit for a truly
-    // headless run.
+    // Optional sinks. FrameSink receives each finished frame as the picture to
+    // show (coreopt::Picture): width x height RGB565 pixels from the top left
+    // of `data`, rows `pitch` bytes apart. Its size follows H32/H40, the
+    // borders, the NTSC filter and double-field interlace, and its pixels are
+    // square only by chance, so `aspect` is the width / height to show it at.
+    // A host that sets no core options, the IDA plugin, gets 0 there: show
+    // the pixels square. Omit the sink for a truly headless run.
     using FrameSink = std::function<void(const uint8_t* data, int width, int height, int pitch,
-                                         int vpX, int vpY, int vpW, int vpH)>;
+                                         double aspect)>;
     // Receives one frame's worth of 16-bit stereo samples. Omit for silence.
     using AudioSink = std::function<void(const int16_t* stereo, int frames)>;
     using EventSink = std::function<void(const DebugEvent&)>;
@@ -65,6 +69,55 @@ public:
     // Load a ROM and start the emulation thread. Returns false if the ROM
     // failed to load (no thread is started in that case).
     bool start(const std::string& romPath);
+
+    // ---- Core options, reset, reload ----
+    //
+    // For the standalone app. A host that never calls setCoreOptions runs on
+    // the core's defaults — the IDA plugin does exactly that.
+    //
+    // Before start(): the options the next start() loads the ROM with. While
+    // running, the change is queued and applied at the top of the run loop,
+    // between two frames — never inside a pause, which sits in the middle of
+    // a frame and of an instruction; a paused emulator applies it after it is
+    // resumed and the frame ends. LIVE options take effect there; RESET ones
+    // at the next reset(true), RELOAD ones at the next reload() or start().
+    //
+    // Returns why part of it cannot work as asked — a TMSS boot ROM switched
+    // on but missing or invalid, a lock-on cartridge whose ROM file is not
+    // there — or "" when all is well.
+    std::string setCoreOptions(const coreopt::CoreOptions& o);
+    coreopt::CoreOptions coreOptions() const;     // as last set
+    // What the core runs with: coreOptions() less each change not applied
+    // yet — RESET options until a hard reset, RELOAD ones until a reload or a
+    // start, the rest until the next frame boundary. So
+    // coreopt::needs(coreOptionsRunning(), coreOptions()) is what a UI still
+    // has to ask the user for.
+    coreopt::CoreOptions coreOptionsRunning() const;
+
+    // Hard: a power cycle that keeps cartridge SRAM and picks up RESET-class
+    // options. Soft: the console's reset button. False when nothing is
+    // running.
+    //
+    // Carried out at the top of the run loop like an option change, but not
+    // left waiting there: the rest of the current frame runs with breakpoints
+    // and steps passing through, so a breakpoint hit on every frame cannot
+    // put it off. A paused emulator is resumed for that, and stops again at
+    // the first instruction after the reset.
+    bool reset(bool hard);
+    // Loads the ROM again with the current options, keeping cartridge SRAM.
+    // Carried out as reset() is. False when nothing is running or the ROM
+    // file cannot be read now or is empty.
+    //
+    // A file that changes between this check and the load can still fail it.
+    // Then the run ends: the emulation thread exits, isRunning() turns false,
+    // a Stopped event goes out from that thread, and stopReason() says why.
+    bool reload();
+
+    // Why the run ended on its own, or "" while it runs or when stop() ended it.
+    std::string stopReason() const;
+
+    // Resets and reloads performed so far, to tell that a queued one is done.
+    uint64_t resetCount() const { return resets_.load(); }
 
     // Signal the emulation thread to exit and join it.
     void stop();
@@ -123,13 +176,25 @@ public:
     void setHostMutations(HostMutations m) { hostMut_ = std::move(m); }
     const HostMutations& hostMutations() const { return hostMut_; }
 
-    // Copy the visible viewport as tightly packed RGB565 (w*h*2 bytes). Call
-    // from the emulation thread — i.e. through invoke() — so the framebuffer
-    // is not being redrawn underneath.
-    void copyViewport(std::vector<uint8_t>& out, int& w, int& h) const;
+    // Copy the picture the frame sink is given as tightly packed RGB565
+    // (width*height*2 bytes): borders, the NTSC filter's width and both
+    // interlaced fields included when they are on. Returns its size, shape
+    // and where the game's display lies in it; a zero size and an empty
+    // `out` when there is none. Call from the emulation thread — i.e. through
+    // invoke() — so the framebuffer is not being redrawn underneath.
+    coreopt::Picture copyPicture(std::vector<uint8_t>& out) const;
 
 private:
     void run(std::string romPath);
+    void applyPending();
+    void runToFrameEnd();
+    void beforeLoad();
+    void afterStateLoad();
+    void hardReset();
+    void doReload();
+    void emitStopped();
+    void installBootRomFor(const coreopt::CoreOptions& o);
+    void setInCore(const coreopt::CoreOptions& o);
     void drainCommands();
     void drainTasks();
     void emitEvent(const DebugEvent& ev);   // not `emit`: clashes with Qt's macro
@@ -149,7 +214,32 @@ private:
     std::atomic<int>  framesLeft_ { 0 };   // frame-advance countdown
     std::atomic<uint64_t> stops_  { 0 };
     std::atomic<uint64_t> frames_ { 0 };
+    std::atomic<uint64_t> resets_ { 0 };
+    std::atomic<bool> stoppedSent_ { false };   // one Stopped event per run
+    // A reset or reload holds stops until the frame ends (runToFrameEnd);
+    // repause_ says the emulator was paused when it was asked for.
+    std::atomic<bool> repause_ { false };
     HostMutations     hostMut_;
+
+    // Requests for the top of the run loop, applied in the order made.
+    struct Pending {
+        enum class Kind { Options, Reset, Reload } kind;
+        coreopt::CoreOptions opts;   // Options
+        bool hard = false;           // Reset
+    };
+    std::string             romPath_;
+    mutable std::mutex      optMx_;
+    coreopt::CoreOptions    want_;              // as last set       (optMx_)
+    bool                    haveOptions_ = false;                  // (optMx_)
+    std::deque<Pending>     pending_;                              // (optMx_)
+    std::string             stopReason_;                           // (optMx_)
+    // Emulation thread only (and start(), before the thread exists):
+    bool                    useOptions_ = false;   // haveOptions_ as of the run
+    coreopt::CoreOptions    requested_;   // the latest Options request applied
+    // What the core is running with. Written there under optMx_ (setInCore),
+    // so coreOptionsRunning() can read it from another thread; the emulation
+    // thread itself reads it without the lock.
+    coreopt::CoreOptions    inCore_;
 
     // Work handed to the emulation thread by invoke().
     //

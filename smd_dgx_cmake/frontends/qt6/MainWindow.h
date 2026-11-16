@@ -4,9 +4,11 @@
 #include <QString>
 #include <QTimer>
 #include <vector>
+#include <utility>
 #include <cstdint>
 
 #include "debugger/DebugState.h"
+#include "debugger/CoreOptions.h"
 
 class EmulatorScreen;
 class EmuHost;
@@ -24,6 +26,8 @@ class MemoryView;
 class RamSearchView;
 class RamWatchView;
 class CpuDebugView;
+class QToolButton;
+class QActionGroup;
 
 class MainWindow : public QMainWindow
 {
@@ -48,11 +52,21 @@ private slots:
     void debugStepOver();
     void debugStepOut();
     void refreshViews();
+    void resetSoft();
+    void resetHard();
+    void reloadRom();
+    void updateApplyHint();
+    void watchHost();
 
 private:
     void buildMenus();
     void stopEmulator();
     void buildDocks();
+    void buildOptionsMenu();
+    void setCoreOption(const coreopt::OptionDef& def, int stored);
+    void saveCoreOptions();
+    void adoptHostOptions();
+    void reportQueued(const QString& what, bool wasPaused);
 
     // The host owns the backend, and there must be exactly one: the CPU hook is
     // a single global that the most recently constructed GpgxBackend claims, so
@@ -87,4 +101,15 @@ private:
     QAction* actStepInto_ = nullptr;
     QAction* actStepOver_ = nullptr;
     QAction* actStepOut_  = nullptr;
+
+    // Emulator core options: the standalone app's only, kept in views.ini
+    // [Core]. The IDA plugin never sets any and runs on the core defaults.
+    coreopt::CoreOptions coreOpts_;
+    QAction*     actReset_     = nullptr;
+    QAction*     actHardReset_ = nullptr;
+    QAction*     actReload_    = nullptr;
+    QLabel*      applyLabel_   = nullptr;   // options waiting for a reset or reload
+    QToolButton* applyButton_  = nullptr;   // ... and the one click that applies them
+    // Each option's menu, to check the choice the host switched to itself.
+    std::vector<std::pair<const coreopt::OptionDef*, QActionGroup*>> optionGroups_;
 };

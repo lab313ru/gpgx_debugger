@@ -541,6 +541,18 @@ int sound_context_load(uint8 *state)
 #ifdef HAVE_YM3438_CORE
     uint8 config_ym3438;
     load_param(&config_ym3438, sizeof(config_ym3438));
+
+    /* The state holds the chip of the FM core it was saved with (MAME or   */
+    /* Nuked). Restored into the other core's chip, it would leave the one  */
+    /* playing reset and silent, so that core is brought back with it.      */
+    if ((config_ym3438 != 0) != (config.ym3438 != 0))
+    {
+      config.ym3438 = config_ym3438;
+      if (config_ym3438)
+        OPN2_SetChipType((config_ym3438 == 2) ? ym3438_mode_readmode : ym3438_mode_ym2612);
+      sound_init();
+    }
+
     if (config_ym3438)
     {
       load_param(&ym3438, sizeof(ym3438));

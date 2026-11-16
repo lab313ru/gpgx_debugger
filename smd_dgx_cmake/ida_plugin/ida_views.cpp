@@ -173,10 +173,9 @@ void smd_dgx_view_detach_all()
     for (auto& d : g_docks) d.widget = nullptr;
 }
 
-void smd_dgx_push_frame(const unsigned char* data, int w, int h, int pitch,
-                        int vpX, int vpY, int vpW, int vpH)
+void smd_dgx_push_frame(const unsigned char* data, int w, int h, int pitch, double aspect)
 {
     std::lock_guard<std::mutex> lk(g_screenMx);
     if (g_screen)
-        g_screen->pushFrame(data, w, h, pitch, vpX, vpY, vpW, vpH);
+        g_screen->pushFrame(data, w, h, pitch, aspect);
 }

@@ -1,7 +1,9 @@
 #include "EmuHost.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <fstream>
 
 #include <gx/gx.hpp>
 
@@ -11,7 +13,11 @@ extern "C" {
 #include <vdp_ctrl.h>
 }
 
-EmuHost::EmuHost() = default;
+EmuHost::EmuHost()
+{
+    backend_.setBeforeLoad([this] { beforeLoad(); });
+    backend_.setAfterStateLoad([this] { afterStateLoad(); });
+}
 
 EmuHost::~EmuHost()
 {
@@ -22,6 +28,17 @@ bool EmuHost::start(const std::string& romPath)
 {
     stop();
     stopFlag_.store(false);
+    stoppedSent_.store(false);
+    repause_.store(false);
+
+    {
+        std::lock_guard<std::mutex> lk(optMx_);
+        pending_.clear();             // requests made for the previous run
+        stopReason_.clear();
+        useOptions_ = haveOptions_;
+        requested_ = inCore_ = haveOptions_ ? want_ : coreopt::CoreOptions{};
+    }
+    romPath_ = romPath;
 
     // Load synchronously so the caller learns immediately whether the ROM is
     // valid; the thread only runs frames.
@@ -69,11 +86,19 @@ void EmuHost::stop()
     stopFlag_.store(true);
     // Not just resume(): the instruction right after a resume can hit the same
     // breakpoint and park the thread again before it ever re-checks stopFlag_,
-    // and then this join waits forever.
-    backend_.abortRunControl();
+    // and then this join waits forever. A thread that has already ended on
+    // its own needs neither, and would only get a Resumed after its Stopped.
+    if (!stoppedSent_.load()) backend_.abortRunControl();
     thread_.join();
     running_.store(false);
+    emitStopped();
+}
 
+// Once per run: the emulation thread sends it when the run ends on its own,
+// and stop() must not send a second one after joining that thread.
+void EmuHost::emitStopped()
+{
+    if (stoppedSent_.exchange(true)) return;
     DebugEvent stopped;
     stopped.type = DebugEvent::Type::Stopped;
     stopped.changed = backend_.takeCodemap();
@@ -84,12 +109,14 @@ void EmuHost::run(std::string /*romPath*/)
 {
     namespace chr = std::chrono;   // core/system.h declares a global system_clock
 
-    const double fps = vdp_pal ? 50.0 : 60.0;
-    const auto frameDur = chr::duration_cast<chr::steady_clock::duration>(
-        chr::duration<double>(1.0 / fps));
     auto nextFrame = chr::steady_clock::now();
 
     while (!stopFlag_.load()) {
+        // Resets, reloads and option changes happen here and nowhere else: a
+        // pause stops mid-frame and mid-instruction, where the core cannot be
+        // rebuilt underneath the CPU that is executing.
+        applyPending();
+        if (stopFlag_.load()) break;     // e.g. a reload that could not load the ROM
         drainCommands();
 
         system_frame_gen(0);      // one field/frame; blocks in firePause on bp
@@ -102,9 +129,9 @@ void EmuHost::run(std::string /*romPath*/)
             backend_.pause();
 
         if (frameSink_) {
-            const t_bitmap& bm = ::bitmap;
-            frameSink_(bm.data, bm.width, bm.height, bm.pitch,
-                       bm.viewport.x, bm.viewport.y, bm.viewport.w, bm.viewport.h);
+            const coreopt::Picture pic = coreopt::picture(inCore_);
+            frameSink_(::bitmap.data, pic.width, pic.height, ::bitmap.pitch,
+                       useOptions_ ? pic.aspect : 0.0);
         }
 
         if (audioSink_ && snd.enabled && snd.blips[0]) {
@@ -117,8 +144,15 @@ void EmuHost::run(std::string /*romPath*/)
         // Run at console speed. Unpaced, the emulator spins a core flat out for
         // no benefit — a debugger host still wants the game in real time. A
         // pause blocks inside system_frame_gen, so re-baseline once we are
-        // behind rather than bursting frames to catch up.
-        nextFrame += frameDur;
+        // behind rather than bursting frames to catch up. The rate is read
+        // every frame, as a region or VDP mode change alters it.
+        //
+        // A frame makes the console's rate worth of samples, so pacing below
+        // that rate starves the sound card and the audio crackles. A shade
+        // above it instead: AudioOutput::write blocks on a full queue and so
+        // takes up the excess.
+        nextFrame += chr::duration_cast<chr::steady_clock::duration>(
+            chr::duration<double>(1.0 / (coreopt::frameRate() * 1.002)));
         const auto now = chr::steady_clock::now();
         if (nextFrame > now)
             std::this_thread::sleep_until(nextFrame);
@@ -126,6 +160,222 @@ void EmuHost::run(std::string /*romPath*/)
             nextFrame = now;
     }
     gx::shutdown();
+
+    // Ended by itself rather than by stop(): nothing else would tell anyone,
+    // and every call that waits on this thread would wait out its timeout.
+    bool ownEnd;
+    { std::lock_guard<std::mutex> lk(optMx_); ownEnd = !stopReason_.empty(); }
+    if (ownEnd) {
+        running_.store(false);
+        emitStopped();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Core options, reset, reload
+// ---------------------------------------------------------------------------
+
+std::string EmuHost::setCoreOptions(const coreopt::CoreOptions& o)
+{
+    std::string problem;
+    if (o.bootRom) problem = coreopt::findBootRom().problem;
+    if (const coreopt::LockOnRom lockOn = coreopt::checkLockOn(o); !lockOn.ok())
+        problem += (problem.empty() ? "" : "; ") + lockOn.problem;
+
+    std::lock_guard<std::mutex> lk(optMx_);
+    want_ = o;
+    haveOptions_ = true;
+    if (running_.load())
+        pending_.push_back({ Pending::Kind::Options, o, false });
+    return problem;
+}
+
+coreopt::CoreOptions EmuHost::coreOptions() const
+{
+    std::lock_guard<std::mutex> lk(optMx_);
+    return want_;
+}
+
+coreopt::CoreOptions EmuHost::coreOptionsRunning() const
+{
+    std::lock_guard<std::mutex> lk(optMx_);
+    return inCore_;
+}
+
+std::string EmuHost::stopReason() const
+{
+    std::lock_guard<std::mutex> lk(optMx_);
+    return stopReason_;
+}
+
+void EmuHost::setInCore(const coreopt::CoreOptions& o)
+{
+    std::lock_guard<std::mutex> lk(optMx_);
+    inCore_ = o;
+}
+
+namespace {
+
+// What File > Open asks of a ROM before loading it. An empty file is what an
+// assembler leaves while it rewrites the ROM, and the core cannot load one.
+bool romFileLoadable(const std::string& path)
+{
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    return f && f.tellg() > 0;
+}
+
+} // namespace
+
+bool EmuHost::reset(bool hard)
+{
+    if (!running_.load()) return false;
+    {
+        std::lock_guard<std::mutex> lk(optMx_);
+        pending_.push_back({ Pending::Kind::Reset, {}, hard });
+    }
+    runToFrameEnd();
+    return true;
+}
+
+bool EmuHost::reload()
+{
+    if (!running_.load()) return false;
+    if (!romFileLoadable(romPath_)) return false;
+    {
+        std::lock_guard<std::mutex> lk(optMx_);
+        pending_.push_back({ Pending::Kind::Reload, {}, false });
+    }
+    runToFrameEnd();
+    return true;
+}
+
+// A request waiting for the frame boundary would otherwise wait for as long
+// as a breakpoint keeps stopping the frame short of it, and a paused emulator
+// never gets there at all. applyPending() lifts the hold.
+void EmuHost::runToFrameEnd()
+{
+    backend_.holdStops(true);
+    if (backend_.isPaused()) {
+        repause_.store(true);
+        backend_.resume();
+    }
+}
+
+void EmuHost::applyPending()
+{
+    std::deque<Pending> ops;
+    {
+        std::lock_guard<std::mutex> lk(optMx_);
+        if (pending_.empty()) return;
+        ops.swap(pending_);
+        useOptions_ = haveOptions_;
+    }
+    const bool held = std::any_of(ops.begin(), ops.end(),
+                                  [](const Pending& op) { return op.kind != Pending::Kind::Options; });
+    for (const Pending& op : ops) {
+        if (stopFlag_.load()) return;
+        switch (op.kind) {
+        case Pending::Kind::Options: {
+            requested_ = op.opts;
+            const coreopt::CoreOptions next =
+                coreopt::withClass(inCore_, op.opts, coreopt::Apply::Live);
+            const bool reinit = coreopt::applyLive(inCore_, next);
+            setInCore(next);
+            if (reinit) hardReset();
+            break;
+        }
+        case Pending::Kind::Reset:
+            if (op.hard) {
+                hardReset();
+            } else {
+                coreopt::softReset();
+                backend_.onSystemReset();
+                resets_.fetch_add(1);
+            }
+            break;
+        case Pending::Kind::Reload:
+            doReload();
+            break;
+        }
+    }
+    if (held) {
+        backend_.holdStops(false);
+        // Stopped where it was asked for: at the first instruction after it.
+        if (repause_.exchange(false)) backend_.pause();
+    }
+}
+
+// GpgxBackend::loadRom calls this between gx::init() and the ROM load: from
+// start() on the caller's thread, before the emulation thread exists, and from
+// a reload on the emulation thread.
+void EmuHost::beforeLoad()
+{
+    if (!useOptions_) return;
+    coreopt::applyAtLoad(requested_);
+    installBootRomFor(requested_);
+    setInCore(requested_);
+}
+
+// A save state brings back the FM core it was saved with (sound_context_load):
+// the core runs it from now on, and the options say so, so that a UI shows
+// what is playing and no later change of another option switches it back.
+void EmuHost::afterStateLoad()
+{
+    if (!useOptions_) return;
+    const int fm = coreopt::runningFmCore();
+    if (fm == inCore_.fmCore) return;
+
+    std::lock_guard<std::mutex> lk(optMx_);
+    inCore_.fmCore = requested_.fmCore = want_.fmCore = fm;
+    for (Pending& op : pending_)
+        if (op.kind == Pending::Kind::Options) op.opts.fmCore = fm;
+}
+
+void EmuHost::hardReset()
+{
+    if (useOptions_) {
+        setInCore(coreopt::withClass(inCore_, requested_, coreopt::Apply::Reset));
+        coreopt::applyResetFields(inCore_);
+        installBootRomFor(inCore_);
+    }
+    coreopt::reinitMachine();
+    backend_.onSystemReset();
+    resets_.fetch_add(1);
+}
+
+void EmuHost::doReload()
+{
+    // Checked again: if the file has gone or been emptied since the request,
+    // the game being played is worth more than the reload.
+    if (!romFileLoadable(romPath_)) return;
+
+    // SRAM the game has written exists only in memory until shutdown, and the
+    // load would replace it with whatever was last saved to disk.
+    std::vector<uint8_t> keep(sram.sram, sram.sram + sizeof sram.sram);
+    const bool hadSram = sram.on != 0;
+
+    if (!backend_.loadRom(romPath_.c_str())) {
+        // gx::init() has taken the machine down, so the run ends here. A load
+        // that fails leaves SRAM alone, so gx::shutdown() saves this session's
+        // game as a stop would.
+        {
+            std::lock_guard<std::mutex> lk(optMx_);
+            stopReason_ = "could not load " + romPath_;
+        }
+        stopFlag_.store(true);
+        return;
+    }
+    // stop() may have abandoned run control while the load re-armed it.
+    if (stopFlag_.load()) backend_.abortRunControl();
+    if (hadSram && sram.on) std::memcpy(sram.sram, keep.data(), keep.size());
+    resets_.fetch_add(1);
+}
+
+void EmuHost::installBootRomFor(const coreopt::CoreOptions& o)
+{
+    if (!o.bootRom) { coreopt::installBootRom(nullptr); return; }
+    const coreopt::BootRom rom = coreopt::findBootRom();
+    coreopt::installBootRom(rom.ok() ? &rom : nullptr);
 }
 
 void EmuHost::drainCommands()
@@ -220,20 +470,18 @@ void EmuHost::dispatch(const DebugCommand& cmd)
     }
 }
 
-void EmuHost::copyViewport(std::vector<uint8_t>& out, int& w, int& h) const
+coreopt::Picture EmuHost::copyPicture(std::vector<uint8_t>& out) const
 {
     const t_bitmap& bm = ::bitmap;
-    w = bm.viewport.w;
-    h = bm.viewport.h;
+    const coreopt::Picture pic = coreopt::picture(inCore_);
+    const int w = pic.width, h = pic.height;
     out.clear();
-    if (!bm.data || w <= 0 || h <= 0) { w = h = 0; return; }
+    if (!bm.data || w <= 0 || h <= 0) return {};
 
     out.resize(static_cast<size_t>(w) * h * 2);
-    for (int y = 0; y < h; ++y) {
-        const uint8_t* src = bm.data + (size_t)(bm.viewport.y + y) * bm.pitch
-                                     + (size_t)bm.viewport.x * 2;
-        std::memcpy(out.data() + (size_t)y * w * 2, src, (size_t)w * 2);
-    }
+    for (int y = 0; y < h; ++y)
+        std::memcpy(out.data() + (size_t)y * w * 2, bm.data + (size_t)y * bm.pitch, (size_t)w * 2);
+    return pic;
 }
 
 int EmuHost::addEventSink(EventSink s)
