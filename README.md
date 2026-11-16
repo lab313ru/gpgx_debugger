@@ -250,14 +250,30 @@ and builds the `linux-release` preset, runs the tests and writes to
 The IDA modules have **never been loaded into a real Linux IDA** — there was
 none to load them into. What was checked instead is under Status below.
 
-Qt, SDL2 and the libraries they need travel inside the standalone packages. The
-script downloads linuxdeploy and its Qt plugin (their GitHub "continuous"
-releases) into `~/.cache/smd_dgx/tools` on first use and says so on every run;
-the AppImage runtime it takes out of linuxdeploy itself, where appimagetool
-would download another. `tools/check_linux_package.sh <unpacked dir | AppImage>
-<rom>` starts a package on the current display, checks that it answers on the
-control socket, and fails if anything loads from the build tree or any Qt
-library from outside the package.
+Qt, SDL2 and most of what they need travel inside the standalone packages.
+What they take from the system instead (the desktop's X11, OpenGL/EGL and font
+libraries, and for sound ALSA, libdrm, libgbm and libwayland-client) the script
+works out from the deployed files and writes into the package's `README.txt`,
+with the Debian/Ubuntu packages that provide it. `BUNDLED.txt` beside it names
+each bundled library's distribution package, version and source package, and
+the tools the package was made with. `LICENSE.txt` is in both packages and
+next to the AppImage.
+
+The script downloads nothing. linuxdeploy and its Qt plugin go into
+`~/.cache/smd_dgx/tools` (or `LINUXDEPLOY` and `LINUXDEPLOY_PLUGIN_QT` name
+them), and they must be the copies `tools/linux/linuxdeploy.sha256` pins: they
+decide which libraries go in, and the AppImage runtime is cut out of linuxdeploy
+itself, where appimagetool would download another. The pinned ones are GitHub
+"continuous" builds, which that page has since replaced or will; a new copy
+needs `SMD_DGX_ANY_LINUXDEPLOY=1` or a new pin.
+
+`tools/check_linux_package.sh <tarball | unpacked dir | AppImage> <rom>` starts
+a package on the current display, checks that it answers on the control socket,
+and fails if anything loads from the build tree, any Qt library from outside the
+package, or an SDL2 other than the bundled one. It writes what it saw to
+`check_<package>.log` next to the package. Under WSL with systemd,
+`/tmp/.X11-unix` can be empty while WSLg's socket is in `/mnt/wslg/.X11-unix`;
+Qt's xcb plugin then aborts before the app starts.
 
 **The floor: glibc 2.38 and GLIBCXX 3.4.31**, the highest versions any ELF file
 in either archive imports (`objdump -T`, undefined symbols only). Ubuntu
@@ -296,14 +312,16 @@ IDA's own actions, with the trace checked against the machine's stack memory.
 
 **Verified on Linux by a scripted run (Ubuntu 24.04 under WSL2):** the whole
 test suite, and the standalone app loading a game in WSLg and answering the
-bridge's `ping`, `status`, `pause` and `frame`. Both standalone packages, away
-from the build tree and with an empty `LD_LIBRARY_PATH` — the tarball unpacked
-into a fresh directory, the AppImage with `APPIMAGE_EXTRACT_AND_RUN=1` — ran a
-game in WSLg and drew it over the bridge, and `ldd` and the running app's
-memory map showed Qt loaded from the package and nothing from the build tree.
-Every run was silent (`DGX_NO_AUDIO=1`): that `dlopen` finds the bundled SDL2
-was checked with a probe, not by listening. No other distribution or desktop
-has run the packages; the glibc 2.38 floor is measured, not tried.
+bridge's `ping`, `status`, `pause` and `frame`. Both standalone packages pass
+`tools/check_linux_package.sh` away from the build tree and with an empty
+`LD_LIBRARY_PATH` — the tarball unpacked into a fresh directory, the AppImage
+with `APPIMAGE_EXTRACT_AND_RUN=1`: each ran a game in WSLg and drew it over the
+bridge, and `ldd` and the running app's memory map showed Qt and SDL2 loaded
+from the package and nothing from the build tree. The check keeps that, with
+the package's sha256, in `check_<package>.log` beside the package. Every run
+was silent (`DGX_NO_AUDIO=1`): SDL2 was loaded but no device opened, so no
+sound has been heard from a Linux build. No other distribution or desktop has
+run the packages; the glibc 2.38 floor is measured, not tried.
 
 **Built but never driven by hand:**
 
