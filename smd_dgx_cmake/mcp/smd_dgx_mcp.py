@@ -585,7 +585,7 @@ def screenshot() -> list[Image | str]:
     line of text follows the image saying where the game's display lies in
     it; map VDP coordinates through that, not straight onto the image.
     """
-    reply = bridge.command("frame")
+    reply = bridge.command("frame full")
     *nums, b64 = reply.split(" ", 8)
     w, h, ax, ay, aw, ah, vw, vh = (int(n) for n in nums)
     out: list[Image | str] = [Image(data=_png(base64.b64decode(b64), w, h), format="png")]

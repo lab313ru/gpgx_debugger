@@ -838,20 +838,35 @@ TEST(bridge_frame_reports_the_display_area)
         return ok == "ok" && is && !b64.empty() ? n : std::vector<int>{};
     };
 
-    std::vector<int> f = numbers(raw.cmd("frame"));
+    // ok w h base64: what scripts that split on two spaces expect.
+    auto shortForm = [](const std::string& reply, int& w, int& h) {
+        std::istringstream is(reply);
+        std::string ok, b64, extra;
+        is >> ok >> w >> h >> b64;
+        return ok == "ok" && is && !(is >> extra) && b64.size() == ((size_t(w) * h * 2 + 2) / 3) * 4;
+    };
+
+    std::vector<int> f = numbers(raw.cmd("frame full"));
     REQUIRE(f.size() == 8);
     CHECK(f[2] == 0 && f[3] == 0 && f[4] == f[0] && f[5] == f[1]);
     CHECK(f[6] == f[0] && f[7] == f[1]);
+    int sw = 0, sh = 0;
+    CHECK(shortForm(raw.cmd("frame"), sw, sh));
+    CHECK(sw == f[0] && sh == f[1]);
 
     coreopt::CoreOptions o;
     o.overscan = coreopt::OverscanFull;
     w.emu.host()->setCoreOptions(o);
     REQUIRE(raw.cmd("stepframe 2").rfind("ok", 0) == 0);
-    f = numbers(raw.cmd("frame"));
+    f = numbers(raw.cmd("frame full"));
     REQUIRE(f.size() == 8);
     CHECK_EQ(f[2], 14);
     CHECK(f[3] > 0);
     CHECK_EQ(f[0], f[4] + 2 * f[2]);
     CHECK_EQ(f[1], f[5] + 2 * f[3]);
     CHECK(f[4] == f[6] && f[5] == f[7]);
+    // With borders on, the short form still hands old scripts the game alone.
+    CHECK(shortForm(raw.cmd("frame"), sw, sh));
+    CHECK(sw == f[4] && sh == f[5]);
+    CHECK_STR(raw.cmd("frame wide"), "err usage: frame [full]");
 }

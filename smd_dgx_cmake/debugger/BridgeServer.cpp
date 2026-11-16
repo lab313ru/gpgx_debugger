@@ -947,25 +947,36 @@ std::string BridgeServer::handle(const std::string& line, Client& client)
     }
 
     if (cmd == "frame") {
-        // The picture the screen shows, as raw RGB565, base64. The Python
-        // side turns it into a PNG so this stays dependency-free. Borders,
-        // the NTSC filter and double-field interlace change w and h; the
-        // pixels are stored as drawn, not stretched to the TV shape.
-        //   ok <w> <h> <ax> <ay> <aw> <ah> <vw> <vh> <base64>
-        // The game's display, vw x vh VDP pixels, fills the aw x ah area at
-        // (ax, ay): VDP pixel (x, y) lands at (ax + x*aw/vw, ay + y*ah/vh).
-        const VdpState v = be->getVdpState();
-        (void)v;
+        // Raw RGB565, base64; the Python side turns it into a PNG so this
+        // stays dependency-free. Two forms:
+        //   frame       ok <w> <h> <base64>   the game's display area only
+        //   frame full  ok <w> <h> <ax> <ay> <aw> <ah> <vw> <vh> <base64>
+        // Scripts in several projects split the short form on its first two
+        // spaces, so it keeps that shape whatever the Borders option says.
+        // The full form is the picture the screen shows, borders included;
+        // the game's vw x vh VDP pixels fill its aw x ah area at (ax, ay):
+        // VDP pixel (x, y) lands at (ax + x*aw/vw, ay + y*ah/vh).
+        const std::string form = arg();
+        if (!form.empty() && form != "full") return "err usage: frame [full]";
         coreopt::Picture pic;
         std::vector<uint8_t> rgb;
         if (!host_->invoke([&] { pic = host_->copyPicture(rgb); }))
             return "err emulator not running";
         if (rgb.empty()) return "err no frame";
         std::ostringstream o;
-        o << "ok " << pic.width << " " << pic.height << " "
-          << pic.areaX << " " << pic.areaY << " " << pic.areaW << " " << pic.areaH << " "
-          << pic.displayW << " " << pic.displayH << " "
-          << base64(rgb.data(), rgb.size());
+        if (form == "full") {
+            o << "ok " << pic.width << " " << pic.height << " "
+              << pic.areaX << " " << pic.areaY << " " << pic.areaW << " " << pic.areaH << " "
+              << pic.displayW << " " << pic.displayH << " "
+              << base64(rgb.data(), rgb.size());
+            return o.str();
+        }
+        std::vector<uint8_t> area(static_cast<size_t>(pic.areaW) * pic.areaH * 2);
+        for (int y = 0; y < pic.areaH; ++y)
+            std::memcpy(area.data() + static_cast<size_t>(y) * pic.areaW * 2,
+                        rgb.data() + (static_cast<size_t>(pic.areaY + y) * pic.width + pic.areaX) * 2,
+                        static_cast<size_t>(pic.areaW) * 2);
+        o << "ok " << pic.areaW << " " << pic.areaH << " " << base64(area.data(), area.size());
         return o.str();
     }
 
