@@ -391,6 +391,47 @@ TEST(listing_reads_work_ram_and_its_mirrors)
     CHECK_EQ(spy.busReads, 0);
 }
 
+// Centre on the immediate of "move.l #$12345678,d0" after a nop sled: every
+// stream runs into the move and steps over the centre, so none lands. The
+// nops still lead up to it, the move's opcode word is a dc.w line, and
+// scrolling up from the first line (which re-centres on it) always moves.
+TEST(listing_lines_lead_to_a_centre_no_stream_lands_on)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+
+    std::vector<uint8_t> code;
+    for (int i = 0; i < 0x40; ++i) { code.push_back(0x4E); code.push_back(0x71); }
+    const uint32_t move = 0xFF8000;
+    for (uint8_t b : { 0x20, 0x3C, 0x12, 0x34, 0x56, 0x78 }) code.push_back(b);
+    REQUIRE(e.backend()->writeRegion(1, 0x8000 - 0x80, code.data(), uint32_t(code.size())));
+
+    ReadSpy spy(e.backend());
+    const auto v = listAround(spy, move + 2, 4, 1);
+    REQUIRE(v.size() == 6u);
+    CHECK(contiguous(v));
+    REQUIRE(indexOf(v, move + 2) == 4u);
+    for (int i = 0; i < 3; ++i) {
+        CHECK_EQ(v[i].addr, move - 6 + 2 * uint32_t(i));
+        CHECK_STR(v[i].text, "nop");
+    }
+    CHECK_EQ(v[3].addr, move);
+    CHECK_EQ(v[3].len, 2u);
+    CHECK_STR(v[3].text, "dc.w $203c");
+    CHECK_STR(v[3].hex, "203C");
+    CHECK(v[3].readable);
+
+    uint32_t centre = move + 2;
+    for (int pass = 0; pass < 8; ++pass) {
+        const auto up = listAround(spy, centre, 3, 3);
+        REQUIRE(!up.empty());
+        REQUIRE(up.front().addr < centre);
+        centre = up.front().addr;
+    }
+    CHECK_EQ(spy.busReads, 0);
+}
+
 // A target comes from the operand that names it, with the CPU's own
 // arithmetic: .w sign-extends, and everything is 24 bits.
 TEST(listing_flow_targets_from_disasm_text)

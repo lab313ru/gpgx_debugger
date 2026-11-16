@@ -49,8 +49,11 @@ struct ListingLine {
 // Instructions have no fixed length, so the lines before centre are found by
 // resync: from every even start between centre-2 and centre-0x40 (further
 // back when `before` asks for more lines than that can hold), decode forward,
-// and keep the start whose stream lands exactly on centre with the most lines;
-// when none lands, there are no lines before it. Each instruction is decoded
+// and keep the start whose stream lands exactly on centre with the most lines.
+// When none lands (centre on an operand, or in data), the stream with the most
+// lines is kept up to the line that would step over centre, and each word
+// left before centre is a one-word "dc.w $xxxx" line (kNotReadable when it is
+// not readable), so a window scrolling up always moves. Each instruction is decoded
 // from bytes read once for the whole listing, with room after the last line,
 // so none is cut short by the fetch.
 //
