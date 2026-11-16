@@ -95,7 +95,9 @@ Z80Regs GpgxBackend::getZ80Regs()
     r.af2 = Z80.af2.w.l; r.bc2 = Z80.bc2.w.l; r.de2 = Z80.de2.w.l; r.hl2 = Z80.hl2.w.l;
     r.ix  = Z80.ix.w.l;  r.iy  = Z80.iy.w.l;
     r.sp  = Z80.sp.w.l;  r.pc  = Z80.pc.w.l;
-    r.i   = Z80.i; r.r = Z80.r; r.im = Z80.im;
+    // The core counts R in Z80.r through all 8 bits and keeps bit 7, which
+    // the CPU never changes on its own, apart in Z80.r2 (z80.h).
+    r.i   = Z80.i; r.r = uint8_t((Z80.r & 0x7F) | (Z80.r2 & 0x80)); r.im = Z80.im;
     r.iff1 = Z80.iff1; r.iff2 = Z80.iff2; r.halt = Z80.halt;
     r.zstate = ::zstate;
     r.bank = ::zbank;
@@ -107,7 +109,7 @@ void GpgxBackend::setZ80Regs(const Z80Regs& r)
     Z80.af.w.l  = r.af;  Z80.bc.w.l  = r.bc;  Z80.de.w.l  = r.de;  Z80.hl.w.l  = r.hl;
     Z80.af2.w.l = r.af2; Z80.bc2.w.l = r.bc2; Z80.de2.w.l = r.de2; Z80.hl2.w.l = r.hl2;
     Z80.ix.w.l  = r.ix;  Z80.iy.w.l  = r.iy;  Z80.sp.w.l  = r.sp;  Z80.pc.w.l  = r.pc;
-    Z80.i = r.i; Z80.r = r.r; Z80.im = r.im;
+    Z80.i = r.i; Z80.r = r.r; Z80.r2 = r.r & 0x80; Z80.im = r.im;
     Z80.iff1 = r.iff1; Z80.iff2 = r.iff2; Z80.halt = r.halt;
 }
 
@@ -156,12 +158,25 @@ SoundState GpgxBackend::getSoundState()
 // map->base regions (ROM/RAM) are stored word-swapped on LSB_FIRST hosts;
 // XOR 1 converts to logical Genesis byte order. read8/write8 handlers take
 // real bus addresses and need no correction.
+namespace {
+// Pages $80-$DF (I/O, VDP, and the ones that lock the machine up) carry
+// work_ram as their base only for VDP DMA (genesis.c); the 68000 itself
+// always goes through their handlers. That base is not memory at the address.
+bool baseIsForDmaOnly(const cpu_memory_map* map, uint32_t a)
+{
+    return map->base == work_ram && (a >> 16) < 0xE0;
+}
+} // namespace
+
 std::vector<uint8_t> GpgxBackend::readMemory(uint32_t addr, uint32_t size)
 {
     std::vector<uint8_t> buf(size, 0xFF);
     for (uint32_t i = 0; i < size; ++i) {
         uint32_t a = (addr + i) & 0xFFFFFF;
         const cpu_memory_map* map = &m68k.memory_map[(a >> 16) & 0xFF];
+        // A read on those pages is an access (the VDP's ports, the lock-up),
+        // so they read as $FF.
+        if (baseIsForDmaOnly(map, a)) continue;
         if (map->base)  buf[i] = map->base[(a & 0xFFFF) ^ 1];
         else if (map->read8) buf[i] = static_cast<uint8_t>(map->read8(a));
     }
@@ -173,6 +188,11 @@ bool GpgxBackend::writeMemory(uint32_t addr, const uint8_t* data, uint32_t size)
     for (uint32_t i = 0; i < size; ++i) {
         uint32_t a = (addr + i) & 0xFFFFFF;
         cpu_memory_map* map = &m68k.memory_map[(a >> 16) & 0xFF];
+        // Not into work RAM, and not through the handler either: a write to
+        // $A11100 or $A11200 runs the Z80 up to the 68000's cycle (genesis.c,
+        // gen_zbusreq_w), which from a debugger call would re-enter the core
+        // and its hooks; other pages lock the machine up.
+        if (baseIsForDmaOnly(map, a)) return false;
         if (map->base) map->base[(a & 0xFFFF) ^ 1] = data[i];
         else if (map->write8) map->write8(a, data[i]);
         else return false;
@@ -427,8 +447,17 @@ void GpgxBackend::pause()   { if (!paused_.load()) stepInto_.store(true); }
 void GpgxBackend::resume()  { paused_.store(false); if (resumeCb_) resumeCb_(); }
 void GpgxBackend::stepInto(Cpu cpu)
 {
-    if (cpu == Cpu::Z80) stepIntoZ80_.store(true);
-    else                 stepInto_.store(true);
+    if (cpu == Cpu::Z80) {
+        // A Z80 step can run for long: while the 68000 holds the Z80 in reset
+        // or has its bus, the machine runs on until the Z80 gets to move. So
+        // it says it resumed, as a step over a call does. The event goes out
+        // before the thread is released, so it cannot follow the stop.
+        stepIntoZ80_.store(true);
+        if (resumeCb_) resumeCb_();
+        paused_.store(false);
+        return;
+    }
+    stepInto_.store(true);
     paused_.store(false);
 }
 

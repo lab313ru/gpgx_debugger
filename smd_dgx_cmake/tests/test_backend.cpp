@@ -566,6 +566,87 @@ TEST(z80_steps_one_instruction)
     CHECK_EQ(e.backend()->getZ80Regs().af & 0x40, 0x40u); // Z set by xor a
 }
 
+// R's bit 7 is kept apart from the 7 bits that count (z80.h): what is
+// written comes back, and the count wraps within the low 7 bits.
+TEST(z80_r_keeps_bit_7_across_steps)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+    REQUIRE(armZ80(e));
+
+    for (uint8_t r : { uint8_t(0xFF), uint8_t(0x7F), uint8_t(0x80) }) {
+        Z80Regs z = e.backend()->getZ80Regs();
+        z.r = r;
+        e.backend()->setZ80Regs(z);
+        CHECK_EQ(e.backend()->getZ80Regs().r, uint32_t(r));
+    }
+
+    // From $FF one opcode fetch wraps the low 7 bits to 0 and leaves bit 7.
+    Z80Regs z = e.backend()->getZ80Regs();
+    z.r = 0xFF;
+    e.backend()->setZ80Regs(z);
+    REQUIRE(e.stepAndWait(Cpu::Z80));                     // ld sp,$1FF0
+    CHECK_EQ(e.backend()->getZ80Regs().r, 0x80u);
+}
+
+// While the 68000 holds the Z80 in reset, a Z80 step cannot finish, and the
+// machine runs on; the backend must say it resumed, or the window would still
+// show it paused.
+TEST(z80_step_while_held_in_reset_reports_resumed)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+
+    constexpr uint32_t at = 0xFF2000;
+    const uint8_t code[] = {
+        0x33, 0xFC, 0x00, 0x00, 0x00, 0xA1, 0x12, 0x00,   // move.w #$0000,$A11200  /RESET asserted
+        0x60, 0xFE,                                       // bra.s *
+    };
+    REQUIRE(e.backend()->writeRegion(1, at & 0xFFFF, code, sizeof code));
+    e.parkM68kAt(at);
+    REQUIRE(e.stepAndWait(Cpu::M68K));
+    REQUIRE(e.stepAndWait(Cpu::M68K));
+    REQUIRE(e.backend()->getM68kRegs().pc == at + 8);
+    REQUIRE((e.backend()->getZ80Regs().zstate & 1) == 0);
+
+    const uint64_t r = e.resumeSeq();
+    const uint64_t p = e.pauseSeq();
+    e.backend()->stepInto(Cpu::Z80);
+    CHECK(e.waitResume(r, 3000));
+    CHECK(!e.waitPause(p, 200));                          // still held: no stop
+    CHECK(!e.backend()->isPaused());
+    REQUIRE(e.pauseAndWait());
+}
+
+// $A11200 and the VDP's ports carry work RAM as their base only for DMA: a
+// write there must not land in work RAM at the same offset, and a read there
+// shows none of it.
+TEST(memory_io_and_vdp_pages_are_not_work_ram)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+
+    const uint8_t marker[2] = { 0x5A, 0xA5 };
+    REQUIRE(e.backend()->writeMemory(0xFF1200, marker, 2));
+    const uint8_t zero[2] = { 0, 0 };
+    CHECK(!e.backend()->writeMemory(0xA11200, zero, 2));
+    CHECK(!e.backend()->writeMemory(0xC00004, zero, 2));
+    const auto ram = e.backend()->readMemory(0xFF1200, 2);
+    REQUIRE(ram.size() == 2u);
+    CHECK_EQ(ram[0], 0x5Au);
+    CHECK_EQ(ram[1], 0xA5u);
+
+    for (uint32_t a : { 0xA11200u, 0xC01200u, 0x801200u }) {
+        const auto io = e.backend()->readMemory(a, 2);
+        REQUIRE(io.size() == 2u);
+        CHECK_EQ(io[0], 0xFFu);
+        CHECK_EQ(io[1], 0xFFu);
+    }
+}
+
 TEST(z80_step_out_returns_to_the_caller)
 {
     t::Emu e;
