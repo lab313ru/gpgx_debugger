@@ -97,6 +97,7 @@ Z80Regs GpgxBackend::getZ80Regs()
     r.sp  = Z80.sp.w.l;  r.pc  = Z80.pc.w.l;
     r.i   = Z80.i; r.r = Z80.r; r.im = Z80.im;
     r.iff1 = Z80.iff1; r.iff2 = Z80.iff2; r.halt = Z80.halt;
+    r.zstate = ::zstate;
     r.bank = ::zbank;
     return r;
 }

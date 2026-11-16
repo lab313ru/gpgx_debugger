@@ -302,6 +302,7 @@ void RemoteBackend::setM68kRegs(const M68kRegs& r)
 Z80Regs RemoteBackend::getZ80Regs()
 {
     Z80Regs r{};
+    r.zstate = kZ80StateUnknown;   // regsz80 does not carry it
     for (const auto& kv : kvPairs(call("regsz80"))) {
         const std::string& k = kv.first;
         const uint32_t v = hexU32(kv.second);
