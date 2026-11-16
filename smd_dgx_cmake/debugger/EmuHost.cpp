@@ -116,9 +116,9 @@ void EmuHost::run(std::string /*romPath*/)
             backend_.pause();
 
         if (frameSink_) {
-            const t_bitmap& bm = ::bitmap;
-            frameSink_(bm.data, bm.width, bm.height, bm.pitch,
-                       bm.viewport.x, bm.viewport.y, bm.viewport.w, bm.viewport.h);
+            const coreopt::Picture pic = coreopt::picture(inCore_);
+            frameSink_(::bitmap.data, pic.width, pic.height, ::bitmap.pitch,
+                       useOptions_ ? pic.aspect : 0.0);
         }
 
         if (audioSink_ && snd.enabled && snd.blips[0]) {
@@ -367,20 +367,18 @@ void EmuHost::dispatch(const DebugCommand& cmd)
     }
 }
 
-void EmuHost::copyViewport(std::vector<uint8_t>& out, int& w, int& h) const
+void EmuHost::copyPicture(std::vector<uint8_t>& out, int& w, int& h) const
 {
     const t_bitmap& bm = ::bitmap;
-    w = bm.viewport.w;
-    h = bm.viewport.h;
+    const coreopt::Picture pic = coreopt::picture(inCore_);
+    w = pic.width;
+    h = pic.height;
     out.clear();
     if (!bm.data || w <= 0 || h <= 0) { w = h = 0; return; }
 
     out.resize(static_cast<size_t>(w) * h * 2);
-    for (int y = 0; y < h; ++y) {
-        const uint8_t* src = bm.data + (size_t)(bm.viewport.y + y) * bm.pitch
-                                     + (size_t)bm.viewport.x * 2;
-        std::memcpy(out.data() + (size_t)y * w * 2, src, (size_t)w * 2);
-    }
+    for (int y = 0; y < h; ++y)
+        std::memcpy(out.data() + (size_t)y * w * 2, bm.data + (size_t)y * bm.pitch, (size_t)w * 2);
 }
 
 int EmuHost::addEventSink(EventSink s)

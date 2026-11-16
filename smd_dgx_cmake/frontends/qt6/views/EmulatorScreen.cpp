@@ -5,6 +5,7 @@
 #include <QKeyEvent>
 #include <QContextMenuEvent>
 #include <QMenu>
+#include <cmath>
 #include <cstring>
 
 EmulatorScreen::EmulatorScreen(QWidget* parent) : QWidget(parent)
@@ -96,21 +97,21 @@ void EmulatorScreen::focusOutEvent(QFocusEvent*)
     if (backend_) backend_->setPad(0, 0);
 }
 
-void EmulatorScreen::pushFrame(const uint8_t* data, int srcW, int srcH, int pitch,
-                                int vpX, int vpY, int vpW, int vpH)
+void EmulatorScreen::pushFrame(const uint8_t* data, int w, int h, int pitch, double aspect)
 {
+    if (w <= 0 || h <= 0) return;
     QMutexLocker lk(&mutex_);
-    if (back_.width() != srcW || back_.height() != srcH)
-        back_ = QImage(srcW, srcH, QImage::Format_RGB16);
-    for (int y = 0; y < srcH; ++y)
-        std::memcpy(back_.scanLine(y), data + y*pitch, (size_t)srcW*2);
-    vpX_=vpX; vpY_=vpY; vpW_=vpW; vpH_=vpH; newFrame_=true;
+    if (back_.width() != w || back_.height() != h)
+        back_ = QImage(w, h, QImage::Format_RGB16);
+    for (int y = 0; y < h; ++y)
+        std::memcpy(back_.scanLine(y), data + y*pitch, (size_t)w*2);
+    aspect_ = aspect; newFrame_ = true;
     QMetaObject::invokeMethod(this, "update", Qt::QueuedConnection);
 }
 
 void EmulatorScreen::paintEvent(QPaintEvent*)
 {
-    { QMutexLocker lk(&mutex_); if (newFrame_) { front_ = back_.copy(vpX_,vpY_,vpW_,vpH_); newFrame_=false; } }
+    { QMutexLocker lk(&mutex_); if (newFrame_) { front_ = back_.copy(); frontAspect_ = aspect_; newFrame_ = false; } }
     if (front_.isNull()) return;
 
     QPainter p(this);
@@ -121,9 +122,12 @@ void EmulatorScreen::paintEvent(QPaintEvent*)
     p.drawImage(dst, front_);
 }
 
-// Where the frame lands inside the widget.
-//   integer scale : largest whole multiple that fits, centred — one emulated
-//                   pixel becomes an exact NxN block, nothing is resampled.
+// Where the frame lands inside the widget. The aspect it keeps is the one the
+// frame came with — the TV's — or square pixels when it came with none.
+//   integer scale : the largest picture, centred, in which every emulated line
+//                   is N rows and every pixel M columns, both whole numbers, so
+//                   nothing is resampled. M is the one that comes closest to
+//                   the aspect; it is N for square pixels.
 //                   Falls back to fitting when the widget is smaller than one
 //                   full frame, otherwise there would be nothing to show.
 //   fit           : fill the widget, optionally preserving aspect.
@@ -131,21 +135,34 @@ QRectF EmulatorScreen::targetRect() const
 {
     const double sw = front_.width(), sh = front_.height();
     if (sw <= 0 || sh <= 0) return QRectF(rect());
+    const double aspect = frontAspect_ > 0 ? frontAspect_ : sw / sh;
+
+    auto centred = [this](double w, double h) {
+        return QRectF((width() - w) / 2.0, (height() - h) / 2.0, w, h);
+    };
 
     if (integerScale_) {
-        const int n = qMin(int(width() / sw), int(height() / sh));
-        if (n >= 1) {
-            const double w = sw * n, h = sh * n;
-            return QRectF((width() - w) / 2.0, (height() - h) / 2.0, w, h);
+        // A pixel's width over its height: about 0.9 for a plain H40 frame,
+        // 0.46 for the NTSC filter's doubled lines, 1.8 for a double field.
+        const double pixelAspect = aspect * sh / sw;
+        for (int n = int(height() / sh); n >= 1; --n) {
+            const int m = qMax(1, qRound(n * pixelAspect));
+            // Square pixels, 9% off the TV shape in H40 and 13% in H32, have
+            // to pass; a 1x NTSC-filtered frame, more than twice too wide,
+            // must not.
+            if (std::abs(m / (n * pixelAspect) - 1.0) > 0.15) continue;
+            if (sw * m <= width()) return centred(sw * m, sh * n);
         }
         // too small for 1x — fall through to a fitted, aspect-correct image
     }
 
     if (keepAspect_ || integerScale_) {
-        const double sa = sw / sh, da = double(width()) / double(height());
-        if (da > sa) { const double h = height(), w = h * sa; return {(width() - w) / 2.0, 0.0, w, h}; }
-        const double w = width(), h = w / sa;
-        return {0.0, (height() - h) / 2.0, w, h};
+        if (double(width()) / double(height()) > aspect) {
+            const double h = height();
+            return centred(h * aspect, h);
+        }
+        const double w = width();
+        return centred(w, w / aspect);
     }
     return QRectF(rect());
 }

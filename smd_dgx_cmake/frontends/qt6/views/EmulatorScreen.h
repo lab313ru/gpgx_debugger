@@ -25,8 +25,10 @@ public:
     void setBackend(IDebugBackend* b) { backend_ = b; }
     void refresh() {}                       // frames arrive via pushFrame()
 
-    void pushFrame(const uint8_t* data, int srcW, int srcH, int pitch,
-                   int vpX, int vpY, int vpW, int vpH);
+    // A frame as EmuHost's FrameSink hands it over: w x h RGB565 pixels at
+    // `data`, drawn at `aspect` (width / height), or with square pixels when
+    // that is 0. Called on the emulation thread.
+    void pushFrame(const uint8_t* data, int w, int h, int pitch, double aspect);
 
     // Presentation. Defaults suit a debugger: unfiltered pixels at an integer
     // scale, so what you see maps 1:1 onto VRAM. Right-click to change.
@@ -55,5 +57,5 @@ private:
     bool    keepAspect_   = true;
     bool    smooth_       = false;   // nearest-neighbour by default
     bool    integerScale_ = true;    // pixel perfect by default
-    int     vpX_=0, vpY_=0, vpW_=320, vpH_=224;
+    double  aspect_ = 0, frontAspect_ = 0;   // of back_ and front_; 0 = square pixels
 };

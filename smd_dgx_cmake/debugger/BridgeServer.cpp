@@ -935,13 +935,15 @@ std::string BridgeServer::handle(const std::string& line, Client& client)
     }
 
     if (cmd == "frame") {
-        // Visible viewport as raw RGB565, base64. The Python side turns it
-        // into a PNG so this stays dependency-free.
+        // The picture the screen shows, as raw RGB565, base64. The Python
+        // side turns it into a PNG so this stays dependency-free. Borders,
+        // the NTSC filter and double-field interlace change w and h; the
+        // pixels are stored as drawn, not stretched to the TV shape.
         const VdpState v = be->getVdpState();
         (void)v;
         int w = 0, h = 0;
         std::vector<uint8_t> rgb;
-        if (!host_->invoke([&] { host_->copyViewport(rgb, w, h); }))
+        if (!host_->invoke([&] { host_->copyPicture(rgb, w, h); }))
             return "err emulator not running";
         if (rgb.empty()) return "err no frame";
         std::ostringstream o;

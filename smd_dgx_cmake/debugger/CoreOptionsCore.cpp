@@ -4,6 +4,7 @@
 
 #include "CoreOptions.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -267,6 +268,40 @@ void reinitMachine()
 void softReset()
 {
     gen_reset(0);
+}
+
+Picture picture(const CoreOptions& o)
+{
+    // remap_line draws every line from x = 0, border included, and puts the
+    // top border's lines first.
+    const int w = bitmap.viewport.w + 2 * bitmap.viewport.x;
+    const int h = bitmap.viewport.h + 2 * bitmap.viewport.y;
+    Picture p;
+    if (w <= 0 || h <= 0) return p;
+
+    // calculate_display_aspect_ratio, from the picture before the filter and
+    // the second field change its size. The sample rates cut a line into
+    // square pixels of a 480- or 576-line frame, and one console line is a
+    // field line, two frame lines tall.
+    if (o.aspect == AspectAuto && (system_hw == SYSTEM_GG || system_hw == SYSTEM_GGMS)
+        && config.overscan == 0 && config.gg_extra == 0) {
+        p.aspect = (6.0 / 5.0) * w / h;
+    } else {
+        constexpr double kNtscRate = 135000000.0 / 11.0;
+        constexpr double kPalRate  = 14750000.0;
+        const double dotRate = system_clock / (bitmap.viewport.w == 320 ? 8.0 : 10.0);
+        const double rate = o.aspect == AspectNtscPar ? kNtscRate
+                          : o.aspect == AspectPalPar  ? kPalRate
+                          : vdp_pal ? kPalRate : kNtscRate;
+        p.aspect = (rate / dotRate) * (double(w) / (h * 2.0));
+    }
+
+    // The same choice of filter remap_line makes for the line.
+    p.width  = !config.ntsc ? w : (reg[12] & 1) ? MD_NTSC_OUT_WIDTH(w) : SMS_NTSC_OUT_WIDTH(w);
+    p.height = (config.render && interlaced) ? h * 2 : h;
+    p.width  = std::min(p.width, (int)bitmap.width);
+    p.height = std::min(p.height, (int)bitmap.height);
+    return p;
 }
 
 } // namespace coreopt

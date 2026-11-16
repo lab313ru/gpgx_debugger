@@ -156,4 +156,15 @@ void reinitMachine();
 // The console's reset button.
 void softReset();
 
+// The picture the core has drawn, as libretro hands it to its front end
+// (update_viewport): it starts at the top left of bitmap.data and takes in the
+// borders when they are on, the NTSC filter's wider lines and both fields of a
+// double-field interlaced frame. The active area alone is bitmap.viewport.
+struct Picture {
+    int    width  = 0;
+    int    height = 0;
+    double aspect = 0;       // width / height on a TV, per o.aspect
+};
+Picture picture(const CoreOptions& o);
+
 } // namespace coreopt

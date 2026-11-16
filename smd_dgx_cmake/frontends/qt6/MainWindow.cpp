@@ -223,9 +223,8 @@ void MainWindow::openRomFile(const QString& path)
     if (!audio_->isOpen())
         statusBar()->showMessage(QStringLiteral("No audio device — running silently"), 8000);
 
-    emuHost_->setFrameSink([this](const uint8_t* d, int w, int h, int pitch,
-                                  int vx, int vy, int vw, int vh) {
-        screen_->pushFrame(d, w, h, pitch, vx, vy, vw, vh);   // takes its own lock
+    emuHost_->setFrameSink([this](const uint8_t* d, int w, int h, int pitch, double aspect) {
+        screen_->pushFrame(d, w, h, pitch, aspect);   // takes its own lock
     });
     emuHost_->setAudioSink([this](const int16_t* stereo, int frames) {
         audio_->write(stereo, frames);

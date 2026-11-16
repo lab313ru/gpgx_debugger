@@ -9,8 +9,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <functional>
+#include <mutex>
 #include <thread>
+#include <vector>
 
 extern "C" {
 #include <shared.h>      // config, vdp_pal, region_code, io_reg, m68k, bitmap
@@ -388,6 +391,156 @@ TEST(ntsc_filter_renders_frames)
     paintSentinel();
     REQUIRE(runFrames(e, 2));
     CHECK(pixelPastPicture() != kSentinel);
+}
+
+// ---------------------------------------------------------------------------
+// The picture handed to the screen and the bridge is what the core draws:
+// borders, the NTSC filter's wider lines, both fields of a double-field frame.
+// Painting the whole framebuffer first shows the paint surviving exactly
+// outside it. Its aspect is libretro's for the same picture.
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr uint32_t kModeProg = 0xFF8000;
+
+// Mode 5 with the display on, then the given VDP register 12, from 68000 code
+// so the VDP sees real writes; then frames enough for the change to settle.
+bool setVdpMode(t::Emu& e, uint8_t reg12)
+{
+    const uint8_t prog[] = {
+        0x33, 0xFC, 0x81, 0x44, 0x00, 0xC0, 0x00, 0x04,   // move.w #$8144,$C00004
+        0x33, 0xFC, 0x8C, reg12, 0x00, 0xC0, 0x00, 0x04,  // move.w #$8Cxx,$C00004
+        0x60, 0xFE,                                       // bra.s *
+    };
+    if (!e.backend()->writeMemory(kModeProg, prog, sizeof prog)) return false;
+    e.parkM68kAt(kModeProg);
+    return runFrames(e, 3);
+}
+
+uint16_t& pixelAt(int x, int y)
+{
+    return reinterpret_cast<uint16_t*>(bitmap.data + (size_t)y * bitmap.pitch)[x];
+}
+
+// Every line of a w x h picture drawn edge to edge, and nothing past it.
+bool drawnAreaIs(t::Emu& e, int w, int h)
+{
+    for (int y = 0; y < bitmap.height; ++y)
+        for (int x = 0; x < bitmap.width; ++x)
+            pixelAt(x, y) = kSentinel;
+    if (!runFrames(e, 2)) return false;      // two: one field each
+    for (int y = 0; y < h; ++y)
+        if (pixelAt(0, y) == kSentinel || pixelAt(w - 1, y) == kSentinel) return false;
+    for (int y = 0; y < h && w < bitmap.width; ++y)
+        if (pixelAt(w, y) != kSentinel) return false;
+    return h >= bitmap.height || pixelAt(0, h) == kSentinel;
+}
+
+struct Shown { int w = 0, h = 0; double aspect = 0; };
+
+Shown copied(t::Emu& e)
+{
+    Shown s;
+    std::vector<uint8_t> rgb;
+    if (!e.host()->invoke([&] { e.host()->copyPicture(rgb, s.w, s.h); })) return {};
+    if (rgb.size() != size_t(s.w) * s.h * 2) return {};
+    return s;
+}
+
+bool approx(double a, double b) { return std::abs(a - b) < 1e-3; }
+
+} // namespace
+
+TEST(picture_takes_in_borders_ntsc_width_and_double_field)
+{
+    std::mutex mx;
+    Shown sunk;
+    t::Emu e;
+    e.host()->setFrameSink([&](const uint8_t*, int w, int h, int, double aspect) {
+        std::lock_guard<std::mutex> lk(mx);
+        sunk = { w, h, aspect };
+    });
+    auto lastSunk = [&] { std::lock_guard<std::mutex> lk(mx); return sunk; };
+
+    CoreOptions o;
+    e.host()->setCoreOptions(o);
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+    REQUIRE(setVdpMode(e, 0x81));             // H40
+
+    Shown s = copied(e);
+    CHECK_EQ(s.w, 320);
+    CHECK_EQ(s.h, 224);
+    CHECK(drawnAreaIs(e, 320, 224));
+    // libretro's 1.306: the 135/11 MHz sample rate over the H40 dot clock
+    // (master / 8), times 320 over 2 x 224.
+    const double ntsc = (135000000.0 / 11.0) / (53693175.0 / 8.0) * 320.0 / 448.0;
+    CHECK_EQ(lastSunk().w, 320);
+    CHECK(approx(lastSunk().aspect, ntsc));
+
+    o.overscan = coreopt::OverscanFull;
+    e.host()->setCoreOptions(o);
+    REQUIRE(runFrames(e, 2));
+    s = copied(e);
+    CHECK_EQ(s.w, 320 + 2 * 14);
+    CHECK_EQ(s.h, 224 + 2 * 8);
+    CHECK(drawnAreaIs(e, 348, 240));
+    CHECK_EQ(lastSunk().w, 348);
+    CHECK_EQ(lastSunk().h, 240);
+    CHECK(approx(lastSunk().aspect, ntsc * (348.0 / 240.0) / (320.0 / 224.0)));
+
+    // The filter widens the lines, not the picture's shape.
+    o.ntscFilter = coreopt::NtscRgb;
+    e.host()->setCoreOptions(o);
+    REQUIRE(runFrames(e, 2));
+    s = copied(e);
+    CHECK_EQ(s.w, (348 - 3) / 4 * 8 + 8);     // MD_NTSC_OUT_WIDTH
+    CHECK_EQ(s.h, 240);
+    CHECK(drawnAreaIs(e, s.w, 240));
+    CHECK(approx(lastSunk().aspect, ntsc * (348.0 / 240.0) / (320.0 / 224.0)));
+
+    // PAR forced either way; auto is the NTSC one on an NTSC console.
+    o.ntscFilter = coreopt::NtscOff;
+    o.overscan = coreopt::OverscanOff;
+    o.aspect = coreopt::AspectPalPar;
+    e.host()->setCoreOptions(o);
+    REQUIRE(runFrames(e, 2));
+    CHECK(approx(lastSunk().aspect, ntsc * 14750000.0 / (135000000.0 / 11.0)));
+    o.aspect = coreopt::AspectNtscPar;
+    e.host()->setCoreOptions(o);
+    REQUIRE(runFrames(e, 2));
+    CHECK(approx(lastSunk().aspect, ntsc));
+
+    // Interlace mode 2: one field per frame unless both are asked for.
+    REQUIRE(setVdpMode(e, 0x87));
+    s = copied(e);
+    CHECK_EQ(s.w, 320);
+    CHECK_EQ(s.h, 224);
+    o.doubleField = 1;
+    e.host()->setCoreOptions(o);
+    REQUIRE(runFrames(e, 2));
+    s = copied(e);
+    CHECK_EQ(s.w, 320);
+    CHECK_EQ(s.h, 448);
+    CHECK(drawnAreaIs(e, 320, 448));
+    CHECK(approx(lastSunk().aspect, ntsc));
+}
+
+// Without options — the IDA plugin — the screen keeps square pixels.
+TEST(picture_without_options_has_no_aspect)
+{
+    std::mutex mx;
+    double aspect = -1;
+    t::Emu e;
+    e.host()->setFrameSink([&](const uint8_t*, int, int, int, double a) {
+        std::lock_guard<std::mutex> lk(mx);
+        aspect = a;
+    });
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+    REQUIRE(runFrames(e, 2));
+    std::lock_guard<std::mutex> lk(mx);
+    CHECK_EQ(aspect, 0.0);
 }
 
 // ---------------------------------------------------------------------------

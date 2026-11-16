@@ -28,12 +28,15 @@
 // the emulator core is only ever touched from one thread.
 class EmuHost {
 public:
-    // Optional sinks. FrameSink receives the rendered framebuffer each frame
-    // (RGB565, gpgx t_bitmap geometry) plus the active viewport rect — the
-    // visible area varies with H32/H40 and border settings. Omit for a truly
-    // headless run.
+    // Optional sinks. FrameSink receives each finished frame as the picture to
+    // show (coreopt::Picture): width x height RGB565 pixels from the top left
+    // of `data`, rows `pitch` bytes apart. Its size follows H32/H40, the
+    // borders, the NTSC filter and double-field interlace, and its pixels are
+    // square only by chance, so `aspect` is the width / height to show it at.
+    // A host that sets no core options, the IDA plugin, gets 0 there: show
+    // the pixels square. Omit the sink for a truly headless run.
     using FrameSink = std::function<void(const uint8_t* data, int width, int height, int pitch,
-                                         int vpX, int vpY, int vpW, int vpH)>;
+                                         double aspect)>;
     // Receives one frame's worth of 16-bit stereo samples. Omit for silence.
     using AudioSink = std::function<void(const int16_t* stereo, int frames)>;
     using EventSink = std::function<void(const DebugEvent&)>;
@@ -151,10 +154,11 @@ public:
     void setHostMutations(HostMutations m) { hostMut_ = std::move(m); }
     const HostMutations& hostMutations() const { return hostMut_; }
 
-    // Copy the visible viewport as tightly packed RGB565 (w*h*2 bytes). Call
-    // from the emulation thread — i.e. through invoke() — so the framebuffer
-    // is not being redrawn underneath.
-    void copyViewport(std::vector<uint8_t>& out, int& w, int& h) const;
+    // Copy the picture the frame sink is given as tightly packed RGB565
+    // (w*h*2 bytes): borders, the NTSC filter's width and both interlaced
+    // fields included when they are on. Call from the emulation thread — i.e.
+    // through invoke() — so the framebuffer is not being redrawn underneath.
+    void copyPicture(std::vector<uint8_t>& out, int& w, int& h) const;
 
 private:
     void run(std::string romPath);
