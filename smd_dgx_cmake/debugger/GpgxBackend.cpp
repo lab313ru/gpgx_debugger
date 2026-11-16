@@ -517,25 +517,34 @@ bool GpgxBackend::loadRom(const char* path)
     static std::vector<uint8_t> framebuffer(720 * 576 * 4, 0);
     gx::bitmap_data() = framebuffer.data();
 
-    {
-        std::lock_guard<std::mutex> lk(callstackMutex_);
-        callstack_.clear();
-        callstackSlot_.clear();
-        callstackZ80_.clear();
-        callstackSlotZ80_.clear();
-    }
+    onSystemReset();
     abandoned_.store(false);        // a previous shutdown must not mute this run
+
+    // gx::init() has just put config back to defaults, and load_rom reads it.
+    if (beforeLoad_) beforeLoad_();
 
     bool ok = gx::load_rom(path);
     if (ok) {
-        romFile_ = path;
-        const size_t slash = romFile_.find_last_of("/\\");
-        if (slash != std::string::npos) romFile_.erase(0, slash + 1);
-        const size_t dot = romFile_.rfind('.');
-        if (dot != std::string::npos && dot > 0) romFile_.resize(dot);
+        std::string name = path;
+        const size_t slash = name.find_last_of("/\\");
+        if (slash != std::string::npos) name.erase(0, slash + 1);
+        const size_t dot = name.rfind('.');
+        if (dot != std::string::npos && dot > 0) name.resize(dot);
+        // A reload runs on the emulation thread while bridge clients read
+        // sessionInfo(); the same name must not be rewritten under them.
+        if (name != romFile_) romFile_ = std::move(name);
         running_.store(true);
     }
     return ok;
+}
+
+void GpgxBackend::onSystemReset()
+{
+    std::lock_guard<std::mutex> lk(callstackMutex_);
+    callstack_.clear();
+    callstackSlot_.clear();
+    callstackZ80_.clear();
+    callstackSlotZ80_.clear();
 }
 
 // ---------------------------------------------------------------------------

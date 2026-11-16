@@ -1,6 +1,7 @@
 #pragma once
 #include "GpgxBackend.h"
 #include "DebugApi.h"
+#include "CoreOptions.h"
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -66,6 +67,34 @@ public:
     // failed to load (no thread is started in that case).
     bool start(const std::string& romPath);
 
+    // ---- Core options, reset, reload ----
+    //
+    // For the standalone app. A host that never calls setCoreOptions runs on
+    // the core's defaults — the IDA plugin does exactly that.
+    //
+    // Before start(): the options the next start() loads the ROM with. While
+    // running, the change is queued and applied at the top of the run loop,
+    // between two frames — never inside a pause, which sits in the middle of
+    // a frame and of an instruction; a paused emulator applies it after it is
+    // resumed and the frame ends. LIVE options take effect there; RESET ones
+    // at the next reset(true), RELOAD ones at the next reload() or start().
+    //
+    // Returns why part of it cannot work as asked — today only a TMSS boot
+    // ROM that is switched on but missing or invalid — or "" when all is well.
+    std::string setCoreOptions(const coreopt::CoreOptions& o);
+    coreopt::CoreOptions coreOptions() const;     // as last set
+
+    // Queued like setCoreOptions. Hard: a power cycle that keeps cartridge
+    // SRAM and picks up RESET-class options. Soft: the console's reset button.
+    // False when nothing is running.
+    bool reset(bool hard);
+    // Loads the ROM again with the current options, keeping cartridge SRAM.
+    // False when nothing is running or the ROM file cannot be read now.
+    bool reload();
+
+    // Resets and reloads performed so far, to tell that a queued one is done.
+    uint64_t resetCount() const { return resets_.load(); }
+
     // Signal the emulation thread to exit and join it.
     void stop();
 
@@ -129,6 +158,11 @@ public:
 
 private:
     void run(std::string romPath);
+    void applyPending();
+    void beforeLoad();
+    void hardReset();
+    void doReload();
+    void installBootRomFor(const coreopt::CoreOptions& o);
     void drainCommands();
     void drainTasks();
     void emitEvent(const DebugEvent& ev);   // not `emit`: clashes with Qt's macro
@@ -148,7 +182,24 @@ private:
     std::atomic<int>  framesLeft_ { 0 };   // frame-advance countdown
     std::atomic<uint64_t> stops_  { 0 };
     std::atomic<uint64_t> frames_ { 0 };
+    std::atomic<uint64_t> resets_ { 0 };
     HostMutations     hostMut_;
+
+    // Requests for the top of the run loop, applied in the order made.
+    struct Pending {
+        enum class Kind { Options, Reset, Reload } kind;
+        coreopt::CoreOptions opts;   // Options
+        bool hard = false;           // Reset
+    };
+    std::string             romPath_;
+    mutable std::mutex      optMx_;
+    coreopt::CoreOptions    want_;              // as last set       (optMx_)
+    bool                    haveOptions_ = false;                  // (optMx_)
+    std::deque<Pending>     pending_;                              // (optMx_)
+    // Emulation thread only (and start(), before the thread exists):
+    bool                    useOptions_ = false;   // haveOptions_ as of the run
+    coreopt::CoreOptions    requested_;   // the latest Options request applied
+    coreopt::CoreOptions    inCore_;      // what the core is running with
 
     // Work handed to the emulation thread by invoke().
     //

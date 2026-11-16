@@ -58,6 +58,15 @@ public:
     bool loadRom(const char* path) override;
     bool isRunning() const override { return running_.load(); }
 
+    // Runs inside loadRom() after gx::init() has reset the core's config to
+    // defaults and before the ROM is loaded: the one window in which a host's
+    // own settings reach the load and are not wiped by it.
+    void setBeforeLoad(std::function<void()> fn) { beforeLoad_ = std::move(fn); }
+
+    // The console was reset underneath the backend: the call stacks describe
+    // a run that no longer exists.
+    void onSystemReset();
+
     void onCpuHook(int type, int width, uint32_t addr, uint32_t value);
 
     // Identity of the loaded game, for clients that must pick between several
@@ -102,6 +111,7 @@ private:
     PauseCb  pauseCb_;
     ResumeCb resumeCb_;
     std::function<void()> pausePump_;
+    std::function<void()> beforeLoad_;
     SafeExec safeExec_;
 
     std::string       romFile_;            // set before running_ goes true

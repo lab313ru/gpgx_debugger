@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <fstream>
 
 #include <gx/gx.hpp>
 
@@ -11,7 +12,10 @@ extern "C" {
 #include <vdp_ctrl.h>
 }
 
-EmuHost::EmuHost() = default;
+EmuHost::EmuHost()
+{
+    backend_.setBeforeLoad([this] { beforeLoad(); });
+}
 
 EmuHost::~EmuHost()
 {
@@ -22,6 +26,14 @@ bool EmuHost::start(const std::string& romPath)
 {
     stop();
     stopFlag_.store(false);
+
+    {
+        std::lock_guard<std::mutex> lk(optMx_);
+        pending_.clear();             // requests made for the previous run
+        useOptions_ = haveOptions_;
+        requested_ = inCore_ = haveOptions_ ? want_ : coreopt::CoreOptions{};
+    }
+    romPath_ = romPath;
 
     // Load synchronously so the caller learns immediately whether the ROM is
     // valid; the thread only runs frames.
@@ -84,12 +96,14 @@ void EmuHost::run(std::string /*romPath*/)
 {
     namespace chr = std::chrono;   // core/system.h declares a global system_clock
 
-    const double fps = vdp_pal ? 50.0 : 60.0;
-    const auto frameDur = chr::duration_cast<chr::steady_clock::duration>(
-        chr::duration<double>(1.0 / fps));
     auto nextFrame = chr::steady_clock::now();
 
     while (!stopFlag_.load()) {
+        // Resets, reloads and option changes happen here and nowhere else: a
+        // pause stops mid-frame and mid-instruction, where the core cannot be
+        // rebuilt underneath the CPU that is executing.
+        applyPending();
+        if (stopFlag_.load()) break;     // a reload that could not load the ROM
         drainCommands();
 
         system_frame_gen(0);      // one field/frame; blocks in firePause on bp
@@ -117,8 +131,10 @@ void EmuHost::run(std::string /*romPath*/)
         // Run at console speed. Unpaced, the emulator spins a core flat out for
         // no benefit — a debugger host still wants the game in real time. A
         // pause blocks inside system_frame_gen, so re-baseline once we are
-        // behind rather than bursting frames to catch up.
-        nextFrame += frameDur;
+        // behind rather than bursting frames to catch up. The rate is read
+        // every frame: a region or VDP mode change switches 60 Hz and 50 Hz.
+        nextFrame += chr::duration_cast<chr::steady_clock::duration>(
+            chr::duration<double>(1.0 / (vdp_pal ? 50.0 : 60.0)));
         const auto now = chr::steady_clock::now();
         if (nextFrame > now)
             std::this_thread::sleep_until(nextFrame);
@@ -126,6 +142,137 @@ void EmuHost::run(std::string /*romPath*/)
             nextFrame = now;
     }
     gx::shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Core options, reset, reload
+// ---------------------------------------------------------------------------
+
+std::string EmuHost::setCoreOptions(const coreopt::CoreOptions& o)
+{
+    std::string problem;
+    if (o.bootRom) problem = coreopt::findBootRom().problem;
+
+    std::lock_guard<std::mutex> lk(optMx_);
+    want_ = o;
+    haveOptions_ = true;
+    if (running_.load())
+        pending_.push_back({ Pending::Kind::Options, o, false });
+    return problem;
+}
+
+coreopt::CoreOptions EmuHost::coreOptions() const
+{
+    std::lock_guard<std::mutex> lk(optMx_);
+    return want_;
+}
+
+bool EmuHost::reset(bool hard)
+{
+    if (!running_.load()) return false;
+    std::lock_guard<std::mutex> lk(optMx_);
+    pending_.push_back({ Pending::Kind::Reset, {}, hard });
+    return true;
+}
+
+bool EmuHost::reload()
+{
+    if (!running_.load()) return false;
+    if (!std::ifstream(romPath_, std::ios::binary)) return false;
+    std::lock_guard<std::mutex> lk(optMx_);
+    pending_.push_back({ Pending::Kind::Reload, {}, false });
+    return true;
+}
+
+void EmuHost::applyPending()
+{
+    std::deque<Pending> ops;
+    {
+        std::lock_guard<std::mutex> lk(optMx_);
+        if (pending_.empty()) return;
+        ops.swap(pending_);
+        useOptions_ = haveOptions_;
+    }
+    for (const Pending& op : ops) {
+        if (stopFlag_.load()) return;
+        switch (op.kind) {
+        case Pending::Kind::Options: {
+            requested_ = op.opts;
+            const coreopt::CoreOptions next =
+                coreopt::withClass(inCore_, op.opts, coreopt::Apply::Live);
+            const bool reinit = coreopt::applyLive(inCore_, next);
+            inCore_ = next;
+            if (reinit) hardReset();
+            break;
+        }
+        case Pending::Kind::Reset:
+            if (op.hard) {
+                hardReset();
+            } else {
+                coreopt::softReset();
+                backend_.onSystemReset();
+                resets_.fetch_add(1);
+            }
+            break;
+        case Pending::Kind::Reload:
+            doReload();
+            break;
+        }
+    }
+}
+
+// GpgxBackend::loadRom calls this between gx::init() and the ROM load: from
+// start() on the caller's thread, before the emulation thread exists, and from
+// a reload on the emulation thread.
+void EmuHost::beforeLoad()
+{
+    if (!useOptions_) return;
+    coreopt::applyAtLoad(requested_);
+    installBootRomFor(requested_);
+    inCore_ = requested_;
+}
+
+void EmuHost::hardReset()
+{
+    if (useOptions_) {
+        inCore_ = coreopt::withClass(inCore_, requested_, coreopt::Apply::Reset);
+        coreopt::applyResetFields(inCore_);
+        installBootRomFor(inCore_);
+    }
+    coreopt::reinitMachine();
+    backend_.onSystemReset();
+    resets_.fetch_add(1);
+}
+
+void EmuHost::doReload()
+{
+    // Checked again: if the file has gone since the request, the game being
+    // played is worth more than the reload.
+    if (!std::ifstream(romPath_, std::ios::binary)) return;
+
+    // SRAM the game has written exists only in memory until shutdown, and the
+    // load would replace it with whatever was last saved to disk.
+    std::vector<uint8_t> keep(sram.sram, sram.sram + sizeof sram.sram);
+    const bool hadSram = sram.on != 0;
+
+    if (!backend_.loadRom(romPath_.c_str())) {
+        // No cartridge is left whose SRAM gx::shutdown() should write over
+        // the good copy on disk.
+        sram.on = 0;
+        stopFlag_.store(true);
+        return;
+    }
+    // stop() may have abandoned run control while the load re-armed it.
+    if (stopFlag_.load()) backend_.abortRunControl();
+    if (hadSram && sram.on) std::memcpy(sram.sram, keep.data(), keep.size());
+    resets_.fetch_add(1);
+}
+
+void EmuHost::installBootRomFor(const coreopt::CoreOptions& o)
+{
+    if (!o.bootRom) { coreopt::installBootRom(nullptr); return; }
+    const coreopt::BootRom rom = coreopt::findBootRom();
+    coreopt::installBootRom(rom.ok() ? &rom : nullptr);
 }
 
 void EmuHost::drainCommands()
