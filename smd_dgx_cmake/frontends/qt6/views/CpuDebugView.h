@@ -37,6 +37,11 @@ public:
     explicit CpuDebugView(QWidget* parent = nullptr);
     void setBackend(IDebugBackend* b);
 
+    // Whether an emulator is running, from the host: GpgxBackend::isRunning()
+    // stays true after a stop. Off, run control and register edits are
+    // disabled; on again, the listing starts over around the new PC.
+    void setRunning(bool on);
+
     // Registers, run state, breakpoints and the listing, read again. While the
     // emulator runs the listing stays where it is and is rebuilt at most once
     // per kRunningListMs, however often this is called.
@@ -51,7 +56,6 @@ public:
 
 protected:
     bool eventFilter(QObject* obj, QEvent* ev) override;
-    void changeEvent(QEvent* ev) override;
 
 private:
     enum class BpKind { Pc, Ram68k, RamZ80, Vram, Cram, Vsram };
@@ -70,8 +74,9 @@ private:
     int  visibleRows() const;
     void toggleBreakpointAt(int row);
 
-    // registers
-    void showRegisters(const M68kRegs& r, bool paused);
+    // run control and registers
+    void setControls(bool running, bool paused);
+    void showRegisters(const M68kRegs& r);
     void commitRegField(QLineEdit* edit);
     void writeRegisters(const std::function<void(M68kRegs&)>& change);
 
@@ -89,6 +94,7 @@ private:
     static constexpr int kRunningListMs = 100;    // the host's refresh period
 
     IDebugBackend* backend_ = nullptr;
+    bool           running_ = false;
 
     QTabWidget*   cpuTabs_    = nullptr;
     QTableWidget* listing_    = nullptr;

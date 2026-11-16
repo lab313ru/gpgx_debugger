@@ -503,6 +503,13 @@ void RemoteBackend::removeBreakpoint(int id)
     call(o.str());
 }
 
+bool RemoteBackend::setBreakpointEnabled(int id, bool on)
+{
+    std::ostringstream o;
+    o << "bpenable " << std::dec << id << " " << (on ? 1 : 0);
+    return !call(o.str()).empty();        // "ok <id>"; an error comes back empty
+}
+
 void RemoteBackend::clearBreakpoints() { call("bpclear"); }
 
 std::vector<Breakpoint> RemoteBackend::getBreakpoints()

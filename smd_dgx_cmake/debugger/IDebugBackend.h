@@ -62,6 +62,10 @@ public:
     // Breakpoints
     virtual int  addBreakpoint(const Breakpoint&) = 0;
     virtual void removeBreakpoint(int id) = 0;
+    // Turns a breakpoint on or off where it is: the id stays, so a client that
+    // set it (IDA, an MCP agent) can still remove it. False if no breakpoint
+    // has that id.
+    virtual bool setBreakpointEnabled(int id, bool on) = 0;
     virtual void clearBreakpoints() = 0;
     virtual std::vector<Breakpoint> getBreakpoints() = 0;
 

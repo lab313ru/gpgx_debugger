@@ -58,6 +58,7 @@ public:
     void setConditionEvaluator(ConditionEval f) override { be_->setConditionEvaluator(std::move(f)); }
     int  addBreakpoint(const Breakpoint& bp) override { return be_->addBreakpoint(bp); }
     void removeBreakpoint(int id) override { be_->removeBreakpoint(id); }
+    bool setBreakpointEnabled(int id, bool on) override { return be_->setBreakpointEnabled(id, on); }
     void clearBreakpoints() override { be_->clearBreakpoints(); }
     std::vector<Breakpoint> getBreakpoints() override { return be_->getBreakpoints(); }
     void pause() override { be_->pause(); }
@@ -224,6 +225,30 @@ TEST(listing_flags_the_pc_and_a_breakpoint_and_resyncs_far_back)
     REQUIRE(store != nullptr);
     CHECK_EQ(store->len, 10u);
     CHECK_STR(store->hex, "23FC 1234 5678 00FF 4276");
+
+    e.backend()->clearBreakpoints();
+}
+
+// The backend stops on an execution breakpoint that touches the opcode word,
+// so one on the odd byte of it marks the line, and only that line.
+TEST(listing_marks_a_breakpoint_on_the_odd_byte_of_an_opcode)
+{
+    t::Emu e;
+    REQUIRE(e.start());
+    REQUIRE(e.pauseAndWait());
+
+    Breakpoint bp;
+    bp.type = BpType::PC; bp.cpu = Cpu::M68K; bp.is_vdp = false;
+    bp.start = bp.end = kSubEntry + 1;
+    REQUIRE(e.backend()->addBreakpoint(bp) >= 0);
+
+    const auto v = listAround(*e.backend(), kSubEntry, 4, 4);
+    const ListingLine* nop = lineAt(v, kSubEntry);
+    const ListingLine* rts = lineAt(v, kSubRts);
+    REQUIRE(nop != nullptr);
+    REQUIRE(rts != nullptr);
+    CHECK(nop->hasBreakpoint);
+    CHECK(!rts->hasBreakpoint);
 
     e.backend()->clearBreakpoints();
 }

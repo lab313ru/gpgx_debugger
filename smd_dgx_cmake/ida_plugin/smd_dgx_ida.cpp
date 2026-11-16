@@ -591,6 +591,30 @@ bool host_del_bpt(int id)
     return false;   // not one of ours (a Z80 breakpoint): let the backend do it
 }
 
+struct enable_bpt_req : public exec_request_t {
+    ea_t ea;
+    bool on;
+    enable_bpt_req(ea_t a, bool o) : ea(a), on(o) {}
+    ssize_t idaapi execute() override { enable_bpt(ea, on); return 0; }
+};
+
+// Through IDA's Breakpoints window, like a delete. IDA keeps a disabled
+// breakpoint out of the process: ev_update_bpts deletes it from the backend,
+// and enabling it again adds it under a new id.
+bool host_enable_bpt(int id, bool on)
+{
+    if (!g_host) return false;
+    for (const auto& kv : g_bpIds) {
+        if (kv.second != id) continue;
+        ea_t ea = kv.first.start;
+        if (kv.first.vdp) ea += BREAKPOINTS_BASE;
+        enable_bpt_req req(ea, on);
+        execute_sync(req, MFF_WRITE);
+        return true;
+    }
+    return false;   // not one of ours (a Z80 breakpoint): let the backend do it
+}
+
 struct clear_bpts_req : public exec_request_t {
     ssize_t idaapi execute() override {
         // Walk backwards: deleting renumbers the ones after it.
@@ -919,6 +943,7 @@ drc_t start_process(const char* path, const char* input_path)
     hm.pause            = host_pause;
     hm.addBreakpoint    = host_add_bpt;
     hm.removeBreakpoint = host_del_bpt;
+    hm.enableBreakpoint = host_enable_bpt;
     hm.clearBreakpoints = host_clear_bpts;
     g_host->setHostMutations(hm);
 #ifdef SMD_DGX_IDA_VIEWS

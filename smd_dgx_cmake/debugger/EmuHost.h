@@ -117,6 +117,7 @@ public:
         std::function<bool()>                        pause;
         std::function<bool(const Breakpoint&, int*)> addBreakpoint;   // out: id
         std::function<bool(int)>                     removeBreakpoint;
+        std::function<bool(int, bool)>               enableBreakpoint;
         std::function<bool()>                        clearBreakpoints;
     };
     void setHostMutations(HostMutations m) { hostMut_ = std::move(m); }

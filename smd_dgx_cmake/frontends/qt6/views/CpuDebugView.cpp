@@ -99,6 +99,13 @@ bool sameBreakpoint(const Breakpoint& a, const Breakpoint& b)
         && a.condition == b.condition;
 }
 
+// The backend matches an execution breakpoint against the opcode word, so one
+// on a + 1 stops at a as well.
+bool touchesOpcode(const Breakpoint& bp, uint32_t a)
+{
+    return bp.start <= a + 1 && a <= bp.end;
+}
+
 bool sameLine(const disasm::ListingLine& a, const disasm::ListingLine& b)
 {
     return a.addr == b.addr && a.len == b.len && a.readable == b.readable && a.isPc == b.isPc
@@ -124,6 +131,7 @@ CpuDebugView::CpuDebugView(QWidget* parent) : QWidget(parent)
     root->addWidget(split);
 
     updatePanelForKind();
+    setControls(false, false);
 }
 
 void CpuDebugView::setBackend(IDebugBackend* b)
@@ -132,6 +140,18 @@ void CpuDebugView::setBackend(IDebugBackend* b)
     hasCentre_ = false;
     lines_.clear();
     bps_.clear();
+}
+
+void CpuDebugView::setRunning(bool on)
+{
+    if (on && !running_) {
+        hasCentre_ = false;
+        lines_.clear();
+        disabledAt_.clear();
+        listClock_.invalidate();
+    }
+    running_ = on;
+    refresh();
 }
 
 // --------------------------------------------------------------------------
@@ -276,7 +296,7 @@ QWidget* CpuDebugView::buildCpuTab()
     auto mkBtn = [this](const QString& text, const QString& name, std::function<void(IDebugBackend&)> fn) {
         auto* b = new QPushButton(text);
         b->setAccessibleName(name);
-        connect(b, &QPushButton::clicked, this, [this, fn = std::move(fn)] { if (backend_) fn(*backend_); });
+        connect(b, &QPushButton::clicked, this, [this, fn = std::move(fn)] { if (backend_ && running_) fn(*backend_); });
         return b;
     };
     btnStepInto_ = mkBtn(QStringLiteral("Step Into (F7)"), QStringLiteral("Step Into"),
@@ -288,7 +308,7 @@ QWidget* CpuDebugView::buildCpuTab()
     btnRun_      = mkBtn(QStringLiteral("Run (F9)"), QStringLiteral("Run"),
                          [](IDebugBackend& be) { be.resume(); });
     btnPause_    = mkBtn(QStringLiteral("Pause (F5)"), QStringLiteral("Pause"),
-                         [](IDebugBackend& be) { if (be.isRunning()) be.pause(); });
+                         [](IDebugBackend& be) { be.pause(); });
     auto* runGrid = new QGridLayout;
     runGrid->setSpacing(2);
     runGrid->addWidget(btnStepInto_, 0, 0);
@@ -342,8 +362,12 @@ QWidget* CpuDebugView::buildBreakpointPanel()
     kinds->setSpacing(2);
     for (int i = 0; i < 6; ++i) {
         kindRadio_[i] = new QRadioButton(QString::fromLatin1(kKinds[i]));
-        kinds->addWidget(kindRadio_[i], i % 3, i / 3);
+        kinds->addWidget(kindRadio_[i], i / 3, i % 3);
     }
+    kindRadio_[int(BpKind::Ram68k)]->setToolTip(QStringLiteral(
+        "Reads and writes anywhere on the 68000 bus: RAM, ROM, I/O, the VDP ports"));
+    kindRadio_[int(BpKind::RamZ80)]->setToolTip(QStringLiteral(
+        "Reads and writes anywhere on the Z80 bus: RAM, YM2612, bank, PSG, the 68000 window"));
     kindRadio_[0]->setChecked(true);
     for (auto* r : kindRadio_)      // after the default: the handler reads widgets made below
         connect(r, &QRadioButton::toggled, this, [this](bool on) { if (on) updatePanelForKind(); });
@@ -362,6 +386,7 @@ QWidget* CpuDebugView::buildBreakpointPanel()
 
     bpRead_  = new QCheckBox(QStringLiteral("Read"));
     bpWrite_ = new QCheckBox(QStringLiteral("Write"));
+    bpRead_->setChecked(true);
     bpWrite_->setChecked(true);
 
     auto* addrRow = new QHBoxLayout;
@@ -411,6 +436,7 @@ QWidget* CpuDebugView::buildBreakpointPanel()
         bpTable_->setColumnWidth(ColBpSize, cw * 5 + 12);
     }
     connect(bpTable_, &QTableWidget::itemChanged, this, &CpuDebugView::onBreakpointItemChanged);
+    bpTable_->installEventFilter(this);         // Delete
 
     bpMsg_ = new QLabel;
     bpMsg_->setWordWrap(true);
@@ -432,18 +458,12 @@ QWidget* CpuDebugView::buildBreakpointPanel()
 // --------------------------------------------------------------------------
 void CpuDebugView::refresh()
 {
-    if (!backend_) return;
-    const bool running = backend_->isRunning();
+    const bool running = backend_ && running_;
     const bool paused  = running && backend_->isPaused();
-
-    btnStepInto_->setEnabled(paused);
-    btnStepOver_->setEnabled(paused);
-    btnStepOut_->setEnabled(paused);
-    btnRun_->setEnabled(paused);
-    btnPause_->setEnabled(running && !paused);
+    setControls(running, paused);
     if (!running) return;
 
-    showRegisters(backend_->getM68kRegs(), paused);
+    showRegisters(backend_->getM68kRegs());
     refreshBreakpoints();
     rebuildListing(paused);
 }
@@ -452,7 +472,7 @@ void CpuDebugView::followPc()
 {
     if (!backend_) return;
     refresh();
-    if (!backend_->isRunning()) return;
+    if (!running_) return;
 
     // Stepping through code keeps the listing still and moves the mark; it
     // jumps only when PC leaves the lines decoded around the current centre,
@@ -483,7 +503,7 @@ void CpuDebugView::centreOn(uint32_t addr, int rowHint)
 
 void CpuDebugView::rebuildListing(bool force)
 {
-    if (!backend_ || !backend_->isRunning()) return;
+    if (!backend_ || !running_) return;
     if (!force && listClock_.isValid() && listClock_.elapsed() < kRunningListMs) return;
     listClock_.restart();
 
@@ -501,7 +521,7 @@ void CpuDebugView::rebuildListing(bool force)
     for (const auto& l : lines) {
         if (l.hasBreakpoint) continue;
         for (const auto& bp : bps)
-            if (isM68kExec(bp) && !bp.enabled && bp.start <= l.addr && l.addr <= bp.end) {
+            if (isM68kExec(bp) && !bp.enabled && touchesOpcode(bp, l.addr)) {
                 disabled.push_back(l.addr);
                 break;
             }
@@ -587,7 +607,7 @@ void CpuDebugView::toggleBreakpointAt(int row)
     // Off removes whatever marks the line; on adds one for this address only.
     bool removed = false;
     for (const auto& bp : backend_->getBreakpoints())
-        if (isM68kExec(bp) && bp.start <= a && a <= bp.end) {
+        if (isM68kExec(bp) && touchesOpcode(bp, a)) {
             backend_->removeBreakpoint(bp.id);
             removed = true;
         }
@@ -604,6 +624,15 @@ void CpuDebugView::toggleBreakpointAt(int row)
 
 bool CpuDebugView::eventFilter(QObject* obj, QEvent* ev)
 {
+    // The PC line's colour is worked out from the table's palette when a row
+    // is made. The table gets a new palette after this widget does, so it is
+    // the table's change that counts.
+    if (obj == listing_ && ev->type() == QEvent::PaletteChange) fillListing();
+    if (obj == bpTable_ && ev->type() == QEvent::KeyPress
+        && static_cast<QKeyEvent*>(ev)->key() == Qt::Key_Delete) {
+        deleteSelectedBreakpoints();
+        return true;
+    }
     if (obj == listing_->viewport() && ev->type() == QEvent::Wheel) {
         const auto* we = static_cast<QWheelEvent*>(ev);
         const QScrollBar* sb = listing_->verticalScrollBar();
@@ -640,31 +669,38 @@ bool CpuDebugView::eventFilter(QObject* obj, QEvent* ev)
     return QWidget::eventFilter(obj, ev);
 }
 
-void CpuDebugView::changeEvent(QEvent* ev)
-{
-    // The PC line's colour is worked out from the palette when a row is made.
-    if (ev->type() == QEvent::PaletteChange && listing_) fillListing();
-    QWidget::changeEvent(ev);
-}
-
 // --------------------------------------------------------------------------
 // registers
 // --------------------------------------------------------------------------
-void CpuDebugView::showRegisters(const M68kRegs& r, bool paused)
+void CpuDebugView::setControls(bool running, bool paused)
+{
+    btnStepInto_->setEnabled(paused);
+    btnStepOver_->setEnabled(paused);
+    btnStepOut_->setEnabled(paused);
+    btnRun_->setEnabled(paused);
+    btnPause_->setEnabled(running && !paused);
+    for (const auto& f : regFields_) f.edit->setReadOnly(!paused || !f.write);
+    for (const auto& b : srBits_) b.box->setEnabled(paused);
+    srMask_->setEnabled(paused);
+}
+
+void CpuDebugView::showRegisters(const M68kRegs& r)
 {
     for (const auto& f : regFields_) {
-        f.edit->setReadOnly(!paused || !f.write);
-        if (f.edit->hasFocus()) continue;          // the user may be typing into it
+        // Only typing not yet committed is left alone; a field that merely
+        // has focus, say to copy from, still follows the core.
+        if (f.edit->hasFocus() && !f.edit->isReadOnly() && f.edit->isModified()) continue;
         const QString t = hex(f.read(r), f.digits);
         if (f.edit->text() != t) f.edit->setText(t);
     }
     for (const auto& b : srBits_) {
         const QSignalBlocker block(b.box);
-        b.box->setEnabled(paused);
         b.box->setChecked((r.sr >> b.bit) & 1);
     }
-    srMask_->setEnabled(paused);
-    if (!srMask_->hasFocus()) {
+    // The spin box takes what was typed only on Enter or focus out; until
+    // then its text differs from its value.
+    const bool typing = srMask_->hasFocus() && srMask_->cleanText() != QString::number(srMask_->value());
+    if (!typing) {
         const QSignalBlocker block(srMask_);
         srMask_->setValue(int((r.sr >> 8) & 7));
     }
@@ -683,7 +719,7 @@ void CpuDebugView::commitRegField(QLineEdit* edit)
         const auto write = f->write;
         writeRegisters([&write, v](M68kRegs& r) { write(r, v); });
     }
-    // Still focused, so refresh() leaves it alone: show what the core holds.
+    // What the core holds, also when the text did not parse.
     edit->setText(hex(f->read(backend_->getM68kRegs()), f->digits));
 }
 
@@ -691,7 +727,7 @@ void CpuDebugView::writeRegisters(const std::function<void(M68kRegs&)>& change)
 {
     // Read, change and write in one go on the parked core, the way the
     // bridge's wreg68k does, so a half-applied set never runs.
-    if (backend_ && backend_->isRunning() && backend_->isPaused()) {
+    if (backend_ && running_ && backend_->isPaused()) {
         backend_->runSafely([&] {
             M68kRegs r = backend_->getM68kRegs();
             const bool super = (r.sr & kSrS) != 0;
@@ -765,12 +801,9 @@ void CpuDebugView::onBreakpointItemChanged(QTableWidgetItem* item)
     const bool on = item->checkState() == Qt::Checked;
     if (on == bps_[row].enabled) return;
 
-    // The interface has no toggle: put back a copy that differs only in
-    // `enabled`. It comes back under a new id.
-    Breakpoint copy = bps_[row];
-    copy.enabled = on;
-    backend_->removeBreakpoint(copy.id);
-    selectBpId_ = backend_->addBreakpoint(copy);
+    // In place: IDA and MCP clients know their breakpoints by id. If another
+    // client has just removed it, the rebuild below drops the row.
+    backend_->setBreakpointEnabled(bps_[row].id, on);
     // Not from inside this signal: the rebuild deletes the item emitting it.
     QMetaObject::invokeMethod(this, [this] {
         refreshBreakpoints();
@@ -792,8 +825,8 @@ void CpuDebugView::updatePanelForKind()
     bpWrite_->setEnabled(k != BpKind::Pc);
     static const char* const kHints[] = {
         "$000000-$FFFFFF",
-        "$FF0000-$FFFFFF, or an offset into it",
-        "Z80 address $0000-$1FFF",
+        "$000000-$FFFFFF",
+        "Z80 address $0000-$FFFF",
         "$0000-$FFFF",
         "$00-$7F",
         "$00-$7F",
@@ -814,18 +847,23 @@ void CpuDebugView::addBreakpointFromPanel()
     const uint32_t size = bpSize_->currentData().toUInt();
     const BpKind k = panelKind();
 
+    // Read and write breakpoints watch the whole bus, as the CPU hooks see it.
     Breakpoint bp;
-    uint32_t base = 0, lo = 0, hi = 0;          // the space, and the addresses typed into it
+    uint32_t base = 0, hi = 0;                  // the space, and where the addresses typed into it end
     switch (k) {
     case BpKind::Pc:     hi = 0x1000000; break;
-    case BpKind::Ram68k: if (a < 0x10000) a += 0xFF0000; lo = 0xFF0000; hi = 0x1000000; break;
-    case BpKind::RamZ80: bp.cpu = Cpu::Z80; hi = 0x2000; break;
+    case BpKind::Ram68k: hi = 0x1000000; break;
+    case BpKind::RamZ80: bp.cpu = Cpu::Z80; hi = 0x10000; break;
     case BpKind::Vram:   bp.is_vdp = true; base = VDP_BP_VRAM;  hi = 0x10000; break;
     case BpKind::Cram:   bp.is_vdp = true; base = VDP_BP_CRAM;  hi = 0x80;    break;
     case BpKind::Vsram:  bp.is_vdp = true; base = VDP_BP_VSRAM; hi = 0x80;    break;
     }
-    if (a < lo || uint64_t(a) + size > hi) {
+    if (uint64_t(a) + size > hi) {
         panelMessage(QStringLiteral("Out of range: ") + bpAddr_->placeholderText() + QLatin1Char('.'));
+        return;
+    }
+    if (k == BpKind::Pc && (a & 1)) {
+        panelMessage(QStringLiteral("Instructions start at even addresses."));
         return;
     }
     bp.start = base + a;

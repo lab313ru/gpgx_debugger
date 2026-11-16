@@ -236,10 +236,12 @@ std::vector<ListingLine> listAround(IDebugBackend& be, uint32_t centre, int befo
 
     const uint32_t pc = be.getM68kRegs().pc & (kBusEnd - 1);
     const std::vector<Breakpoint> bps = be.getBreakpoints();
+    // The backend matches an execution breakpoint against the opcode word, so
+    // one on a + 1 stops there too.
     const auto breaksAt = [&](uint32_t a) {
         for (const Breakpoint& bp : bps)
             if (bp.type == BpType::PC && bp.enabled && bp.cpu == Cpu::M68K && !bp.is_vdp
-                && bp.start <= a && a <= bp.end)
+                && bp.start <= a + 1 && a <= bp.end)
                 return true;
         return false;
     };

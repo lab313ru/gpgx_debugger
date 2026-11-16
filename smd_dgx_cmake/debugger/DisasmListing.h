@@ -20,7 +20,7 @@ struct ListingLine {
     std::string text;            // disasm68k's text, or kNotReadable
     bool        readable      = false;
     bool        isPc          = false;   // the 68000 PC is at addr
-    bool        hasBreakpoint = false;   // an enabled 68000 execution breakpoint covers addr
+    bool        hasBreakpoint = false;   // an enabled 68000 execution breakpoint touches the opcode word at addr
 
     // Where a branch, dbcc, jmp or jsr goes, when its operand names the
     // place: a PC-relative label or an absolute $xxxx.w / $xxxxxxxx.l.

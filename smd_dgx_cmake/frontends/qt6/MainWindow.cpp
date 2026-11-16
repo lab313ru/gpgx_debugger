@@ -105,6 +105,7 @@ void MainWindow::stopEmulator()
     if (emuHost_) emuHost_->stop();
     delete audio_; audio_ = nullptr;      // outlives the host: the sink writes to it
     refreshTimer_.stop();
+    if (debuggerView_) debuggerView_->setRunning(false);
     attachLabel_->setText(QStringLiteral("IDA attach: open a ROM first"));
     attachLabel_->setToolTip(QString());
 }
@@ -288,6 +289,7 @@ void MainWindow::openRomFile(const QString& path)
     setWindowTitle(fi.completeBaseName() + QStringLiteral(" — Genesis Plus GX Debugger"));
 
     refreshTimer_.start();
+    debuggerView_->setRunning(true);
     statusLabel_->setText(QStringLiteral("Running: ") + path);
     actPause_->setEnabled(true);
     actResume_->setEnabled(false);

@@ -405,6 +405,13 @@ void GpgxBackend::removeBreakpoint(int id)
         [id](const Breakpoint& b){ return b.id == id; }), breakpoints_.end());
     bpCount_.store(int(breakpoints_.size()), std::memory_order_relaxed);
 }
+bool GpgxBackend::setBreakpointEnabled(int id, bool on)
+{
+    std::lock_guard<std::mutex> lk(bpMutex_);
+    for (auto& b : breakpoints_)
+        if (b.id == id) { b.enabled = on; return true; }
+    return false;
+}
 void GpgxBackend::clearBreakpoints() { std::lock_guard<std::mutex> lk(bpMutex_); breakpoints_.clear(); bpCount_.store(0, std::memory_order_relaxed); }
 std::vector<Breakpoint> GpgxBackend::getBreakpoints() { std::lock_guard<std::mutex> lk(bpMutex_); return breakpoints_; }
 
@@ -525,6 +532,14 @@ bool GpgxBackend::loadRom(const char* path)
         callstackSlotZ80_.clear();
     }
     abandoned_.store(false);        // a previous shutdown must not mute this run
+    // Nor stop it: a step asked for while nothing ran, or one a shutdown left
+    // armed, would park the new ROM on its first instruction.
+    stepInto_.store(false);
+    stepOverAddr_.store(-1);
+    stepOutSp_.store(-1);
+    stepIntoZ80_.store(false);
+    stepOverAddrZ80_.store(-1);
+    stepOutSpZ80_.store(-1);
 
     bool ok = gx::load_rom(path);
     if (ok) {
