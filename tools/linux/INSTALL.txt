@@ -10,8 +10,9 @@ Linux x86_64, IDA 9.2+ (built against the IDA 9.3 SDK).
 NOT YET LOADED IN A REAL LINUX IDA. These modules build, export only what
 IDA looks for (PLUGIN from the plugin, LDSC from the loaders), and every
 symbol they import resolves against the SDK's libida.so and the C/C++
-runtime; the Qt imports were checked by name against IDA's namespaced Qt
-only. The Windows build is the one that has been used in IDA.
+runtime, except Qt: the plugin names no Qt library and expects the Qt IDA
+has already loaded, and its Qt imports were only checked to carry IDA's QT
+namespace. The Windows build is the one that has been used in IDA.
 
 
 INSTALL
